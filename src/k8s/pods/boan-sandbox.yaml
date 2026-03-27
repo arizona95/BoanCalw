@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: boan-sandbox
+  namespace: boan
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: boan-sandbox
+  template:
+    metadata:
+      labels:
+        app: boan-sandbox
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 2000
+        runAsGroup: 2000
+        seccompProfile:
+          type: Localhost
+          localhostProfile: profiles/boan-sandbox-seccomp.json
+      containers:
+        - name: boan-sandbox
+          image: boanclaw/boan-sandbox:latest
+          resources:
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+            requests:
+              memory: "256Mi"
+              cpu: "200m"
+          env:
+            - name: HTTP_PROXY
+              value: "http://boan-proxy:18080"
+            - name: HTTPS_PROXY
+              value: "http://boan-proxy:18080"
+            - name: BOAN_PROXY_ADMIN
+              value: "http://boan-proxy:18081"
+            - name: ANTHROPIC_BASE_URL
+              value: "http://localhost:8083"
+            - name: BOAN_ONECLI_LISTEN
+              value: ":8083"
+            - name: BOAN_ONECLI_CRED_FILTER_URL
+              value: "http://boan-credential-filter:8082"
+            - name: BOAN_ONECLI_ORG_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: boan-config
+                  key: org_id
+                  optional: true
+            - name: BOAN_ONECLI_UPSTREAM_URL
+              value: "https://api.anthropic.com"
+            - name: BOAN_ONECLI_CREDENTIAL_NAME
+              value: "anthropic_api_key"
+            - name: BOAN_ONECLI_CREDENTIAL_TYPE
+              value: "api_key"
+            - name: BOAN_SESSION_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: workspace
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}

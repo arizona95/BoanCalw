@@ -1,0 +1,136 @@
+version: "3.9"
+
+services:
+  boan-proxy:
+    build:
+      context: ./packages/boan-proxy
+    ports:
+      - "18080:18080"
+      - "18081:18081"
+    environment:
+      - BOAN_ORG_ID=${BOAN_ORG_ID:-dev-org}
+      - BOAN_POLICY_URL=http://boan-policy-server:8080
+      - BOAN_LOCAL_LLM_URL=http://host.docker.internal:11434
+      - BOAN_SECURITY_AGENT=http://boan-sandbox:8080
+      - BOAN_CREDENTIAL_FILTER_URL=http://boan-credential-filter:8080
+      - BOAN_AUDIT_URL=http://boan-audit-agent:8080
+      - BOAN_LLM_REGISTRY_URL=http://boan-llm-registry:8080
+      - BOAN_WHITELIST_PROXY_URL=http://boan-whitelist-proxy:8090
+    volumes:
+      - boan-ca:/etc/boan
+    depends_on:
+      - boan-policy-server
+      - boan-credential-filter
+      - boan-audit-agent
+      - boan-llm-registry
+      - boan-whitelist-proxy
+    networks:
+      - boan-internal
+
+  boan-policy-server:
+    build:
+      context: ./packages/boan-policy-server
+    ports:
+      - "18090:8080"
+    environment:
+      - BOAN_ORG_ID=${BOAN_ORG_ID:-dev-org}
+    volumes:
+      - policy-data:/data/policies
+      - policy-keys:/etc/boan-policy
+    networks:
+      - boan-internal
+
+  boan-credential-filter:
+    build:
+      context: ./packages/boan-proxy
+    ports:
+      - "18092:8080"
+    environment:
+      - BOAN_ORG_ID=${BOAN_ORG_ID:-dev-org}
+      - BOAN_MODE=credential-filter
+    networks:
+      - boan-internal
+
+  boan-audit-agent:
+    build:
+      context: ./packages/boan-proxy
+    ports:
+      - "18093:8080"
+    environment:
+      - BOAN_ORG_ID=${BOAN_ORG_ID:-dev-org}
+      - BOAN_MODE=audit-agent
+    networks:
+      - boan-internal
+
+  boan-asset-constitution:
+    build:
+      context: ./packages/boan-policy-server
+    ports:
+      - "18094:8080"
+    environment:
+      - BOAN_ORG_ID=${BOAN_ORG_ID:-dev-org}
+      - BOAN_MODE=asset-constitution
+    networks:
+      - boan-internal
+    depends_on:
+      - boan-policy-server
+
+  boan-llm-registry:
+    build:
+      context: ./packages/boan-llm-registry
+    ports:
+      - "18095:8080"
+    environment:
+      - BOAN_ORG_ID=${BOAN_ORG_ID:-dev-org}
+    networks:
+      - boan-internal
+
+  boan-whitelist-proxy:
+    build:
+      context: ./packages/boan-whitelist-proxy
+    ports:
+      - "18096:8090"
+    environment:
+      - BOAN_ORG_ID=${BOAN_ORG_ID:-dev-org}
+      - BOAN_LLM_URL=http://boan-llm-registry:8080
+    networks:
+      - boan-internal
+    depends_on:
+      - boan-llm-registry
+
+  boan-sandbox:
+    build:
+      context: ./packages/boan-agent
+    environment:
+      - HTTP_PROXY=http://boan-proxy:18080
+      - HTTPS_PROXY=http://boan-proxy:18080
+      - BOAN_SESSION_ID=dev-session
+    volumes:
+      - workspace:/workspace
+    depends_on:
+      - boan-proxy
+    networks:
+      - boan-internal
+
+  boan-admin-console:
+    build:
+      context: ./packages/boan-admin-console
+    ports:
+      - "18099:80"
+    depends_on:
+      - boan-policy-server
+      - boan-audit-agent
+      - boan-credential-filter
+      - boan-llm-registry
+    networks:
+      - boan-internal
+
+networks:
+  boan-internal:
+    driver: bridge
+
+volumes:
+  boan-ca:
+  policy-data:
+  policy-keys:
+  workspace:

@@ -1,0 +1,715 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BoanClaw v4</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: #f0f2f7;
+  color: #1a2030;
+  font-family: 'Segoe UI', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif;
+  font-size: 11.5px;
+  line-height: 1.5;
+  padding: 22px 26px 36px;
+  min-width: 1280px;
+}
+
+/* ── Header ── */
+.hdr { text-align:center; margin-bottom:14px; }
+.hdr h1 { font-size:19px; font-weight:700; color:#111827; margin-bottom:3px; }
+.hdr .sub { font-size:10.5px; color:#6b7280; letter-spacing:.08em; text-transform:uppercase; }
+
+/* ── Legend ── */
+.legend { display:flex; justify-content:center; gap:14px; margin-bottom:16px; flex-wrap:wrap; }
+.leg { display:flex; align-items:center; gap:5px; font-size:10.5px; color:#5a6270; }
+.leg-dot  { width:9px; height:9px; border-radius:2px; flex-shrink:0; }
+.leg-dash { width:18px; height:9px; border:1.5px dashed #9aa0ae; border-radius:2px; }
+.leg-arr  { width:20px; height:2px; background:#dc2626; border-radius:1px; }
+
+/* ── Main grid: S4 | conn | S3 | conn | S1 ── */
+.diagram {
+  display:grid;
+  grid-template-columns: 200px 56px 1fr 56px 230px;
+  gap:0;
+  align-items:stretch;
+}
+
+/* ── Zone panels ── */
+.zone-panel {
+  border-radius:12px; border:2px solid;
+  padding:14px 12px 12px;
+  position:relative; background:#fff;
+  display:flex; flex-direction:column; gap:8px;
+}
+.zone-panel-label {
+  position:absolute; top:-12px; left:14px;
+  font-size:9.5px; font-weight:700; letter-spacing:.1em; text-transform:uppercase;
+  padding:2px 10px; border-radius:4px; color:#fff; white-space:nowrap;
+}
+.panel-s4 { border-color:#7c3aed; background:#faf8ff; }
+.panel-s4 .zone-panel-label { background:#7c3aed; }
+.panel-s3 { border-color:#1d4ed8; background:#f8faff; }
+.panel-s3 .zone-panel-label { background:#1d4ed8; }
+.panel-s1 { border-color:#b45309; background:#fffbf5; }
+.panel-s1 .zone-panel-label { background:#b45309; }
+
+/* ── Connector ── */
+.connector {
+  display:flex; flex-direction:column;
+  align-items:center; justify-content:center;
+  gap:10px; padding:6px 2px; position:relative;
+}
+.connector::before {
+  content:''; position:absolute; top:50px; bottom:50px; left:50%;
+  width:1.5px;
+  background:linear-gradient(to bottom, transparent, #c5cad6 20%, #c5cad6 80%, transparent);
+  transform:translateX(-50%);
+}
+.flow-arr {
+  position:relative; z-index:1;
+  display:flex; flex-direction:column; align-items:center;
+  gap:3px; background:#f0f2f7; padding:4px 0; width:100%;
+}
+.arr-row  { display:flex; align-items:center; width:100%; }
+.arr-line { flex:1; height:1.5px; }
+.arr-head { font-size:11px; line-height:1; flex-shrink:0; }
+.arr-label { font-size:9px; font-weight:600; text-align:center; white-space:nowrap; }
+.arr-note  { font-size:8px; color:#9ca3af; text-align:center; white-space:nowrap; }
+
+.arr-policy .arr-line { background:#7c3aed; } .arr-policy .arr-head,.arr-policy .arr-label { color:#7c3aed; }
+.arr-cred   .arr-line { background:#4f46e5; } .arr-cred   .arr-head,.arr-cred   .arr-label { color:#4f46e5; }
+.arr-audit  .arr-line { background:#9ca3af; } .arr-audit  .arr-head,.arr-audit  .arr-label { color:#6b7280; }
+.arr-llm    .arr-line { background:#6366f1; } .arr-llm    .arr-head,.arr-llm    .arr-label { color:#6366f1; }
+.arr-out    .arr-line { background:#dc2626; } .arr-out    .arr-head,.arr-out    .arr-label { color:#dc2626; }
+.arr-in     .arr-line { background:#9ca3af; } .arr-in     .arr-head,.arr-in     .arr-label { color:#6b7280; }
+
+/* ── Card ── */
+.card { border:1px solid; border-radius:7px; padding:8px 10px; background:#fff; flex:1; }
+.card.dashed { border-style:dashed; }
+.card-title { font-size:11px; font-weight:700; display:flex; align-items:center; gap:5px; margin-bottom:4px; }
+.card-body  { font-size:10px; color:#6b7280; line-height:1.7; }
+.card-body li { list-style:none; }
+.card-body li::before { content:'· '; }
+
+.panel-s4 .card { border-color:rgba(124,58,237,.25); } .panel-s4 .card-title { color:#6d28d9; }
+.panel-s1 .card { border-color:rgba(180,83,9,.25);   } .panel-s1 .card-title { color:#92400e; }
+
+/* ── Tag ── */
+.tag { display:inline-block; font-size:8.5px; padding:1px 5px; border-radius:3px; background:#f3f4f6; color:#6b7280; }
+.tag-red    { background:#fef2f2; color:#dc2626; }
+.tag-green  { background:#f0fdf4; color:#047857; }
+.tag-blue   { background:#eff6ff; color:#1d4ed8; }
+.tag-purple { background:#faf5ff; color:#7c3aed; }
+.tag-yellow { background:#fefce8; color:#92400e; }
+
+/* ── Gate band ── */
+.gate-band { display:flex; align-items:center; gap:6px; }
+.gate-band-line { flex:1; height:1px; }
+.gate-band-pill {
+  border:1px solid; border-radius:20px; padding:3px 10px;
+  font-size:9.5px; font-weight:600;
+  display:flex; align-items:center; gap:5px; flex-wrap:wrap;
+}
+.gate-machine .gate-band-line { background:linear-gradient(to right, transparent, #7c3aed55, transparent); }
+.gate-machine .gate-band-pill { border-color:#7c3aed55; color:#7c3aed; background:#faf8ff; }
+.gate-human   .gate-band-line { background:linear-gradient(to right, transparent, #1d4ed855, transparent); }
+.gate-human   .gate-band-pill { border-color:#1d4ed855; color:#1d4ed8; background:#f8faff; }
+
+/* ── LLM stripe ── */
+.llm-stripe { border:1.5px solid; border-radius:8px; padding:8px 10px; background:#fff; }
+.llm-stripe-title { font-size:9px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; margin-bottom:5px; }
+.llm-stripe.s4-llm { border-color:#6d28d944; } .llm-stripe.s4-llm .llm-stripe-title { color:#6d28d9; }
+.llm-stripe.pc-llm { border-color:#059669; border-style:dashed; } .llm-stripe.pc-llm .llm-stripe-title { color:#047857; }
+.llm-stripe.s1-llm { border-color:#b4530944; } .llm-stripe.s1-llm .llm-stripe-title { color:#92400e; }
+.choice-badge { font-size:8px; font-weight:600; background:#ecfdf5; color:#047857; border:1px solid #6ee7b7; border-radius:2px; padding:1px 4px; }
+
+/* ════════════════════════════════════════
+   S3 단말 내부 구조
+════════════════════════════════════════ */
+
+/* S3 안에 PC 박스 + Mobile 박스 나란히 */
+.device-row { display:flex; gap:8px; align-items:stretch; margin-top:6px; }
+
+/* ── PC 박스: Sandbox 포함 ── */
+.pc-box {
+  flex: 3;
+  border: 1.5px solid rgba(29,78,216,.35);
+  border-radius: 10px;
+  background: #f5f8ff;
+  padding: 10px 10px 10px;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.pc-box-label {
+  position: absolute; top: -9px; left: 10px;
+  font-size: 9px; font-weight: 700; letter-spacing: .06em;
+  padding: 1px 8px; border-radius: 3px;
+  background: #1d4ed8; color: #fff;
+}
+
+/* PC 내부 상단 카드들 */
+.pc-top { display:flex; gap:7px; align-items:stretch; }
+.pc-card {
+  border:1px solid rgba(29,78,216,.2); border-radius:7px;
+  padding:7px 9px; background:#fff; flex:1;
+}
+.pc-card.dashed { border-style:dashed; border-color:#9ca3af80; }
+.pc-card-title { font-size:10.5px; font-weight:700; display:flex; align-items:center; gap:5px; margin-bottom:3px; }
+.pc-card-body  { font-size:9.5px; color:#6b7280; line-height:1.65; }
+.pc-card-body li { list-style:none; }
+.pc-card-body li::before { content:'· '; }
+.pc-card-title.blue { color:#1e40af; }
+.pc-card-title.gray { color:#6b7280; }
+.pc-card-title.green { color:#047857; }
+
+/* ── S3↔S2 게이트 (PC 박스 안) ── */
+.inner-gate { display:flex; align-items:center; gap:6px; }
+.inner-gate-line { flex:1; height:1px; background:linear-gradient(to right, transparent, #1d4ed855, transparent); }
+.inner-gate-pill {
+  border:1px solid #1d4ed855; border-radius:16px;
+  padding:3px 9px; font-size:9px; font-weight:600;
+  color:#1d4ed8; background:#f0f5ff;
+  display:flex; align-items:center; gap:5px;
+}
+
+/* ── S2 Sandbox (PC 박스 안) ── */
+.sandbox-box {
+  border: 1.5px solid #047857;
+  border-radius: 9px;
+  background: #f0fdf8;
+  padding: 8px 8px 10px;
+  position: relative;
+}
+.sandbox-box-label {
+  position: absolute; top: -9px; left: 10px;
+  font-size: 9px; font-weight: 700; letter-spacing: .05em;
+  padding: 1px 8px; border-radius: 3px;
+  background: #047857; color: #fff;
+}
+
+/* ── Kubernetes (Sandbox 안) ── */
+.k8s-cluster {
+  border: 1.5px dashed #3b82f6;
+  border-radius: 8px;
+  background: rgba(59,130,246,.03);
+  padding: 8px 8px 10px;
+  position: relative;
+  margin-top: 6px;
+}
+.k8s-label {
+  position: absolute; top: -9px; left: 10px;
+  background: #fff; padding: 1px 7px;
+  font-size: 9px; font-weight: 700; color: #3b82f6;
+  border: 1px solid #93c5fd; border-radius: 3px;
+}
+
+/* ── Pod flow ── */
+.pod-flow { display:flex; align-items:stretch; gap:0; margin-top:8px; }
+
+.pod-conn {
+  display:flex; flex-direction:column;
+  align-items:center; justify-content:center;
+  width:24px; flex-shrink:0;
+}
+.pod-conn-h { display:flex; align-items:center; width:100%; }
+.pod-conn-line { flex:1; height:2px; background:#dc2626; }
+.pod-conn-head { font-size:11px; color:#dc2626; line-height:1; }
+.pod-conn-tag  { font-size:7.5px; color:#dc2626; font-weight:600; text-align:center; margin-top:2px; white-space:nowrap; }
+
+/* ── Pod ── */
+.pod { border:1px solid; border-radius:7px; padding:7px 8px; background:#fff; flex:1; min-width:0; position:relative; }
+.pod-label { position:absolute; top:-8px; left:7px; font-size:8px; font-weight:700; padding:1px 5px; border-radius:3px; color:#fff; }
+.pod-title { font-size:10.5px; font-weight:700; margin-bottom:3px; display:flex; align-items:center; gap:4px; }
+.pod-body  { font-size:9.5px; color:#6b7280; line-height:1.65; }
+.pod-body li { list-style:none; }
+.pod-body li::before { content:'· '; }
+
+.pod-gw  { border-color:#fca5a5; background:#fff5f5; } .pod-gw  .pod-label { background:#dc2626; } .pod-gw  .pod-title { color:#b91c1c; }
+.pod-oc  { border-color:#6ee7b7; background:#f0fdf9; } .pod-oc  .pod-label { background:#047857; } .pod-oc  .pod-title { color:#047857; }
+.pod-wl  { border-color:#c4b5fd; background:#faf5ff; } .pod-wl  .pod-label { background:#7c3aed; } .pod-wl  .pod-title { color:#7c3aed; }
+.pod-reg { border-color:#93c5fd; background:#eff6ff; } .pod-reg .pod-label { background:#1d4ed8; } .pod-reg .pod-title { color:#1d4ed8; }
+
+/* ── Pipeline inside boan-proxy pod ── */
+.pipeline { display:flex; flex-direction:column; gap:2px; margin-top:2px; }
+.pipe-step { display:flex; align-items:flex-start; gap:4px; font-size:9px; color:#4b5563; }
+.pipe-num { width:14px; height:14px; border-radius:50%; font-size:8px; font-weight:700; display:flex; align-items:center; justify-content:center; flex-shrink:0; margin-top:1px; }
+.pn-g { background:#d1fae5; color:#047857; } .pn-r { background:#fee2e2; color:#dc2626; }
+
+/* ── Mobile 박스 ── */
+.mobile-box {
+  flex: 1;
+  border: 1.5px dashed rgba(16,185,129,.5);
+  border-radius: 10px;
+  background: #f0fdf9;
+  padding: 10px 10px 10px;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.mobile-box-label {
+  position: absolute; top: -9px; left: 10px;
+  font-size: 9px; font-weight: 700; letter-spacing: .06em;
+  padding: 1px 8px; border-radius: 3px;
+  background: #059669; color: #fff;
+}
+.mobile-card {
+  border: 1px solid rgba(16,185,129,.3); border-radius: 7px;
+  padding: 7px 9px; background: #fff;
+}
+.mobile-card.dashed { border-style: dashed; border-color: #9ca3af80; }
+.mobile-card-title { font-size:10.5px; font-weight:700; color:#059669; display:flex; align-items:center; gap:5px; margin-bottom:3px; }
+.mobile-card-body  { font-size:9.5px; color:#6b7280; line-height:1.65; }
+.mobile-card-body li { list-style:none; }
+.mobile-card-body li::before { content:'· '; }
+
+/* ── 사내 시스템 ── */
+.isys-wrap { margin-top:8px; }
+.isys-conn-row { display:flex; width:100%; }
+.isys-zone {
+  border: 2px solid #0d9488; border-radius:11px;
+  background: #f0fdfa; padding:12px 14px 10px;
+  position: relative; width:100%;
+}
+.isys-zone-label {
+  position:absolute; top:-11px; left:14px;
+  font-size:9.5px; font-weight:700; letter-spacing:.08em; text-transform:uppercase;
+  padding:2px 10px; border-radius:4px; background:#0d9488; color:#fff;
+}
+.sys-cards { display:flex; gap:8px; flex-wrap:wrap; }
+.sys-card { flex:1; min-width:110px; border:1px solid rgba(13,148,136,.3); border-radius:7px; padding:8px 10px; background:#fff; }
+.sys-card-title { font-size:10.5px; font-weight:700; color:#0f766e; display:flex; align-items:center; gap:5px; margin-bottom:3px; }
+.sys-card-body  { font-size:9.5px; color:#6b7280; line-height:1.65; }
+.sys-card-body li { list-style:none; }
+.sys-card-body li::before { content:'· '; }
+
+/* ── Util ── */
+.row  { display:flex; gap:7px; }
+.col  { display:flex; flex-direction:column; gap:7px; }
+.flex1 { flex:1; } .flex2 { flex:2; }
+.sep  { height:1px; background:#e5e7eb; margin:1px 0; }
+.warn { font-size:9px; color:#dc2626; margin-top:3px; }
+.note { font-size:9px; color:#9ca3af; margin-top:2px; }
+
+/* ── Info / CLI ── */
+.info-bar { margin-top:10px; border:1px solid #dde1ea; border-radius:8px; padding:9px 16px; background:#fff; display:flex; gap:16px; flex-wrap:wrap; }
+.info-item .info-label { font-size:10px; font-weight:700; margin-bottom:1px; }
+.info-item .info-val   { font-size:9.5px; color:#6b7280; }
+.cli-bar { margin-top:8px; border:1px solid #dde1ea; border-radius:8px; padding:8px 14px; background:#fff; display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+.cli-bar-title { font-size:10px; font-weight:700; color:#1d4ed8; white-space:nowrap; }
+code { background:#f3f4f6; border:1px solid #dde1ea; padding:2px 6px; border-radius:3px; font-family:'Consolas','Courier New',monospace; font-size:9.5px; color:#374151; }
+.cli-desc { font-size:9.5px; color:#9ca3af; }
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<div class="hdr">
+  <h1>🔐 BoanClaw v4 — 범용 AI 보안 플레인</h1>
+  <div class="sub">Samsung GenAI Security · 2026.03 · S-Level 통합 보안 체계</div>
+</div>
+
+<!-- LEGEND -->
+<div class="legend">
+  <div class="leg"><div class="leg-dot" style="background:#7c3aed"></div>S4 조직 인프라</div>
+  <div class="leg"><div class="leg-dot" style="background:#1d4ed8"></div>S3 단말</div>
+  <div class="leg"><div class="leg-dot" style="background:#047857"></div>S2 Sandbox (PC 내부)</div>
+  <div class="leg"><div class="leg-dot" style="background:#b45309"></div>S1 개인 클라우드</div>
+  <div class="leg"><div class="leg-dot" style="background:#0d9488"></div>사내 시스템</div>
+  <div class="leg"><div class="leg-dot" style="background:#3b82f6"></div>Kubernetes</div>
+  <div class="leg"><div class="leg-dash"></div>외부 제공 / 사용자 선택</div>
+  <div class="leg"><div class="leg-arr"></div>데이터 흐름</div>
+</div>
+
+<!-- ════════ MAIN DIAGRAM ════════ -->
+<div class="diagram">
+
+  <!-- ── S4 조직 인프라 ── -->
+  <div class="zone-panel panel-s4">
+    <div class="zone-panel-label">S4 · 조직 인프라</div>
+
+    <div class="card" style="margin-top:6px;">
+      <div class="card-title">☁️ CSP <span class="tag tag-purple" style="font-size:7.5px;">고객책임영역</span></div>
+      <ul class="card-body">
+        <li>🗝️ KMS — CMEK · Credential TTL</li>
+        <li>📋 Logging — OTEL · Tamper-proof</li>
+      </ul>
+    </div>
+    <div class="sep"></div>
+    <div class="card">
+      <div class="card-title">📡 Org Policy Server</div>
+      <ul class="card-body">
+        <li><b style="color:#6d28d9;">Policy 배포</b> — ed25519 서명</li>
+        <li>DLP 룰 · Network Whitelist</li>
+        <li style="margin-top:3px;"><b style="color:#6d28d9;">Critical Filtering</b></li>
+        <li>boan-asset-constitution</li>
+        <li>S-Level 분류 원본 (단말 분산 금지)</li>
+        <li style="margin-top:3px;"><b style="color:#6d28d9;">Credential Filtering</b></li>
+        <li>API Key 중앙 저장 · 동적 발급</li>
+      </ul>
+      <div class="warn">⚠ critical 자산 → 각 단말 분산 금지</div>
+    </div>
+    <div class="sep"></div>
+
+    <!-- 사내 Security LLM -->
+    <div class="llm-stripe s4-llm" style="margin-top:auto;">
+      <div class="llm-stripe-title">🔒 사내 Security LLM</div>
+      <ul class="card-body">
+        <li>민감 데이터 전담 처리</li>
+        <li>DLP 문맥 판단 (~1-2s)</li>
+        <li>외부 LLM 중재 결정</li>
+        <li>사내 전용 · 외부 미노출</li>
+      </ul>
+      <div class="note">↔ S2 OpenClaw 직접 연동</div>
+    </div>
+  </div>
+
+  <!-- ── Connector L (S4↔S3) ── -->
+  <div class="connector">
+    <div class="flow-arr arr-policy">
+      <div class="arr-row"><div class="arr-line"></div><div class="arr-head">→</div></div>
+      <div class="arr-label">정책 배포</div>
+      <div class="arr-note">ed25519</div>
+    </div>
+    <div class="flow-arr arr-cred">
+      <div class="arr-row"><div class="arr-line"></div><div class="arr-head">→</div></div>
+      <div class="arr-label">Credential</div>
+      <div class="arr-note">TTL · KMS</div>
+    </div>
+    <div class="flow-arr arr-llm">
+      <div class="arr-row"><div class="arr-head">←</div><div class="arr-line"></div><div class="arr-head">→</div></div>
+      <div class="arr-label">Security LLM</div>
+      <div class="arr-note">DLP · 중재</div>
+    </div>
+    <div class="flow-arr arr-audit">
+      <div class="arr-row"><div class="arr-head">←</div><div class="arr-line"></div></div>
+      <div class="arr-label">OTEL Audit</div>
+      <div class="arr-note">→ S4 Logging</div>
+    </div>
+  </div>
+
+  <!-- ── S3 단말 ── -->
+  <div class="zone-panel panel-s3">
+    <div class="zone-panel-label">S3 · 단말</div>
+
+    <!-- S4↔S3 게이트 (S3 존 상단) -->
+    <div class="gate-band gate-machine" style="margin-top:6px;">
+      <div class="gate-band-line"></div>
+      <div class="gate-band-pill">🔐 S4↔S3 — 기계 자동 제어
+        <span class="tag tag-purple">KMS</span>
+        <span class="tag tag-purple">ed25519</span>
+        <span class="tag tag-purple">Credential TTL</span>
+      </div>
+      <div class="gate-band-line"></div>
+    </div>
+
+    <!-- PC 박스 + Mobile 박스 나란히 -->
+    <div class="device-row">
+
+      <!-- ══ PC 박스 (Sandbox 포함) ══ -->
+      <div class="pc-box">
+        <div class="pc-box-label">🖥️ PC</div>
+
+        <!-- PC 상단: DRM/MDM + Workspace + PC Local LLM -->
+        <div class="pc-top" style="margin-top:4px;">
+          <div class="pc-card dashed" style="max-width:130px; flex:0 0 auto;">
+            <div class="pc-card-title gray">🛡️ DRM/MDM</div>
+            <ul class="pc-card-body">
+              <li>각 사 보안 프로그램</li>
+              <li>BoanClaw 제공 아님</li>
+            </ul>
+          </div>
+          <div class="pc-card flex2">
+            <div class="pc-card-title blue">💼 Developer Workspace</div>
+            <ul class="pc-card-body">
+              <li>코드 · 로컬 파일</li>
+              <li>S3/S4 데이터 혼재 가능</li>
+            </ul>
+            <div class="note" style="margin-top:3px;">↓ 개발자 명시적으로 Sandbox에 마운트</div>
+          </div>
+          <div class="llm-stripe pc-llm" style="max-width:130px; flex:0 0 auto; padding:6px 8px;">
+            <div class="llm-stripe-title" style="font-size:8px;">💻 PC Local LLM <span class="choice-badge">선택</span></div>
+            <ul class="card-body" style="font-size:9.5px;">
+              <li>Ollama 등 로컬 실행</li>
+              <li>사내 LLM 대체 가능</li>
+              <li>완전 오프라인</li>
+            </ul>
+          </div>
+        </div>
+
+        <!-- S3↔S2 게이트 (PC 박스 안) -->
+        <div class="inner-gate">
+          <div class="inner-gate-line"></div>
+          <div class="inner-gate-pill">
+            👤 S3↔S2 게이트 — 인간 검수
+            <code style="font-size:8.5px; background:#eff6ff; border-color:#bfdbfe;">boanclaw mount /workspace</code>
+            <span class="tag tag-blue" style="font-size:8px;">명시적 허용</span>
+            <span class="tag" style="font-size:8px;">S4 포함 시 경고</span>
+          </div>
+          <div class="inner-gate-line"></div>
+        </div>
+
+        <!-- ══ S2 Sandbox (PC 박스 안) ══ -->
+        <div class="sandbox-box">
+          <div class="sandbox-box-label">S2 · Sandbox / Docker</div>
+
+          <!-- Kubernetes 클러스터 -->
+          <div class="k8s-cluster">
+            <div class="k8s-label">☸ Kubernetes (k3s)</div>
+
+            <!-- Pod flow: Agent → Gateway → Cache → Registry -->
+            <div class="pod-flow">
+
+              <!-- ① Agent Pod: OpenClaw -->
+              <div class="pod pod-oc" style="flex:1.15;">
+                <div class="pod-label">① Agent</div>
+                <div class="pod-title">🤖 OpenClaw <span style="font-size:8.5px; font-weight:400;">(보안용)</span></div>
+                <ul class="pod-body">
+                  <li>민감 작업 전담</li>
+                  <li>사내 LLM 위주 행동</li>
+                  <li>사내 시스템 도구 호출</li>
+                  <li>아웃바운드 생성</li>
+                </ul>
+                <div class="note" style="color:#dc2626; font-size:8px; margin-top:4px;">→ 모든 요청 Gateway로</div>
+              </div>
+
+              <!-- →① Gateway -->
+              <div class="pod-conn">
+                <div class="pod-conn-h">
+                  <div class="pod-conn-line"></div>
+                  <div class="pod-conn-head">→</div>
+                </div>
+                <div class="pod-conn-tag">통과 필수</div>
+              </div>
+
+              <!-- ② Gateway Pod: boan-proxy -->
+              <div class="pod pod-gw" style="flex:1.55;">
+                <div class="pod-label">② Gateway</div>
+                <div class="pod-title">🚦 boan-proxy</div>
+                <div class="pipeline">
+                  <div class="pipe-step"><div class="pipe-num pn-r">①</div><span>RBAC <span class="tag tag-red">fail-closed</span></span></div>
+                  <div class="pipe-step"><div class="pipe-num pn-g">②</div><span>TLS 인터셉터 <span class="tag">복호화</span></span></div>
+                  <div class="pipe-step"><div class="pipe-num pn-r">③</div><span>Network Gate <span class="tag tag-purple">Whitelist</span></span></div>
+                  <div class="pipe-step"><div class="pipe-num pn-r">④</div><span>DLP <span class="tag tag-red">~0ms</span><span class="tag tag-red">LLM~2s</span></span></div>
+                  <div class="pipe-step" style="margin-left:18px; font-size:8.5px; color:#6b7280; flex-wrap:wrap; gap:2px;">
+                    S4/S3→<span class="tag tag-red" style="font-size:7px;">차단</span>
+                    S2→<span class="tag tag-blue" style="font-size:7px;">비식별화</span>
+                    S1→<span class="tag tag-green" style="font-size:7px;">통과</span>
+                  </div>
+                  <div class="pipe-step"><div class="pipe-num pn-g">⑤</div><span>Credential 주입</span></div>
+                  <div class="pipe-step"><div class="pipe-num pn-g">⑥</div><span>라우팅 결정</span></div>
+                  <div class="pipe-step"><div class="pipe-num pn-g">⑦</div><span>Audit → S4 Log</span></div>
+                </div>
+                <div class="note" style="margin-top:3px;">18080 · 512MB · 0.5core</div>
+              </div>
+
+              <!-- → Cache -->
+              <div class="pod-conn">
+                <div class="pod-conn-h">
+                  <div class="pod-conn-line"></div>
+                  <div class="pod-conn-head">→</div>
+                </div>
+                <div class="pod-conn-tag">LLM 요청</div>
+              </div>
+
+              <!-- ③ Cache Proxy Pod -->
+              <div class="pod pod-wl" style="flex:1.1;">
+                <div class="pod-label">③ Cache</div>
+                <div class="pod-title">⚡ boan-whitelist-proxy</div>
+                <ul class="pod-body">
+                  <li>프롬프트 → 문장 분할</li>
+                  <li style="color:#047857; font-weight:500;">HIT → 캐시 반환 (비용↓)</li>
+                  <li style="color:#b91c1c; font-weight:500;">MISS → Security LLM</li>
+                  <li>Pass → 후보풀 등록</li>
+                  <li>N회 충족 → 자동 승격</li>
+                </ul>
+              </div>
+
+              <!-- → Registry -->
+              <div class="pod-conn">
+                <div class="pod-conn-h">
+                  <div class="pod-conn-line"></div>
+                  <div class="pod-conn-head">→</div>
+                </div>
+                <div class="pod-conn-tag">LLM 선택</div>
+              </div>
+
+              <!-- ④ LLM Registry Pod -->
+              <div class="pod pod-reg" style="flex:1.1;">
+                <div class="pod-label">④ Registry</div>
+                <div class="pod-title">📦 boan-llm-registry</div>
+                <ul class="pod-body">
+                  <li>curl 등록 → 테스트 → Pool</li>
+                  <li>관리자 바인딩 선택</li>
+                  <li>사내 LLM / Cloud LLM</li>
+                  <li>외부 호출 → boan-proxy</li>
+                </ul>
+                <div class="note" style="margin-top:4px; font-size:8px;">→ S4 사내 LLM 또는 S1 Cloud LLM</div>
+              </div>
+
+            </div><!-- /pod-flow -->
+
+            <!-- 사내 시스템 연결 표시 -->
+            <div style="margin-top:6px; text-align:center; font-size:8.5px; color:#0d9488; font-weight:600;">
+              ↕ OpenClaw ↔ 사내 시스템 (내부망)
+            </div>
+          </div><!-- /k8s-cluster -->
+        </div><!-- /sandbox-box (S2) -->
+      </div><!-- /pc-box -->
+
+      <!-- ══ Mobile 박스 ══ -->
+      <div class="mobile-box">
+        <div class="mobile-box-label">📱 Mobile App</div>
+        <div class="mobile-card">
+          <div class="mobile-card-title">📱 boan-mobile-agent</div>
+          <ul class="mobile-card-body">
+            <li>iOS / Android</li>
+            <li>경량 에이전트</li>
+            <li>사내 앱 · API 연동</li>
+            <li>아웃바운드 → boan-proxy</li>
+          </ul>
+        </div>
+        <div class="mobile-card dashed">
+          <div class="mobile-card-title" style="color:#6b7280;">🛡️ MDM</div>
+          <ul class="mobile-card-body">
+            <li>모바일 기기 관리</li>
+            <li>외부 제공</li>
+          </ul>
+        </div>
+      </div>
+
+    </div><!-- /device-row -->
+  </div><!-- /panel-s3 -->
+
+  <!-- ── Connector R (S2↔S1) ── -->
+  <div class="connector">
+    <div class="flow-arr arr-out">
+      <div class="arr-row"><div class="arr-line"></div><div class="arr-head">→</div></div>
+      <div class="arr-label" style="color:#dc2626;">S2→S1</div>
+      <div class="arr-note" style="color:#dc2626; font-weight:600;">boan-proxy</div>
+      <div class="arr-note" style="color:#dc2626;">무조건 통과</div>
+    </div>
+    <div class="flow-arr arr-in">
+      <div class="arr-row"><div class="arr-head">←</div><div class="arr-line"></div></div>
+      <div class="arr-label">S1→S2</div>
+      <div class="arr-note">자유</div>
+      <div class="arr-note">(역방향 DLP만)</div>
+    </div>
+  </div>
+
+  <!-- ── S1 개인 클라우드 ── -->
+  <div class="zone-panel panel-s1">
+    <div class="zone-panel-label">S1 · 개인 클라우드</div>
+
+    <div class="card" style="margin-top:6px;">
+      <div class="card-title">🚀 OpenClaw <span style="font-size:9px; color:#92400e; font-weight:400;">(활용성)</span></div>
+      <ul class="card-body">
+        <li>일반 코딩 · 리서치</li>
+        <li>빠른 응답 · 다양한 LLM</li>
+        <li>S1 데이터만 취급</li>
+        <li>추가 통제 없음 (게이트 통과)</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <div class="card-title">🔧 기타 에이전트</div>
+      <ul class="card-body">
+        <li>미래 Agent X, Y ...</li>
+        <li>S1 Whitelist 등록만으로 즉시</li>
+        <li>boan-proxy 코드 변경 없음</li>
+      </ul>
+    </div>
+
+    <div class="llm-stripe s1-llm" style="margin-top:auto;">
+      <div class="llm-stripe-title">☁️ Cloud LLM Providers</div>
+      <div style="display:flex; gap:4px; flex-wrap:wrap; margin-bottom:5px;">
+        <span class="tag tag-yellow">OpenAI</span>
+        <span class="tag tag-yellow">Claude</span>
+        <span class="tag tag-yellow">Gemini</span>
+        <span class="tag tag-yellow">기타</span>
+      </div>
+      <ul class="card-body">
+        <li>boan-llm-registry로 등록·관리</li>
+        <li>S1 데이터만 도달 가능</li>
+        <li>S2에서는 커넥터 형태만</li>
+      </ul>
+    </div>
+  </div>
+
+</div><!-- /diagram -->
+
+<!-- ════════ 사내 시스템 하단 ════════ -->
+<div class="isys-wrap">
+  <!-- 연결 점선 (Sandbox 아래 → 사내 시스템) -->
+  <div style="display:flex; width:100%; pointer-events:none;">
+    <div style="width:200px; flex-shrink:0;"></div>
+    <div style="width:56px; flex-shrink:0;"></div>
+    <div style="flex:1; display:flex; flex-direction:column; align-items:center;">
+      <div style="font-size:8.5px; color:#0d9488; font-weight:600; margin-bottom:1px;">OpenClaw ↔ 사내 시스템</div>
+      <div style="width:0; height:14px; border-left:2px dashed #0d9488;"></div>
+    </div>
+    <div style="width:56px; flex-shrink:0;"></div>
+    <div style="width:230px; flex-shrink:0;"></div>
+  </div>
+
+  <div class="isys-zone">
+    <div class="isys-zone-label">🏭 사내 시스템 (Internal Systems)</div>
+    <div class="sys-cards">
+      <div class="sys-card">
+        <div class="sys-card-title">🔌 사내 API 서버</div>
+        <ul class="sys-card-body"><li>REST / gRPC</li><li>OAuth2 · SSO 인증</li><li>OpenClaw 도구 연동</li></ul>
+      </div>
+      <div class="sys-card">
+        <div class="sys-card-title">🗄️ 사내 DB / 데이터</div>
+        <ul class="sys-card-body"><li>내부 데이터베이스</li><li>문서 · 지식베이스</li><li>S3/S4 레벨 데이터</li></ul>
+      </div>
+      <div class="sys-card">
+        <div class="sys-card-title">💬 메신저 / 협업툴</div>
+        <ul class="sys-card-body"><li>사내 채팅 · 알림</li><li>에이전트 알림 연동</li><li>Slack, Teams 등</li></ul>
+      </div>
+      <div class="sys-card">
+        <div class="sys-card-title">🏢 사내 앱 서버</div>
+        <ul class="sys-card-body"><li>ERP · HR · 결재</li><li>사내 SaaS</li><li>내부망 전용</li></ul>
+      </div>
+      <div class="sys-card">
+        <div class="sys-card-title">🔐 인증 / SSO</div>
+        <ul class="sys-card-body"><li>LDAP · AD</li><li>SAML / OIDC</li><li>MFA · 사원증 연동</li></ul>
+      </div>
+    </div>
+    <div style="margin-top:6px; font-size:9.5px; color:#0f766e;">
+      ※ 사내 시스템 통신은 내부망 경유 · OpenClaw가 도구로 호출 (boan-proxy 아웃바운드 통제)
+    </div>
+  </div>
+</div>
+
+<!-- INFO BAR -->
+<div class="info-bar">
+  <div class="info-item">
+    <div class="info-label" style="color:#dc2626;">Pod 데이터 흐름</div>
+    <div class="info-val">① Agent → ② Gateway(boan-proxy) → ③ Whitelist Cache → ④ LLM Registry → Security LLM / Cloud LLM</div>
+  </div>
+  <div class="info-item">
+    <div class="info-label" style="color:#7c3aed;">계층 구조</div>
+    <div class="info-val">S3 단말 &gt; PC 박스 &gt; S2 Sandbox &gt; Kubernetes &gt; Pods</div>
+  </div>
+  <div class="info-item">
+    <div class="info-label" style="color:#047857;">LLM 선택</div>
+    <div class="info-val">사내 Security LLM 또는 PC Local LLM — 사용자 지정 (강제 아님)</div>
+  </div>
+</div>
+
+<!-- CLI BAR -->
+<div class="cli-bar">
+  <div class="cli-bar-title">⌨️ boanclaw</div>
+  <div><code>boanclaw mount /workspace</code> <span class="cli-desc">→ S3↔S2 마운트 (PC 내 Sandbox)</span></div>
+  <div><code>boanclaw chat --secure "계약서"</code> <span class="cli-desc">→ S2 보안 에이전트</span></div>
+  <div><code>boanclaw chat --cloud "리서치"</code> <span class="cli-desc">→ S1 활용 에이전트</span></div>
+  <div><code>boanclaw llm use --local ollama/llama3</code> <span class="cli-desc">→ PC Local LLM</span></div>
+</div>
+
+</body>
+</html>

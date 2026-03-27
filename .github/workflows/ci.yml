@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'src/packages/**'
+      - 'scripts/**'
+      - 'test/**'
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: true
+      - name: Build Go packages
+        run: |
+          for pkg in boan-proxy boan-policy-server boan-whitelist-proxy boan-llm-registry boan-credential-filter boan-audit-agent boan-onecli; do
+            echo "Building $pkg"
+            cd src/packages/$pkg && go build ./... && cd -
+          done
+
+  build-ts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: src/packages/boan-agent/package-lock.json
+      - name: Build TypeScript packages
+        run: |
+          for pkg in boan-agent boan-admin-console; do
+            if [ -f "src/packages/$pkg/package.json" ]; then
+              echo "Building $pkg"
+              cd src/packages/$pkg
+              npm ci --prefer-offline 2>/dev/null || npm install
+              npm run build
+              cd -
+            fi
+          done
+
+  integration-test:
+    runs-on: ubuntu-latest
+    needs: [build-go, build-ts]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+      - name: Start stack
+        run: |
+          docker compose -f docker-compose.dev.yml up -d --build \
+            boan-policy-server boan-credential-filter boan-onecli boan-proxy
+        timeout-minutes: 5
+      - name: Wait for services
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8081/healthz && \
+            curl -sf http://localhost:8082/healthz && \
+            curl -sf http://localhost:8083/healthz && \
+            curl -sf http://localhost:18081/healthz && break
+            sleep 2
+          done
+      - name: Run functional tests
+        run: bash test/functional/run.sh
+        env:
+          BOAN_PROXY_URL: http://localhost:18081
+          BOAN_POLICY_URL: http://localhost:8081
+          BOAN_CRED_URL: http://localhost:8082
+          BOAN_ONECLI_URL: http://localhost:8083
+      - name: Cleanup
+        if: always()
+        run: docker compose -f docker-compose.dev.yml down -v

@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: boan-whitelist-proxy
+  namespace: boan
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: boan-whitelist-proxy
+  template:
+    metadata:
+      labels:
+        app: boan-whitelist-proxy
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: boan-whitelist-proxy
+          image: boanclaw/boan-whitelist-proxy:latest
+          ports:
+            - containerPort: 8090
+          resources:
+            limits:
+              memory: "256Mi"
+              cpu: "250m"
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+          env:
+            - name: BOAN_ORG_ID
+              valueFrom:
+                secretKeyRef:
+                  name: boan-org-config
+                  key: org_id
+            - name: BOAN_LLM_URL
+              value: "http://boan-llm-registry:8080"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8090
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8090
+            periodSeconds: 30
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: boan-whitelist-proxy
+  namespace: boan
+spec:
+  selector:
+    app: boan-whitelist-proxy
+  ports:
+    - name: http
+      port: 8090
+      targetPort: 8090

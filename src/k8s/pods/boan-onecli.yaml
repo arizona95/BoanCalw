@@ -1,0 +1,92 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: boan-onecli
+  namespace: boanclaw
+  labels:
+    app: boan-onecli
+    component: ai-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: boan-onecli
+  template:
+    metadata:
+      labels:
+        app: boan-onecli
+        component: ai-gateway
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+      containers:
+        - name: boan-onecli
+          image: boanclaw/boan-onecli:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8083
+              protocol: TCP
+          env:
+            - name: BOAN_ONECLI_LISTEN
+              value: ":8083"
+            - name: BOAN_ONECLI_CRED_FILTER_URL
+              value: "http://boan-credential-filter:8082"
+            - name: BOAN_ONECLI_ORG_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: BOAN_ONECLI_CREDENTIAL_NAME
+              value: "anthropic-api-key"
+            - name: BOAN_ONECLI_CREDENTIAL_TYPE
+              value: "api_key"
+            - name: BOAN_ONECLI_UPSTREAM_URL
+              value: "https://api.anthropic.com"
+            - name: BOAN_ONECLI_RATE_LIMIT_RPM
+              value: "60"
+            - name: BOAN_ONECLI_MODEL_MAP
+              value: '{"claude-3-opus":"claude-3-5-sonnet-20241022","claude-3-sonnet":"claude-3-5-sonnet-20241022"}'
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8083
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8083
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "32Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: boan-onecli
+  namespace: boanclaw
+  labels:
+    app: boan-onecli
+spec:
+  selector:
+    app: boan-onecli
+  ports:
+    - name: http
+      port: 8083
+      targetPort: 8083
+      protocol: TCP
+  type: ClusterIP

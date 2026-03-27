@@ -1,0 +1,56 @@
+# Ref: NemoClaw test/Dockerfile.sandbox + openclaw-multitenant No-Secrets-On-Agent
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: boan-agent
+  namespace: boan
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: boan-agent
+  template:
+    metadata:
+      labels:
+        app: boan-agent
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 2000
+        runAsGroup: 2000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: boan-agent
+          image: boanclaw/boan-agent:latest
+          resources:
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+            requests:
+              memory: "256Mi"
+              cpu: "200m"
+          env:
+            - name: HTTP_PROXY
+              value: "http://boan-proxy:18080"
+            - name: HTTPS_PROXY
+              value: "http://boan-proxy:18080"
+            - name: BOAN_SESSION_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: workspace
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}

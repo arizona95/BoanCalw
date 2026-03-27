@@ -1,0 +1,127 @@
+version: "3.9"
+
+networks:
+  boanclaw:
+    driver: bridge
+
+services:
+  boan-policy-server:
+    build:
+      context: src/packages/boan-policy-server
+    environment:
+      - BOAN_LISTEN=:8081
+      - BOAN_ORG_ID=dev-org
+    ports:
+      - "8081:8081"
+    networks: [boanclaw]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8081/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  boan-credential-filter:
+    build:
+      context: src/packages/boan-credential-filter
+    environment:
+      - BOAN_LISTEN=:8082
+      - BOAN_KMS_KEY=/etc/boan-cred/aes.key
+    volumes:
+      - boan-cred-keys:/etc/boan-cred
+    ports:
+      - "8082:8082"
+    networks: [boanclaw]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8082/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  boan-whitelist-proxy:
+    build:
+      context: src/packages/boan-whitelist-proxy
+    environment:
+      - BOAN_LISTEN=:8085
+    ports:
+      - "8085:8085"
+    networks: [boanclaw]
+
+  boan-llm-registry:
+    build:
+      context: src/packages/boan-llm-registry
+    environment:
+      - BOAN_LISTEN=:8086
+    ports:
+      - "8086:8086"
+    networks: [boanclaw]
+
+  boan-asset-constitution:
+    build:
+      context: src/packages/boan-asset-constitution
+    environment:
+      - PORT=8087
+    ports:
+      - "8087:8087"
+    networks: [boanclaw]
+
+  boan-audit-agent:
+    build:
+      context: src/packages/boan-audit-agent
+    environment:
+      - BOAN_LISTEN=:8084
+    ports:
+      - "8084:8084"
+    networks: [boanclaw]
+
+  boan-proxy:
+    build:
+      context: src/packages/boan-proxy
+    environment:
+      - BOAN_LISTEN=:18080
+      - BOAN_ADMIN_LISTEN=:18081
+      - BOAN_ORG_ID=dev-org
+      - BOAN_POLICY_URL=http://boan-policy-server:8081
+      - BOAN_CREDENTIAL_FILTER_URL=http://boan-credential-filter:8082
+      - BOAN_OTEL_ENDPOINT=http://boan-audit-agent:8084
+    ports:
+      - "18080:18080"
+      - "18081:18081"
+    networks: [boanclaw]
+    depends_on: [boan-policy-server, boan-credential-filter, boan-audit-agent]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:18081/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  boan-admin-console:
+    build:
+      context: src/packages/boan-admin-console
+    ports:
+      - "19080:80"
+    networks: [boanclaw]
+    depends_on: [boan-proxy]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:80/"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  boan-sandbox:
+    build:
+      context: src/packages
+      dockerfile: boan-sandbox/Dockerfile
+    environment:
+      - HTTP_PROXY=http://boan-proxy:18080
+      - HTTPS_PROXY=http://boan-proxy:18080
+      - BOAN_PROXY_ADMIN=http://boan-proxy:18081
+      - BOAN_SESSION_ID=dev-session-001
+      - BOAN_ONECLI_CRED_FILTER_URL=http://boan-credential-filter:8082
+      - BOAN_ONECLI_ORG_ID=dev-org
+    ports:
+      - "18789:18789"
+    networks: [boanclaw]
+    depends_on: [boan-proxy, boan-credential-filter]
+
+volumes:
+  boan-cred-keys:
