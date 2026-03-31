@@ -1,6 +1,6 @@
 variable "project_id" {}
-variable "region"     { default = "asia-northeast3" }
-variable "org_id"     {}
+variable "region" { default = "asia-northeast3" }
+variable "org_id" {}
 
 resource "google_compute_network" "boan_vpc" {
   name                    = "boanclaw-vpc-${var.org_id}"
@@ -75,6 +75,6 @@ resource "google_compute_firewall" "allow_admin_ingress" {
   source_ranges = ["0.0.0.0/0"]
 }
 
-output "vpc_id"        { value = google_compute_network.boan_vpc.id }
-output "subnet_id"     { value = google_compute_subnetwork.boan_subnet.id }
+output "vpc_id" { value = google_compute_network.boan_vpc.id }
+output "subnet_id" { value = google_compute_subnetwork.boan_subnet.id }
 output "vpc_self_link" { value = google_compute_network.boan_vpc.self_link }

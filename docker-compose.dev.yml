@@ -8,9 +8,15 @@ services:
   boan-policy-server:
     build:
       context: src/packages/boan-policy-server
+    env_file:
+      - deploy/config/gcp.env
     environment:
       - BOAN_LISTEN=:8081
-      - BOAN_ORG_ID=dev-org
+      - BOAN_DATA_DIR=/data/policies
+      - BOAN_KEY_DIR=/etc/boan-policy
+    volumes:
+      - boan-policy-data:/data/policies
+      - boan-policy-keys:/etc/boan-policy
     ports:
       - "8081:8081"
     networks: [boanclaw]
@@ -28,6 +34,7 @@ services:
       - BOAN_KMS_KEY=/etc/boan-cred/aes.key
     volumes:
       - boan-cred-keys:/etc/boan-cred
+      - boan-cred-data:/data/credentials
     ports:
       - "8082:8082"
     networks: [boanclaw]
@@ -51,6 +58,8 @@ services:
       context: src/packages/boan-llm-registry
     environment:
       - BOAN_LISTEN=:8086
+    volumes:
+      - boan-registry-data:/data/registry
     ports:
       - "8086:8086"
     networks: [boanclaw]
@@ -76,13 +85,23 @@ services:
   boan-proxy:
     build:
       context: src/packages/boan-proxy
+    env_file:
+      - deploy/config/gcp.env
     environment:
       - BOAN_LISTEN=:18080
       - BOAN_ADMIN_LISTEN=:18081
-      - BOAN_ORG_ID=dev-org
+      - BOAN_ADMIN_PASSWORD=boan-admin
+      - BOAN_OAUTH_CLIENT_ID=${BOAN_OAUTH_CLIENT_ID:-}
+      - BOAN_OAUTH_CLIENT_SECRET=${BOAN_OAUTH_CLIENT_SECRET:-}
+      - BOAN_OAUTH_REDIRECT_URL=http://localhost:19080/api/auth/callback
+      - BOAN_GCP_ORG_ID=${BOAN_GCP_ORG_ID:-}
       - BOAN_POLICY_URL=http://boan-policy-server:8081
       - BOAN_CREDENTIAL_FILTER_URL=http://boan-credential-filter:8082
+      - BOAN_LLM_REGISTRY_URL=http://boan-llm-registry:8086
       - BOAN_OTEL_ENDPOINT=http://boan-audit-agent:8084
+      - BOAN_USER_DATA_DIR=/data/users
+    volumes:
+      - boan-user-data:/data/users
     ports:
       - "18080:18080"
       - "18081:18081"
@@ -102,10 +121,10 @@ services:
     networks: [boanclaw]
     depends_on: [boan-proxy]
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:80/"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:80/ > /dev/null 2>&1 || exit 1"]
       interval: 10s
       timeout: 5s
-      retries: 3
+      retries: 5
 
   boan-sandbox:
     build:
@@ -124,4 +143,9 @@ services:
     depends_on: [boan-proxy, boan-credential-filter]
 
 volumes:
+  boan-policy-data:
+  boan-policy-keys:
   boan-cred-keys:
+  boan-cred-data:
+  boan-registry-data:
+  boan-user-data:

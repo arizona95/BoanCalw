@@ -29,6 +29,14 @@ func main() {
 		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/credential/"), "/")
 
 		switch {
+		case len(parts) == 1 && parts[0] != "" && r.Method == http.MethodGet:
+			list := store.List(parts[0])
+			if list == nil {
+				list = []filter.CredentialMeta{}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(list)
+
 		case len(parts) == 2 && parts[1] != "" && r.Method == http.MethodGet:
 			resp, err := store.Get(parts[0], parts[1])
 			if err != nil {

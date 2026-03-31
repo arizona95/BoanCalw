@@ -1,6 +1,6 @@
 variable "project_id" {}
-variable "region"     { default = "asia-northeast3" }
-variable "org_id"     {}
+variable "region" { default = "asia-northeast3" }
+variable "org_id" {}
 
 resource "google_kms_key_ring" "boan" {
   name     = "boanclaw-${var.org_id}"
@@ -28,6 +28,6 @@ resource "google_kms_crypto_key" "credential" {
   }
 }
 
-output "keyring_id"         { value = google_kms_key_ring.boan.id }
-output "policy_key_id"      { value = google_kms_crypto_key.policy.id }
-output "credential_key_id"  { value = google_kms_crypto_key.credential.id }
+output "keyring_id" { value = google_kms_key_ring.boan.id }
+output "policy_key_id" { value = google_kms_crypto_key.policy.id }
+output "credential_key_id" { value = google_kms_crypto_key.credential.id }

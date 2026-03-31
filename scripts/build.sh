@@ -32,7 +32,7 @@ build_ts() {
     return 0
   fi
   echo "▶ building $pkg (ts)"
-  (cd "$SRC/$pkg" && npm ci --prefer-offline 2>/dev/null && npm run build) || { echo "  FAIL $pkg"; ERRORS=$((ERRORS+1)); }
+  (cd "$SRC/$pkg" && npm install 2>/dev/null && npm run build) || { echo "  FAIL $pkg"; ERRORS=$((ERRORS+1)); }
 }
 
 build_image() {
@@ -42,7 +42,11 @@ build_image() {
     return 0
   fi
   echo "▶ docker build $pkg"
-  docker build -t "$REGISTRY/$pkg:$TAG" "$SRC/$pkg" || { echo "  FAIL $pkg image"; ERRORS=$((ERRORS+1)); }
+  if [ "$pkg" = "boan-sandbox" ]; then
+    docker build -t "$REGISTRY/$pkg:$TAG" -f "$SRC/$pkg/Dockerfile" "$SRC" || { echo "  FAIL $pkg image"; ERRORS=$((ERRORS+1)); }
+  else
+    docker build -t "$REGISTRY/$pkg:$TAG" "$SRC/$pkg" || { echo "  FAIL $pkg image"; ERRORS=$((ERRORS+1)); }
+  fi
 }
 
 go_packages=(boan-proxy boan-policy-server boan-whitelist-proxy boan-llm-registry boan-credential-filter boan-audit-agent boan-onecli)

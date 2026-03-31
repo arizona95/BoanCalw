@@ -34,16 +34,41 @@ type RBACConfig struct {
 	EnforceStrict bool       `json:"enforce_strict"`
 }
 
+type VersionPolicy struct {
+	MinVersion      string   `json:"min_version,omitempty"`
+	BlockedVersions []string `json:"blocked_versions,omitempty"`
+	UpdateChannel   string   `json:"update_channel,omitempty"`
+}
+
+type SSOProvider struct {
+	ID          string `json:"id"`
+	Label       string `json:"label"`
+	Enabled     bool   `json:"enabled"`
+	Configured  bool   `json:"configured"`
+	RedirectURI string `json:"redirect_uri,omitempty"`
+}
+
+type OrgSettings struct {
+	OrgName      string        `json:"org_name,omitempty"`
+	AllowedSSO   []SSOProvider `json:"allowed_sso,omitempty"`
+	AdminEmails  []string      `json:"admin_emails,omitempty"`
+	SeatLimit    int           `json:"seat_limit,omitempty"`
+	GCPOrgID     string        `json:"gcp_org_id,omitempty"`
+	WorkspaceURL string        `json:"workspace_url,omitempty"`
+}
+
 type Policy struct {
-	Version     int               `json:"version"`
-	OrgID       string            `json:"org_id"`
-	UpdatedAt   time.Time         `json:"updated_at"`
-	Network     []NetworkEndpoint `json:"network_whitelist"`
-	DLPRules    []DLPRule         `json:"dlp_rules"`
-	RBAC        RBACConfig        `json:"rbac"`
-	AllowModels []string          `json:"allow_models"`
-	Features    map[string]bool   `json:"features"`
-	Signature   string            `json:"signature,omitempty"`
+	Version       int               `json:"version"`
+	OrgID         string            `json:"org_id"`
+	UpdatedAt     time.Time         `json:"updated_at"`
+	Network       []NetworkEndpoint `json:"network_whitelist"`
+	DLPRules      []DLPRule         `json:"dlp_rules"`
+	RBAC          RBACConfig        `json:"rbac"`
+	AllowModels   []string          `json:"allow_models"`
+	Features      map[string]bool   `json:"features"`
+	VersionPolicy VersionPolicy     `json:"version_policy,omitempty"`
+	OrgSettings   OrgSettings       `json:"org_settings,omitempty"`
+	Signature     string            `json:"signature,omitempty"`
 }
 
 type VersionInfo struct {
@@ -61,6 +86,43 @@ type Store struct {
 func NewStore(dir string) *Store {
 	os.MkdirAll(dir, 0700)
 	return &Store{dir: dir}
+}
+
+func DefaultPolicy(orgID string) *Policy {
+	return &Policy{
+		Version:   1,
+		OrgID:     orgID,
+		UpdatedAt: time.Now().UTC(),
+		Network: []NetworkEndpoint{
+			{Host: "api.anthropic.com", Ports: []int{443}, Methods: []string{"POST"}},
+		},
+		RBAC: RBACConfig{
+			DefaultRole:   "user",
+			EnforceStrict: true,
+			Roles: []RBACRole{
+				{Role: "owner", Permissions: []string{"policy:*", "org:*", "audit:*"}, SLevel: 4},
+				{Role: "user", Permissions: []string{"workspace:use"}, SLevel: 2},
+			},
+		},
+		AllowModels: []string{"claude-3-5-sonnet"},
+		Features: map[string]bool{
+			"scheduled_tasks": true,
+			"remote_control":  false,
+			"web_access":      false,
+		},
+		VersionPolicy: VersionPolicy{
+			MinVersion:      "0.1.0",
+			BlockedVersions: []string{},
+			UpdateChannel:   "stable",
+		},
+		OrgSettings: OrgSettings{
+			OrgName: orgID,
+			AllowedSSO: []SSOProvider{
+				{ID: "google", Label: "Google", Enabled: true, Configured: false},
+				{ID: "email_otp", Label: "Email OTP", Enabled: true, Configured: true},
+			},
+		},
+	}
 }
 
 func (s *Store) orgDir(orgID string) string {
@@ -93,6 +155,17 @@ func (s *Store) Load(orgID string) (*Policy, error) {
 		return nil, fmt.Errorf("no policy for org %s", orgID)
 	}
 	return s.loadFile(s.orgDir(orgID), versions[len(versions)-1].Version)
+}
+
+func (s *Store) EnsureDefault(orgID string) (*Policy, error) {
+	if p, err := s.Load(orgID); err == nil {
+		return p, nil
+	}
+	p := DefaultPolicy(orgID)
+	if err := s.Save(p); err != nil {
+		return nil, err
+	}
+	return p, nil
 }
 
 func (s *Store) LoadVersion(orgID string, version int) (*Policy, error) {

@@ -1,7 +1,7 @@
 FROM node:22-alpine AS build
 WORKDIR /app
 COPY package.json package-lock.json* ./
-RUN npm ci
+RUN npm install
 COPY . .
 RUN npm run build
 
@@ -16,7 +16,17 @@ server {
         try_files \$uri \$uri/ /index.html;
     }
     location /api/ {
-        proxy_pass http://boan-policy-server:8080/;
+        resolver 127.0.0.11 valid=5s;
+        set \$upstream http://boan-proxy:18081;
+        proxy_pass \$upstream;
+        proxy_connect_timeout 3s;
+        proxy_read_timeout 15s;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header Cookie \$http_cookie;
+        proxy_pass_header Set-Cookie;
+        add_header Access-Control-Allow-Origin * always;
+        add_header Access-Control-Allow-Credentials true always;
     }
 }
 EOF

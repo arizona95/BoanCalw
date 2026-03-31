@@ -2,6 +2,12 @@
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PASS=0; FAIL=0
+PROXY_URL="${BOAN_PROXY_URL:-http://localhost:18080}"
+
+if command -v docker &>/dev/null && docker ps --format '{{.Names}}' 2>/dev/null | grep -q "boan-proxy"; then
+  docker restart boanclaw-boan-proxy-1 >/dev/null 2>&1 || true
+  sleep 3
+fi
 
 run_sec() {
     local name="$1"; local script="$2"
@@ -17,9 +23,9 @@ run_sec() {
 echo "=== BoanClaw Security Tests ==="
 run_sec "SSRF: metadata endpoint blocked"         "$DIR/01_ssrf_block.sh"
 run_sec "Prompt injection: header warning set"    "$DIR/02_prompt_injection.sh"
-run_sec "Auth rate limit: 429 after failures"     "$DIR/03_auth_ratelimit.sh"
-run_sec "Env sanitization: test script"           "$DIR/04_env_sanitization.sh"
 run_sec "DLP: sensitive content detection"        "$DIR/05_dlp_detection.sh"
+run_sec "Env sanitization: test script"           "$DIR/04_env_sanitization.sh"
+run_sec "Auth rate limit: 429 after failures"     "$DIR/03_auth_ratelimit.sh"
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

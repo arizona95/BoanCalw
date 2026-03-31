@@ -6,4 +6,4 @@ COPY . .
 RUN addgroup --system boan && adduser --system --ingroup boan boan
 USER boan
 EXPOSE 8083
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8083"]
+CMD ["sh", "-c", "exec uvicorn server:app --host 0.0.0.0 --port ${PORT:-8087}"]

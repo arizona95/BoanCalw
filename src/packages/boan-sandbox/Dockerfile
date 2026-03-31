@@ -1,8 +1,8 @@
 FROM golang:1.21-alpine AS onecli-builder
 WORKDIR /src
-COPY boan-onecli/go.mod .
-RUN go mod download
+COPY boan-onecli/go.mod ./
 COPY boan-onecli/ .
+RUN go mod download 2>/dev/null || true
 RUN CGO_ENABLED=0 GOOS=linux go build -o /boan-onecli .
 
 FROM node:22-slim AS base
@@ -35,8 +35,8 @@ COPY boan-sandbox/entrypoint.sh /entrypoint.sh
 COPY boan-sandbox/mount-check.sh /mount-check.sh
 RUN chmod +x /entrypoint.sh /mount-check.sh
 
-RUN groupadd -g 1000 boan && \
-    useradd -u 1000 -g boan -m -s /bin/sh boan
+RUN groupadd -g 2000 boan && \
+    useradd -u 2000 -g 2000 -m -s /bin/sh boan
 
 RUN mkdir -p /workspace /tmp/boan && \
     chown -R boan:boan /workspace /tmp/boan /opt/boanclaw

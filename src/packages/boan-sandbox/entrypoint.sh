@@ -60,4 +60,4 @@ echo "[boan-sandbox] installing boan-agent plugin from /opt/boanclaw"
 openclaw plugin install /opt/boanclaw 2>/dev/null || echo "[boan-sandbox] plugin install skipped (may already be installed)"
 
 echo "[boan-sandbox] starting openclaw gateway on port 18789"
-exec openclaw gateway --port 18789 --host 0.0.0.0
+exec openclaw gateway --port 18789

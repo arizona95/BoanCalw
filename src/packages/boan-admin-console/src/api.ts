@@ -16,16 +16,25 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 export interface OrgPolicy {
   version: number;
   org_id: string;
-  rules: Record<string, unknown>;
   updated_at: string;
+  rules: Record<string, unknown>;
+  network_whitelist?: unknown[];
+  dlp_rules?: unknown[];
+  rbac?: unknown;
+  allow_models?: string[];
+  features?: Record<string, boolean>;
 }
 
 export interface LLMEntry {
-  id: string;
   name: string;
   endpoint: string;
-  is_security_llm: boolean;
-  created_at: string;
+  type: "llm" | "image";
+  scope?: string;
+  curl_template?: string;
+  image_curl_template?: string;
+  is_security_llm?: boolean;
+  healthy?: boolean;
+  last_checked?: string;
 }
 
 export interface AuditEvent {
@@ -39,10 +48,9 @@ export interface AuditEvent {
 }
 
 export interface Credential {
-  id: string;
-  name: string;
+  role: string;
+  org_id: string;
   status: "ok" | "expired" | "missing";
-  provider: string;
   expires_at: string;
 }
 
@@ -53,32 +61,55 @@ export interface DashboardStats {
   policy_version: number;
 }
 
+function normalizePolicy(raw: Record<string, unknown>): OrgPolicy {
+  const { version, org_id, updated_at, signature, ...rest } = raw as Record<string, unknown>;
+  void signature;
+  return {
+    version: version as number,
+    org_id: org_id as string,
+    updated_at: updated_at as string,
+    rules: rest,
+    ...rest,
+  };
+}
+
 export const policyApi = {
-  get: () => request<OrgPolicy>(`${POLICY_BASE}/v1/policy`),
+  get: () =>
+    request<Record<string, unknown>>(`${POLICY_BASE}/v1/policy`).then(
+      normalizePolicy
+    ),
   update: (rules: Record<string, unknown>) =>
-    request<OrgPolicy>(`${POLICY_BASE}/v1/policy`, {
+    request<Record<string, unknown>>(`${POLICY_BASE}/v1/policy`, {
       method: "PUT",
-      body: JSON.stringify({ rules }),
-    }),
+      body: JSON.stringify(rules),
+    }).then(normalizePolicy),
   rollback: () =>
-    request<OrgPolicy>(`${POLICY_BASE}/v1/policy/rollback`, {
+    request<Record<string, unknown>>(`${POLICY_BASE}/v1/policy/rollback`, {
       method: "POST",
-    }),
+    }).then(normalizePolicy),
 };
+
+export interface RegisterLLMPayload {
+  name: string;
+  type: "llm" | "image";
+  curl_template?: string;
+  image_curl_template?: string;
+  endpoint?: string;
+}
 
 export const registryApi = {
   list: () => request<LLMEntry[]>(`${REGISTRY_BASE}/v1/llms`),
-  register: (name: string, endpoint: string) =>
+  register: (payload: RegisterLLMPayload) =>
     request<LLMEntry>(`${REGISTRY_BASE}/v1/llms`, {
       method: "POST",
-      body: JSON.stringify({ name, endpoint }),
+      body: JSON.stringify(payload),
     }),
-  bindSecurity: (id: string) =>
-    request<LLMEntry>(`${REGISTRY_BASE}/v1/llms/${id}/bind-security`, {
+  bindSecurity: (name: string) =>
+    request<LLMEntry>(`${REGISTRY_BASE}/v1/llms/${name}/bind-security`, {
       method: "POST",
     }),
-  remove: (id: string) =>
-    request<void>(`${REGISTRY_BASE}/v1/llms/${id}`, { method: "DELETE" }),
+  remove: (name: string) =>
+    request<void>(`${REGISTRY_BASE}/v1/llms/${name}`, { method: "DELETE" }),
 };
 
 export const auditApi = {
@@ -88,14 +119,19 @@ export const auditApi = {
 
 export const credentialApi = {
   list: () => request<Credential[]>(`${CREDENTIAL_BASE}/v1/credentials`),
-  add: (name: string, provider: string) =>
-    request<Credential>(`${CREDENTIAL_BASE}/v1/credentials`, {
+  add: (name: string, key: string, ttlHours = 8760) =>
+    request<{ status: string; role: string }>(`${CREDENTIAL_BASE}/v1/credentials`, {
       method: "POST",
-      body: JSON.stringify({ name, provider }),
+      body: JSON.stringify({ name, key, ttl_hours: ttlHours }),
     }),
-  revoke: (id: string) =>
-    request<void>(`${CREDENTIAL_BASE}/v1/credentials/${id}`, {
+  revoke: (role: string) =>
+    request<void>(`${CREDENTIAL_BASE}/v1/credentials/${role}`, {
       method: "DELETE",
+    }),
+  storeForLLM: (role: string, key: string) =>
+    request<{ status: string; role: string }>(`${CREDENTIAL_BASE}/v1/store`, {
+      method: "POST",
+      body: JSON.stringify({ role, key, ttl_hours: 8760 }),
     }),
 };
 
@@ -117,6 +153,57 @@ export const approvalApi = {
     request<void>(`${APPROVAL_BASE}/${id}/approve`, { method: "POST" }),
   reject: (id: string) =>
     request<void>(`${APPROVAL_BASE}/${id}/reject`, { method: "POST" }),
+};
+
+export interface GCPOrg {
+  name: string;
+  displayName?: string;
+  state?: string;
+  createTime?: string;
+  [key: string]: unknown;
+}
+
+export interface OrgSettingsRecord {
+  org_id: string;
+  display_name?: string;
+  settings: Record<string, unknown>;
+  updated_at: string;
+}
+
+export const orgSettingsApi = {
+  get: () =>
+    fetch("/api/admin/org-settings", { credentials: "include" }).then((r) => {
+      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+      return r.json() as Promise<OrgSettingsRecord>;
+    }),
+  patch: (body: { display_name?: string; settings?: Record<string, unknown> }) =>
+    fetch("/api/admin/org-settings", {
+      method: "PATCH",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).then((r) => {
+      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+      return r.json() as Promise<OrgSettingsRecord>;
+    }),
+};
+
+export const gcpApi = {
+  fetchOrg: (accessToken: string, orgId?: string) =>
+    request<GCPOrg>("/api/gcp/org", {
+      method: "POST",
+      body: JSON.stringify({ access_token: accessToken, org_id: orgId }),
+    }),
+  sync: (accessToken: string, orgId: string, orgName: string, allowDomains: string[]) =>
+    request<{ status: string; org_id: string; domains: number }>("/api/gcp/sync", {
+      method: "POST",
+      body: JSON.stringify({
+        access_token: accessToken,
+        org_id: orgId,
+        org_name: orgName,
+        allow_domains: allowDomains,
+      }),
+    }),
 };
 
 export const dashboardApi = {

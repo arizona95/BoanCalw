@@ -11,31 +11,43 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/audit"
+	"github.com/samsung-sds/boanclaw/boan-proxy/internal/auth"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/config"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/credential"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/dlp"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/network"
+	"github.com/samsung-sds/boanclaw/boan-proxy/internal/orgserver"
+	"github.com/samsung-sds/boanclaw/boan-proxy/internal/orgsettings"
+	"github.com/samsung-sds/boanclaw/boan-proxy/internal/otp"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/promptguard"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/ratelimit"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/rbac"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/router"
 	boantls "github.com/samsung-sds/boanclaw/boan-proxy/internal/tls"
+	"github.com/samsung-sds/boanclaw/boan-proxy/internal/userstore"
 )
 
 type Server struct {
-	cfg     *config.Config
-	ca      *boantls.CA
-	dlpEng  *dlp.Engine
-	rbac    *rbac.Checker
-	gate    *network.Gate
-	creds   *credential.Manager
-	router  *router.Router
-	audit   *audit.Logger
-	limiter *ratelimit.Limiter
+	cfg         *config.Config
+	ca          *boantls.CA
+	dlpEng      *dlp.Engine
+	rbac        *rbac.Checker
+	gate        *network.Gate
+	creds       *credential.Manager
+	router      *router.Router
+	audit       *audit.Logger
+	limiter     *ratelimit.Limiter
+	authProv    *auth.Provider
+	users       *userstore.Store
+	orgSettings *orgsettings.Store
+	orgServer   *orgserver.Client
+	otpStore    *otp.Store
 }
 
 func New(cfg *config.Config) (*Server, error) {
@@ -59,24 +71,81 @@ func New(cfg *config.Config) (*Server, error) {
 		gate = network.NewGate(cfg.PolicyURL, cfg.OrgID)
 	}
 
+	authProv := auth.New(auth.Config{
+		ClientID:            cfg.OAuthClientID,
+		ClientSecret:        cfg.OAuthClientSecret,
+		RedirectURL:         cfg.OAuthRedirectURL,
+		AppBaseURL:          cfg.AppBaseURL,
+		AllowedEmailDomains: splitCSV(cfg.AllowedEmailDomains),
+		JWTSecret:           cfg.JWTSecret,
+		GCPOrgID:            cfg.GCPOrgID,
+	})
+
+	userDataDir := cfg.UserDataDir
+	if userDataDir == "" {
+		userDataDir = "/data/users"
+	}
+	users, err := userstore.New(userDataDir)
+	if err != nil {
+		log.Printf("userstore init warning: %v (using in-memory fallback)", err)
+		users, _ = userstore.New(os.TempDir())
+	}
+
+	orgSettings, err := orgsettings.New(userDataDir)
+	if err != nil {
+		log.Printf("orgsettings init warning: %v", err)
+		orgSettings, err = orgsettings.New(os.TempDir())
+		if err != nil {
+			return nil, fmt.Errorf("orgsettings: %w", err)
+		}
+	}
+
+	otpStore := otp.New(otp.SMTPConfig{
+		Host:     cfg.SMTPHost,
+		Port:     cfg.SMTPPort,
+		User:     cfg.SMTPUser,
+		Password: cfg.SMTPPassword,
+		From:     cfg.SMTPFrom,
+	})
+
 	return &Server{
-		cfg:     cfg,
-		ca:      ca,
-		dlpEng:  dlp.NewEngine(cfg.LocalLLMURL),
-		rbac:    rbac.New(nil),
-		gate:    gate,
-		creds:   credential.NewManager(cfg.PolicyURL, cfg.OrgID),
-		router:  rtr,
-		limiter: ratelimit.NewLimiter(10, 60),
+		cfg:         cfg,
+		ca:          ca,
+		dlpEng:      dlp.NewEngine(cfg.LocalLLMURL),
+		rbac:        rbac.New(nil),
+		gate:        gate,
+		creds:       credential.NewManager(cfg.PolicyURL, cfg.OrgID),
+		router:      rtr,
+		limiter:     ratelimit.NewLimiter(10, 60),
+		authProv:    authProv,
+		users:       users,
+		orgSettings: orgSettings,
+		orgServer:   orgserver.New(cfg.PolicyURL),
+		otpStore:    otpStore,
 	}, nil
 }
 
-func (s *Server) DLPEngine() *dlp.Engine    { return s.dlpEng }
-func (s *Server) Gate() *network.Gate       { return s.gate }
+func splitCSV(v string) []string {
+	if v == "" {
+		return nil
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func (s *Server) DLPEngine() *dlp.Engine     { return s.dlpEng }
+func (s *Server) Gate() *network.Gate        { return s.gate }
 func (s *Server) Creds() *credential.Manager { return s.creds }
-func (s *Server) Router() *router.Router    { return s.router }
-func (s *Server) Audit() *audit.Logger      { return s.audit }
-func (s *Server) CA() *boantls.CA           { return s.ca }
+func (s *Server) Router() *router.Router     { return s.router }
+func (s *Server) Audit() *audit.Logger       { return s.audit }
+func (s *Server) CA() *boantls.CA            { return s.ca }
 
 func (s *Server) Start(ctx context.Context) error {
 	logger, err := audit.New(ctx, s.cfg.AuditEndpoint, s.cfg.OrgID)
@@ -123,10 +192,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
-	if err := s.gate.Allow(r.Host, r.Method); err != nil {
-		http.Error(w, "blocked: "+err.Error(), http.StatusForbidden)
-		s.logEvent(r, "block:network", dlp.SLevel1, err.Error(), nil)
-		return
+	isInternalAPI := r.URL.Host == "" && (r.URL.Path == "/api/llm-use" || r.URL.Path == "/healthz" || strings.HasPrefix(r.URL.Path, "/status"))
+	if !isInternalAPI {
+		if err := s.gate.Allow(r.Host, r.Method); err != nil {
+			http.Error(w, "blocked: "+err.Error(), http.StatusForbidden)
+			s.logEvent(r, "block:network", dlp.SLevel1, err.Error(), nil)
+			return
+		}
 	}
 
 	body, _ := io.ReadAll(r.Body)

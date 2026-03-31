@@ -1,3 +1,3 @@
 module github.com/samsung-sds/boanclaw/boan-llm-registry
 
-go 1.25.0
+go 1.22

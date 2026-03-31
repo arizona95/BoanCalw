@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-PROXY_URL="${BOAN_PROXY_URL:-http://localhost:18081}"
+PROXY_URL="${BOAN_PROXY_URL:-http://localhost:18080}"
 
 STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${PROXY_URL}/api/llm-use" \
   -H "Content-Type: application/json" \

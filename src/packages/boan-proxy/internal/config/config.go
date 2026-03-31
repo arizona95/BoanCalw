@@ -23,6 +23,25 @@ type Config struct {
 	ClientKeyFile       string `json:"client_key_file"`
 	ServerCAPemFile     string `json:"server_ca_pem_file"`
 	NetworkPolicyPubKey string `json:"network_policy_pubkey"`
+	LLMRegistryURL      string `json:"llm_registry_url"`
+	CredentialFilterURL string `json:"credential_filter_url"`
+	OAuthClientID       string `json:"oauth_client_id"`
+	OAuthClientSecret   string `json:"oauth_client_secret"`
+	OAuthRedirectURL    string `json:"oauth_redirect_url"`
+	AppBaseURL          string `json:"app_base_url"`
+	AllowedEmailDomains string `json:"allowed_email_domains"`
+	OwnerEmail          string `json:"owner_email"`
+	JWTSecret           string `json:"jwt_secret"`
+	GCPOrgID            string `json:"gcp_org_id"`
+	AdminPassword       string `json:"admin_password"`
+	AdminEmails         string `json:"admin_emails"`
+	AllowedSSO          string `json:"allowed_sso"`
+	UserDataDir         string `json:"user_data_dir"`
+	SMTPHost            string `json:"smtp_host"`
+	SMTPPort            string `json:"smtp_port"`
+	SMTPUser            string `json:"smtp_user"`
+	SMTPPassword        string `json:"smtp_password"`
+	SMTPFrom            string `json:"smtp_from"`
 }
 
 func Load() (*Config, error) {
@@ -42,6 +61,25 @@ func Load() (*Config, error) {
 		ClientKeyFile:       env("BOAN_CLIENT_KEY", ""),
 		ServerCAPemFile:     env("BOAN_SERVER_CA", ""),
 		NetworkPolicyPubKey: env("BOAN_NETWORK_POLICY_PUBKEY", ""),
+		LLMRegistryURL:      env("BOAN_LLM_REGISTRY_URL", "http://boan-llm-registry:8086"),
+		CredentialFilterURL: env("BOAN_CREDENTIAL_FILTER_URL", "http://boan-credential-filter:8082"),
+		OAuthClientID:       env("BOAN_OAUTH_CLIENT_ID", ""),
+		OAuthClientSecret:   env("BOAN_OAUTH_CLIENT_SECRET", ""),
+		OAuthRedirectURL:    env("BOAN_OAUTH_REDIRECT_URL", ""),
+		AppBaseURL:          env("BOAN_APP_BASE_URL", ""),
+		AllowedEmailDomains: env("BOAN_ALLOWED_EMAIL_DOMAINS", ""),
+		OwnerEmail:          env("BOAN_OWNER_EMAIL", ""),
+		JWTSecret:           env("BOAN_JWT_SECRET", ""),
+		GCPOrgID:            env("BOAN_GCP_ORG_ID", ""),
+		AdminPassword:       env("BOAN_ADMIN_PASSWORD", "boan-admin"),
+		AdminEmails:         env("BOAN_ADMIN_EMAILS", ""),
+		AllowedSSO:          env("BOAN_ALLOWED_SSO", ""),
+		UserDataDir:         env("BOAN_USER_DATA_DIR", "/data/users"),
+		SMTPHost:            env("BOAN_SMTP_HOST", ""),
+		SMTPPort:            env("BOAN_SMTP_PORT", "587"),
+		SMTPUser:            env("BOAN_SMTP_USER", ""),
+		SMTPPassword:        env("BOAN_SMTP_PASSWORD", ""),
+		SMTPFrom:            env("BOAN_SMTP_FROM", ""),
 	}
 
 	if f := os.Getenv("BOAN_CONFIG"); f != "" {

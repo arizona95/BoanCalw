@@ -11,7 +11,7 @@ RUN addgroup -S boan && adduser -S boan -G boan
 RUN apk add --no-cache ca-certificates
 WORKDIR /app
 COPY --from=builder /boan-proxy /boan-audit /usr/local/bin/
-RUN mkdir -p /etc/boan && chown boan:boan /etc/boan
+RUN mkdir -p /etc/boan /data/users && chown -R boan:boan /etc/boan /data/users
 USER boan
 EXPOSE 18080 18081
 ENTRYPOINT ["boan-proxy"]

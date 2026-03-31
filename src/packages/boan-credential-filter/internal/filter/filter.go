@@ -115,6 +115,35 @@ func (s *Store) Register(orgID string, req *RegisterRequest) error {
 	return nil
 }
 
+type CredentialMeta struct {
+	Role      string `json:"role"`
+	OrgID     string `json:"org_id"`
+	Status    Status `json:"status"`
+	ExpiresAt string `json:"expires_at"`
+}
+
+func (s *Store) List(orgID string) []CredentialMeta {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []CredentialMeta
+	for _, c := range s.creds {
+		if c.OrgID != orgID {
+			continue
+		}
+		st := StatusOK
+		if time.Now().After(c.ExpiresAt) {
+			st = StatusExpired
+		}
+		out = append(out, CredentialMeta{
+			Role:      c.Role,
+			OrgID:     c.OrgID,
+			Status:    st,
+			ExpiresAt: c.ExpiresAt.Format(time.RFC3339),
+		})
+	}
+	return out
+}
+
 func (s *Store) Revoke(orgID, role string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
