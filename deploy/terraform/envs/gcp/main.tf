@@ -27,6 +27,7 @@ module "network" {
   project_id = var.project_id
   region     = var.region
   org_id     = var.org_id
+  workstation_rdp_source_ranges = var.workstation_rdp_source_ranges
 }
 
 module "kms" {
@@ -74,6 +75,20 @@ module "admin_console" {
   smtp_user           = var.smtp_user
   smtp_password       = var.smtp_password
   smtp_from           = var.smtp_from
+  workstation_provider = var.workstation_provider
+  workstation_platform = var.workstation_platform
+  workstation_region   = var.workstation_region
+  workstation_machine_type = var.workstation_machine_type
+  workstation_project_id = var.workstation_project_id
+  workstation_zone = var.workstation_zone
+  workstation_image_project = var.workstation_image_project
+  workstation_image_family = var.workstation_image_family
+  workstation_subnetwork = var.workstation_subnetwork
+  workstation_network_tags = var.workstation_network_tags
+  workstation_service_account = var.workstation_service_account
+  workstation_root_volume_gib = var.workstation_root_volume_gib
+  workstation_console_base_url = var.workstation_console_base_url
+  workstation_web_base_url = var.workstation_web_base_url
 }
 
 output "vpc_id" { value = module.network.vpc_id }
@@ -81,5 +96,7 @@ output "project_id" { value = var.project_id }
 output "project_name" { value = var.project_name }
 output "policy_server_url" { value = module.policy_server.policy_server_url }
 output "admin_console_url" { value = module.admin_console.hosting_url }
+output "admin_api_service_account" { value = module.admin_console.admin_api_service_account }
+output "workstation_service_account" { value = module.admin_console.workstation_service_account }
 output "audit_bucket" { value = module.logging.bucket_name }
 output "kms_keyring" { value = module.kms.keyring_id }

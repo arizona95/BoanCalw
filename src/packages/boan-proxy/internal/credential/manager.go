@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 )
@@ -46,6 +49,40 @@ func NewManager(filterURL, orgID string) *Manager {
 		client:     &http.Client{Timeout: 10 * time.Second},
 		refreshBuf: 30 * time.Second,
 	}
+}
+
+func Resolve(ctx context.Context, filterURL, orgID, role string) (string, error) {
+	role = strings.TrimSpace(role)
+	if role == "" {
+		return "", fmt.Errorf("empty credential role")
+	}
+	candidates := []string{role}
+	if !strings.HasSuffix(role, "-apikey") {
+		candidates = append(candidates, role+"-apikey")
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	for _, candidate := range candidates {
+		endpoint := fmt.Sprintf("%s/credential/%s/%s", strings.TrimRight(filterURL, "/"), orgID, url.PathEscape(candidate))
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return "", err
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		var data struct {
+			Key    string `json:"key"`
+			Status string `json:"status"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&data)
+		_, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode < 300 && data.Status == "ok" && data.Key != "" {
+			return data.Key, nil
+		}
+	}
+	return "", fmt.Errorf("credential %q not found", role)
 }
 
 func (m *Manager) Get(name string) (string, error) {

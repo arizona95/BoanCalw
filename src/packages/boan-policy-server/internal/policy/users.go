@@ -19,15 +19,30 @@ const (
 )
 
 type OrgUser struct {
-	Email        string     `json:"email"`
-	Name         string     `json:"name,omitempty"`
-	PasswordHash string     `json:"password_hash,omitempty"`
-	Role         string     `json:"role"`
-	OrgID        string     `json:"org_id"`
-	Status       UserStatus `json:"status"`
-	AuthProvider string     `json:"auth_provider,omitempty"`
-	CreatedAt    time.Time  `json:"created_at"`
-	LastLoginAt  time.Time  `json:"last_login_at,omitempty"`
+	Email        string       `json:"email"`
+	Name         string       `json:"name,omitempty"`
+	MachineID    string       `json:"machine_id,omitempty"`
+	MachineName  string       `json:"machine_name,omitempty"`
+	PasswordHash string       `json:"password_hash,omitempty"`
+	Role         string       `json:"role"`
+	OrgID        string       `json:"org_id"`
+	Status       UserStatus   `json:"status"`
+	AuthProvider string       `json:"auth_provider,omitempty"`
+	CreatedAt    time.Time    `json:"created_at"`
+	LastLoginAt  time.Time    `json:"last_login_at,omitempty"`
+	Workstation  *Workstation `json:"workstation,omitempty"`
+}
+
+type Workstation struct {
+	Provider      string    `json:"provider"`
+	Platform      string    `json:"platform"`
+	Status        string    `json:"status"`
+	DisplayName   string    `json:"display_name"`
+	InstanceID    string    `json:"instance_id"`
+	Region        string    `json:"region,omitempty"`
+	ConsoleURL    string    `json:"console_url,omitempty"`
+	WebDesktopURL string    `json:"web_desktop_url,omitempty"`
+	AssignedAt    time.Time `json:"assigned_at"`
 }
 
 var (
@@ -36,10 +51,10 @@ var (
 )
 
 func (s *Store) RegisterUser(orgID, email, password string) (*OrgUser, error) {
-	return s.RegisterUserWithRole(orgID, email, password, "", UserStatus(""))
+	return s.RegisterUserWithRole(orgID, email, password, "", UserStatus(""), "", "")
 }
 
-func (s *Store) RegisterUserWithRole(orgID, email, password, role string, status UserStatus) (*OrgUser, error) {
+func (s *Store) RegisterUserWithRole(orgID, email, password, role string, status UserStatus, machineID, machineName string) (*OrgUser, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -68,6 +83,8 @@ func (s *Store) RegisterUserWithRole(orgID, email, password, role string, status
 
 	user := &OrgUser{
 		Email:        email,
+		MachineID:    machineID,
+		MachineName:  machineName,
 		PasswordHash: string(hash),
 		Role:         role,
 		OrgID:        orgID,
@@ -82,7 +99,7 @@ func (s *Store) RegisterUserWithRole(orgID, email, password, role string, status
 	return user, nil
 }
 
-func (s *Store) UpsertSSOUser(orgID, email, name, role, provider string, status UserStatus) (*OrgUser, error) {
+func (s *Store) UpsertSSOUser(orgID, email, name, role, provider string, status UserStatus, machineID, machineName string) (*OrgUser, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -107,6 +124,12 @@ func (s *Store) UpsertSSOUser(orgID, email, name, role, provider string, status 
 		if role != "" {
 			u.Role = role
 		}
+		if machineID != "" {
+			u.MachineID = machineID
+		}
+		if machineName != "" {
+			u.MachineName = machineName
+		}
 		u.Status = status
 		u.AuthProvider = provider
 		u.LastLoginAt = now
@@ -119,6 +142,8 @@ func (s *Store) UpsertSSOUser(orgID, email, name, role, provider string, status 
 	user := &OrgUser{
 		Email:        email,
 		Name:         name,
+		MachineID:    machineID,
+		MachineName:  machineName,
 		Role:         role,
 		OrgID:        orgID,
 		Status:       status,
@@ -133,7 +158,7 @@ func (s *Store) UpsertSSOUser(orgID, email, name, role, provider string, status 
 	return user, nil
 }
 
-func (s *Store) UpdateUser(orgID, email, role string, status UserStatus) (*OrgUser, error) {
+func (s *Store) UpdateUser(orgID, email, role string, status UserStatus, workstation *Workstation, machineID, machineName string) (*OrgUser, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -151,6 +176,15 @@ func (s *Store) UpdateUser(orgID, email, role string, status UserStatus) (*OrgUs
 		}
 		if status != "" {
 			u.Status = status
+		}
+		if workstation != nil {
+			u.Workstation = workstation
+		}
+		if machineID != "" {
+			u.MachineID = machineID
+		}
+		if machineName != "" {
+			u.MachineName = machineName
 		}
 		u.LastLoginAt = time.Now().UTC()
 		if err := s.saveUsers(orgID, users); err != nil {

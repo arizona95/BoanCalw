@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -21,6 +20,8 @@ import (
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/config"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/credential"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/dlp"
+	"github.com/samsung-sds/boanclaw/boan-proxy/internal/guardrail"
+	"github.com/samsung-sds/boanclaw/boan-proxy/internal/guac"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/network"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/orgserver"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/orgsettings"
@@ -31,23 +32,28 @@ import (
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/router"
 	boantls "github.com/samsung-sds/boanclaw/boan-proxy/internal/tls"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/userstore"
+	"github.com/samsung-sds/boanclaw/boan-proxy/internal/workstation"
 )
 
 type Server struct {
-	cfg         *config.Config
-	ca          *boantls.CA
-	dlpEng      *dlp.Engine
-	rbac        *rbac.Checker
-	gate        *network.Gate
-	creds       *credential.Manager
-	router      *router.Router
-	audit       *audit.Logger
-	limiter     *ratelimit.Limiter
-	authProv    *auth.Provider
-	users       *userstore.Store
-	orgSettings *orgsettings.Store
-	orgServer   *orgserver.Client
-	otpStore    *otp.Store
+	cfg          *config.Config
+	ca           *boantls.CA
+	dlpEng       *dlp.Engine
+	rbac         *rbac.Checker
+	gate         *network.Gate
+	creds        *credential.Manager
+	router       *router.Router
+	audit        *audit.Logger
+	limiter      *ratelimit.Limiter
+	authProv     *auth.Provider
+	users        *userstore.Store
+	orgSettings  *orgsettings.Store
+	orgServer    *orgserver.Client
+	otpStore     *otp.Store
+	workstations workstation.Provisioner
+	guac         *guac.Client
+	guardrail    *guardrail.Client
+	declinedFPs  *declinedFingerprintStore
 }
 
 func New(cfg *config.Config) (*Server, error) {
@@ -109,19 +115,23 @@ func New(cfg *config.Config) (*Server, error) {
 	})
 
 	return &Server{
-		cfg:         cfg,
-		ca:          ca,
-		dlpEng:      dlp.NewEngine(cfg.LocalLLMURL),
-		rbac:        rbac.New(nil),
-		gate:        gate,
-		creds:       credential.NewManager(cfg.PolicyURL, cfg.OrgID),
-		router:      rtr,
-		limiter:     ratelimit.NewLimiter(10, 60),
-		authProv:    authProv,
-		users:       users,
-		orgSettings: orgSettings,
-		orgServer:   orgserver.New(cfg.PolicyURL),
-		otpStore:    otpStore,
+		cfg:          cfg,
+		ca:           ca,
+		dlpEng:       dlp.NewEngine(cfg.LocalLLMURL, cfg.LocalLLMModel),
+		rbac:         rbac.New(nil),
+		gate:         gate,
+		creds:        credential.NewManager(cfg.CredentialFilterURL, cfg.OrgID),
+		router:       rtr,
+		limiter:      ratelimit.NewLimiter(10, 60),
+		authProv:     authProv,
+		users:        users,
+		orgSettings:  orgSettings,
+		orgServer:    orgserver.New(cfg.PolicyURL),
+		otpStore:     otpStore,
+		workstations: workstation.New(cfg),
+		guac:         guac.New(cfg),
+		guardrail:    guardrail.New(cfg.PolicyURL),
+		declinedFPs:  newDeclinedFingerprintStore(userDataDir),
 	}, nil
 }
 
@@ -194,7 +204,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	isInternalAPI := r.URL.Host == "" && (r.URL.Path == "/api/llm-use" || r.URL.Path == "/healthz" || strings.HasPrefix(r.URL.Path, "/status"))
 	if !isInternalAPI {
-		if err := s.gate.Allow(r.Host, r.Method); err != nil {
+		if err := network.AllowRequest(s.gate, r); err != nil {
 			http.Error(w, "blocked: "+err.Error(), http.StatusForbidden)
 			s.logEvent(r, "block:network", dlp.SLevel1, err.Error(), nil)
 			return
@@ -256,42 +266,9 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
-	if err := s.gate.Allow(r.Host, "CONNECT"); err != nil {
-		http.Error(w, "blocked", http.StatusForbidden)
-		s.logEvent(r, "block:network", dlp.SLevel1, err.Error(), nil)
-		return
-	}
-
-	dest, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
-		dest.Close()
-		return
-	}
-	conn, _, err := hijacker.Hijack()
-	if err != nil {
-		dest.Close()
-		return
-	}
-	defer conn.Close()
-	defer dest.Close()
-
-	s.logEvent(r, "tunnel", dlp.SLevel1, "", nil)
-
-	done := make(chan struct{}, 2)
-	cp := func(a, b net.Conn) {
-		_, _ = io.Copy(a, b)
-		done <- struct{}{}
-	}
-	go cp(dest, conn)
-	go cp(conn, dest)
-	<-done
+	reason := "raw CONNECT tunnel disabled: HTTPS egress must use an inspected, policy-managed path"
+	http.Error(w, reason, http.StatusForbidden)
+	s.logEvent(r, "block:connect", dlp.SLevel1, reason, nil)
 }
 
 func (s *Server) logEvent(r *http.Request, action string, level dlp.SLevel, reason string, body []byte) {

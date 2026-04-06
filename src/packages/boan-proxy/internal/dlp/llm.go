@@ -18,12 +18,14 @@ type LLMResult struct {
 
 type LLMDetector struct {
 	url    string
+	model  string
 	client *http.Client
 }
 
-func NewLLMDetector(ollamaURL string) *LLMDetector {
+func NewLLMDetector(ollamaURL, model string) *LLMDetector {
 	return &LLMDetector{
 		url:    ollamaURL + "/api/generate",
+		model:  strings.TrimSpace(model),
 		client: &http.Client{Timeout: 2 * time.Second},
 	}
 }
@@ -54,11 +56,14 @@ func (d *LLMDetector) Classify(ctx context.Context, text string) (SLevel, error)
 }
 
 func (d *LLMDetector) ClassifyDetailed(ctx context.Context, text string) (*LLMResult, error) {
+	if d == nil || d.model == "" {
+		return nil, fmt.Errorf("llm detector disabled")
+	}
 	if len(text) > 2000 {
 		text = text[:2000]
 	}
 	body, _ := json.Marshal(ollamaReq{
-		Model:  "qwen2.5:3b",
+		Model:  d.model,
 		Prompt: systemPrompt + "\n\nText: " + text,
 		Stream: false,
 	})

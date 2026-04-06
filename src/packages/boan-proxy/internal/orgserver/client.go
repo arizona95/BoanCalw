@@ -15,11 +15,26 @@ type Client struct {
 }
 
 type User struct {
-	Email  string `json:"email"`
-	Name   string `json:"name"`
-	Role   string `json:"role"`
-	OrgID  string `json:"org_id"`
-	Status string `json:"status"`
+	Email       string       `json:"email"`
+	Name        string       `json:"name"`
+	MachineID   string       `json:"machine_id,omitempty"`
+	MachineName string       `json:"machine_name,omitempty"`
+	Role        string       `json:"role"`
+	OrgID       string       `json:"org_id"`
+	Status      string       `json:"status"`
+	Workstation *Workstation `json:"workstation,omitempty"`
+}
+
+type Workstation struct {
+	Provider      string `json:"provider"`
+	Platform      string `json:"platform"`
+	Status        string `json:"status"`
+	DisplayName   string `json:"display_name"`
+	InstanceID    string `json:"instance_id"`
+	Region        string `json:"region,omitempty"`
+	ConsoleURL    string `json:"console_url,omitempty"`
+	WebDesktopURL string `json:"web_desktop_url,omitempty"`
+	AssignedAt    string `json:"assigned_at,omitempty"`
 }
 
 func New(baseURL string) *Client {
@@ -53,10 +68,10 @@ func (c *Client) ListUsers(orgID string) ([]User, error) {
 }
 
 func (c *Client) RegisterUser(orgID, email, password string) error {
-	return c.RegisterUserWithState(orgID, email, password, "", "")
+	return c.RegisterUserWithState(orgID, email, password, "", "", "", "")
 }
 
-func (c *Client) RegisterUserWithState(orgID, email, password, role, status string) error {
+func (c *Client) RegisterUserWithState(orgID, email, password, role, status, machineID, machineName string) error {
 	if !c.Enabled() {
 		return nil
 	}
@@ -65,15 +80,17 @@ func (c *Client) RegisterUserWithState(orgID, email, password, role, status stri
 		"password": password,
 		"role":     role,
 		"status":   status,
+		"machine_id": machineID,
+		"machine_name": machineName,
 	}
 	return c.postJSON(fmt.Sprintf("%s/org/%s/v1/users/register", c.baseURL, orgID), body)
 }
 
 func (c *Client) SyncSSOUser(orgID, email, name, role, provider string) error {
-	return c.SyncUser(orgID, email, name, role, provider, "")
+	return c.SyncUser(orgID, email, name, role, provider, "", "", "")
 }
 
-func (c *Client) SyncUser(orgID, email, name, role, provider, status string) error {
+func (c *Client) SyncUser(orgID, email, name, role, provider, status, machineID, machineName string) error {
 	if !c.Enabled() {
 		return nil
 	}
@@ -83,18 +100,23 @@ func (c *Client) SyncUser(orgID, email, name, role, provider, status string) err
 		"role":     role,
 		"provider": provider,
 		"status":   status,
+		"machine_id": machineID,
+		"machine_name": machineName,
 	}
 	return c.postJSON(fmt.Sprintf("%s/org/%s/v1/users/sso-sync", c.baseURL, orgID), body)
 }
 
-func (c *Client) UpdateUser(orgID, email, role, status string) error {
+func (c *Client) UpdateUser(orgID, email, role, status string, workstation *Workstation, machineID, machineName string) error {
 	if !c.Enabled() {
 		return nil
 	}
-	body := map[string]string{
-		"email":  email,
-		"role":   role,
-		"status": status,
+	body := map[string]any{
+		"email":       email,
+		"role":        role,
+		"status":      status,
+		"workstation": workstation,
+		"machine_id":  machineID,
+		"machine_name": machineName,
 	}
 	return c.doJSON(http.MethodPatch, fmt.Sprintf("%s/org/%s/v1/users", c.baseURL, orgID), body)
 }

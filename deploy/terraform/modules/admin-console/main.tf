@@ -19,6 +19,26 @@ variable "smtp_port" { default = "587" }
 variable "smtp_user" { default = "" }
 variable "smtp_password" { default = "" }
 variable "smtp_from" { default = "" }
+variable "workstation_provider" { default = "gcp-compute" }
+variable "workstation_platform" { default = "windows" }
+variable "workstation_region" { default = "asia-northeast3" }
+variable "workstation_machine_type" { default = "e2-standard-2" }
+variable "workstation_project_id" { default = "" }
+variable "workstation_zone" { default = "asia-northeast3-a" }
+variable "workstation_image_project" { default = "windows-cloud" }
+variable "workstation_image_family" { default = "windows-2022" }
+variable "workstation_subnetwork" { default = "" }
+variable "workstation_network_tags" { default = "" }
+variable "workstation_service_account" { default = "" }
+variable "workstation_root_volume_gib" { default = "100" }
+variable "workstation_console_base_url" { default = "" }
+variable "workstation_web_base_url" { default = "" }
+
+locals {
+  admin_api_service_account_id     = "boan-admin-api"
+  workstation_service_account_id   = "boan-workstation-vm"
+  effective_workstation_sa_email   = var.workstation_service_account != "" ? var.workstation_service_account : google_service_account.workstation_vm.email
+}
 
 resource "google_firebase_hosting_site" "admin" {
   count    = var.enable_firebase_hosting ? 1 : 0
@@ -34,6 +54,42 @@ resource "google_firebase_hosting_channel" "production" {
   channel_id = "live"
 }
 
+resource "google_service_account" "admin_api" {
+  project      = var.project_id
+  account_id   = local.admin_api_service_account_id
+  display_name = "BoanClaw Admin API"
+}
+
+resource "google_service_account" "workstation_vm" {
+  project      = var.project_id
+  account_id   = local.workstation_service_account_id
+  display_name = "BoanClaw Workstation VM"
+}
+
+resource "google_project_iam_member" "admin_api_compute_instance_admin" {
+  project = var.project_id
+  role    = "roles/compute.instanceAdmin.v1"
+  member  = "serviceAccount:${google_service_account.admin_api.email}"
+}
+
+resource "google_project_iam_member" "admin_api_compute_network_user" {
+  project = var.project_id
+  role    = "roles/compute.networkUser"
+  member  = "serviceAccount:${google_service_account.admin_api.email}"
+}
+
+resource "google_project_iam_member" "admin_api_compute_viewer" {
+  project = var.project_id
+  role    = "roles/compute.viewer"
+  member  = "serviceAccount:${google_service_account.admin_api.email}"
+}
+
+resource "google_service_account_iam_member" "admin_api_service_account_user" {
+  service_account_id = google_service_account.workstation_vm.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.admin_api.email}"
+}
+
 # Cloud Run for SSO callback + API proxy
 resource "google_cloud_run_v2_service" "admin_api" {
   name     = "boan-admin-api"
@@ -41,6 +97,8 @@ resource "google_cloud_run_v2_service" "admin_api" {
   project  = var.project_id
 
   template {
+    service_account = google_service_account.admin_api.email
+
     containers {
       image = var.admin_api_image
       ports {
@@ -118,6 +176,66 @@ resource "google_cloud_run_v2_service" "admin_api" {
         name  = "BOAN_SMTP_FROM"
         value = var.smtp_from
       }
+      env {
+        name  = "BOAN_WORKSTATION_PROVIDER"
+        value = var.workstation_provider
+      }
+      env {
+        name  = "BOAN_WORKSTATION_PLATFORM"
+        value = var.workstation_platform
+      }
+      env {
+        name  = "BOAN_WORKSTATION_REGION"
+        value = var.workstation_region
+      }
+      env {
+        name  = "BOAN_WORKSTATION_MACHINE_TYPE"
+        value = var.workstation_machine_type
+      }
+      env {
+        name  = "BOAN_WORKSTATION_PROJECT_ID"
+        value = var.workstation_project_id
+      }
+      env {
+        name  = "BOAN_WORKSTATION_ZONE"
+        value = var.workstation_zone
+      }
+      env {
+        name  = "BOAN_WORKSTATION_IMAGE_PROJECT"
+        value = var.workstation_image_project
+      }
+      env {
+        name  = "BOAN_WORKSTATION_IMAGE_FAMILY"
+        value = var.workstation_image_family
+      }
+      env {
+        name  = "BOAN_WORKSTATION_SUBNETWORK"
+        value = var.workstation_subnetwork
+      }
+      env {
+        name  = "BOAN_WORKSTATION_NETWORK_TAGS"
+        value = var.workstation_network_tags
+      }
+      env {
+        name  = "BOAN_WORKSTATION_SERVICE_ACCOUNT"
+        value = local.effective_workstation_sa_email
+      }
+      env {
+        name  = "BOAN_WORKSTATION_ROOT_VOLUME_GIB"
+        value = var.workstation_root_volume_gib
+      }
+      env {
+        name  = "BOAN_WORKSTATION_CONSOLE_BASE_URL"
+        value = var.workstation_console_base_url
+      }
+      env {
+        name  = "BOAN_WORKSTATION_WEB_BASE_URL"
+        value = var.workstation_web_base_url
+      }
+      env {
+        name  = "GCP_PROJECT_ID"
+        value = var.project_id
+      }
     }
   }
 }
@@ -134,3 +252,5 @@ output "hosting_url" {
   value = var.enable_firebase_hosting ? "https://${google_firebase_hosting_site.admin[0].site_id}.web.app" : ""
 }
 output "admin_api_url" { value = google_cloud_run_v2_service.admin_api.uri }
+output "admin_api_service_account" { value = google_service_account.admin_api.email }
+output "workstation_service_account" { value = local.effective_workstation_sa_email }

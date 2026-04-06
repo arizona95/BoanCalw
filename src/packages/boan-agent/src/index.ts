@@ -2,6 +2,17 @@ import type { OpenClawPluginApi, LLMUseRequest, LLMUseResponse } from "./types.j
 import { registerMountCommand, mountTool } from "./commands/mount.js";
 import { registerSessionCommand, sessionTool } from "./commands/session.js";
 import { registerAuditCommand, auditTool } from "./commands/audit.js";
+import {
+  computerScreenshotTool,
+  computerClickTool,
+  computerDoubleClickTool,
+  computerRightClickTool,
+  computerScrollTool,
+  computerTypeTool,
+  computerKeyTool,
+  computerMoveTool,
+  computerClickQueryTool,
+} from "./commands/computer-use.js";
 import { GitGuard } from "./git/guard.js";
 import { safeFetch } from "./ssrf.js";
 
@@ -77,7 +88,11 @@ export default function register(api: OpenClawPluginApi): void {
   const proxyUrl = process.env.BOAN_PROXY_URL ?? "http://boan-proxy:18080";
   process.env.HTTP_PROXY = proxyUrl;
   process.env.HTTPS_PROXY = proxyUrl;
-  process.env.BOAN_PROXY_ADMIN = proxyUrl;
+  // BOAN_PROXY_ADMIN points to the admin port (18081) for computer-use/session APIs.
+  // Only set default if not already configured via environment.
+  if (!process.env.BOAN_PROXY_ADMIN) {
+    process.env.BOAN_PROXY_ADMIN = proxyUrl.replace(/:18080$/, ":18081");
+  }
 
   const guard = new GitGuard(api.logger);
   guard.install();
@@ -162,10 +177,132 @@ export default function register(api: OpenClawPluginApi): void {
     handler: sessionTool,
   });
 
+  // ── Computer Use Tools ──────────────────────────────────────────────────
+  api.registerTool({
+    name: "computer_screenshot",
+    description: "Take a screenshot of the user's GCP workstation remote desktop. Returns the current screen state as an image.",
+    inputSchema: { type: "object", properties: {} },
+    handler: computerScreenshotTool,
+  });
+
+  api.registerTool({
+    name: "computer_click",
+    description: "Click at (x, y) coordinates on the GCP workstation screen.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        x: { type: "number", description: "X coordinate (pixels from left edge of desktop)" },
+        y: { type: "number", description: "Y coordinate (pixels from top edge of desktop)" },
+        button: { type: "string", enum: ["left", "right", "middle"], description: "Mouse button (default: left)" },
+      },
+      required: ["x", "y"],
+    },
+    handler: computerClickTool,
+  });
+
+  api.registerTool({
+    name: "computer_double_click",
+    description: "Double-click at (x, y) on the GCP workstation screen.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        x: { type: "number", description: "X coordinate" },
+        y: { type: "number", description: "Y coordinate" },
+      },
+      required: ["x", "y"],
+    },
+    handler: computerDoubleClickTool,
+  });
+
+  api.registerTool({
+    name: "computer_right_click",
+    description: "Right-click at (x, y) on the GCP workstation screen.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        x: { type: "number", description: "X coordinate" },
+        y: { type: "number", description: "Y coordinate" },
+      },
+      required: ["x", "y"],
+    },
+    handler: computerRightClickTool,
+  });
+
+  api.registerTool({
+    name: "computer_scroll",
+    description: "Scroll the mouse wheel at (x, y) on the GCP workstation screen.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        x: { type: "number", description: "X coordinate" },
+        y: { type: "number", description: "Y coordinate" },
+        direction: { type: "string", enum: ["up", "down"], description: "Scroll direction (default: down)" },
+        amount: { type: "number", description: "Number of scroll ticks (default: 3)" },
+      },
+      required: ["x", "y"],
+    },
+    handler: computerScrollTool,
+  });
+
+  api.registerTool({
+    name: "computer_type",
+    description: "Type text into the GCP workstation (sends keyboard input).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "Text to type" },
+      },
+      required: ["text"],
+    },
+    handler: computerTypeTool,
+  });
+
+  api.registerTool({
+    name: "computer_key",
+    description: "Press a special key or keyboard shortcut on the GCP workstation. Examples: 'Return', 'Tab', 'Escape', 'Ctl-C', 'Ctl-V', 'F5', 'Delete'.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Key name (e.g. Return, Tab, Escape, Ctl-C, Ctl-V, F5, Delete, BackSpace)" },
+      },
+      required: ["name"],
+    },
+    handler: computerKeyTool,
+  });
+
+  api.registerTool({
+    name: "computer_move",
+    description: "Move the mouse cursor to (x, y) on the GCP workstation screen.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        x: { type: "number", description: "X coordinate" },
+        y: { type: "number", description: "Y coordinate" },
+      },
+      required: ["x", "y"],
+    },
+    handler: computerMoveTool,
+  });
+
+  api.registerTool({
+    name: "computer_click_query",
+    description: "Find a UI element by natural language description and click it. Uses OCR to locate the element on screen.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Natural language description of the element to click (e.g. 'test-text.txt file icon on desktop')" },
+        double: { type: "boolean", description: "If true, double-click instead of single click" },
+      },
+      required: ["query"],
+    },
+    handler: computerClickQueryTool,
+  });
+
   api.logger.info("+-------------------------------------------------+");
   api.logger.info("|  BoanClaw Agent v1.0.0 registered                |");
   api.logger.info(`|  Proxy : ${proxyUrl.padEnd(39)}|`);
   api.logger.info("|  Tools : mount, audit, llm-use, session          |");
+  api.logger.info("|  Computer Use : screenshot, click, type, key...  |");
   api.logger.info("|  Git Guard : active                              |");
   api.logger.info("+-------------------------------------------------+");
 }

@@ -55,6 +55,12 @@ type OrgSettings struct {
 	SeatLimit    int           `json:"seat_limit,omitempty"`
 	GCPOrgID     string        `json:"gcp_org_id,omitempty"`
 	WorkspaceURL string        `json:"workspace_url,omitempty"`
+	MountRoot    string        `json:"mount_root,omitempty"`
+}
+
+type GuardrailConfig struct {
+	Constitution    string `json:"constitution,omitempty"`
+	AutoApproveMode bool   `json:"auto_approve_mode,omitempty"`
 }
 
 type Policy struct {
@@ -68,6 +74,7 @@ type Policy struct {
 	Features      map[string]bool   `json:"features"`
 	VersionPolicy VersionPolicy     `json:"version_policy,omitempty"`
 	OrgSettings   OrgSettings       `json:"org_settings,omitempty"`
+	Guardrail     GuardrailConfig   `json:"guardrail,omitempty"`
 	Signature     string            `json:"signature,omitempty"`
 }
 
@@ -118,9 +125,12 @@ func DefaultPolicy(orgID string) *Policy {
 		OrgSettings: OrgSettings{
 			OrgName: orgID,
 			AllowedSSO: []SSOProvider{
-				{ID: "google", Label: "Google", Enabled: true, Configured: false},
-				{ID: "email_otp", Label: "Email OTP", Enabled: true, Configured: true},
+				{ID: "email_otp", Label: "Company Email OTP", Enabled: true, Configured: true},
 			},
+			MountRoot: "/workspace/boanclaw",
+		},
+		Guardrail: GuardrailConfig{
+			Constitution: "가드레일 헌법: 자격증명, 비밀번호, 토큰, 개인정보, 사내 비밀, 고객 데이터, 민감한 운영 명령은 외부로 그대로 내보내지 않는다. 완전 무해한 일반 텍스트만 허용한다. 애매하면 ask 로 분류하고 사람 확인을 거친다.",
 		},
 	}
 }
@@ -232,5 +242,14 @@ func (s *Store) loadFile(dir string, version int) (*Policy, error) {
 		return nil, err
 	}
 	var p Policy
-	return &p, json.Unmarshal(raw, &p)
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return nil, err
+	}
+	if p.OrgSettings.MountRoot == "" {
+		p.OrgSettings.MountRoot = "/workspace/boanclaw"
+	}
+	if p.Guardrail.Constitution == "" {
+		p.Guardrail.Constitution = DefaultPolicy(p.OrgID).Guardrail.Constitution
+	}
+	return &p, nil
 }

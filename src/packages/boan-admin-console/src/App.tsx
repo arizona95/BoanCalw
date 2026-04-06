@@ -1,17 +1,20 @@
 import { useState } from "react";
-import { Routes, Route, NavLink, Navigate } from "react-router-dom";
+import { Routes, Route, NavLink, Navigate, useLocation } from "react-router-dom";
 import { AuthProvider, useAuth } from "./auth";
 import Login from "./pages/Login";
 import Register from "./pages/Register";
 import SelectOrg from "./pages/SelectOrg";
 import Dashboard from "./pages/Dashboard";
 import OrgSettings from "./pages/OrgSettings";
+import OrgOverview from "./pages/OrgOverview";
 import Policies from "./pages/Policies";
 import LLMRegistry from "./pages/LLMRegistry";
 import AuditLog from "./pages/AuditLog";
 import Credentials from "./pages/Credentials";
 import Approvals from "./pages/Approvals";
 import Users from "./pages/Users";
+import MyBoanClaw from "./pages/MyBoanClaw";
+import MyGCP from "./pages/MyGCP";
 
 const ROLE_COLOR: Record<string, string> = {
   owner: "bg-blue-100 text-blue-800",
@@ -21,6 +24,7 @@ const ROLE_COLOR: Record<string, string> = {
 function Shell() {
   const { user, loading, logout } = useAuth();
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const location = useLocation();
 
   if (loading) {
     return (
@@ -36,16 +40,29 @@ function Shell() {
 
   const canEdit = user.can_edit;
 
-  const NAV_ITEMS = [
-    { path: "/", label: "Dashboard", icon: "📊", always: true },
-    { path: "/org", label: "Org Settings", icon: "🏢", always: false },
-    { path: "/policies", label: "Policies", icon: "📋", always: false },
-    { path: "/llm-registry", label: "LLM Registry", icon: "🤖", always: true },
-    { path: "/audit", label: "Audit Log", icon: "📝", always: true },
-    { path: "/credentials", label: "Credentials", icon: "🔑", always: false },
-    { path: "/approvals", label: "Approvals", icon: "✅", always: false },
-    { path: "/users", label: "Users", icon: "👥", always: false },
-  ].filter((item) => item.always || canEdit);
+  const NAV_ITEMS = canEdit
+    ? [
+        { path: "/", label: "Dashboard", icon: "📊" },
+        { path: "/org", label: "Org Settings", icon: "🏢" },
+        { path: "/policies", label: "Policies", icon: "📋" },
+        { path: "/llm-registry", label: "LLM Registry", icon: "🤖" },
+        { path: "/audit", label: "Audit Log", icon: "📝" },
+        { path: "/credentials", label: "Credentials", icon: "🔑" },
+        { path: "/approvals", label: "Approvals", icon: "✅" },
+        { path: "/users", label: "Users", icon: "👥" },
+        { path: "/my-boanclaw", label: "내 BoanClaw", icon: "🦞" },
+        { path: "/my-gcp", label: "내 작업 컴퓨터", icon: "🖥️" },
+      ]
+    : [
+        { path: "/org-overview", label: "조직 설정 확인", icon: "🏢" },
+        { path: "/my-boanclaw", label: "내 BoanClaw", icon: "🦞" },
+        { path: "/my-gcp", label: "내 작업 컴퓨터", icon: "🖥️" },
+      ];
+
+  const fullBleed = location.pathname === "/my-boanclaw" || location.pathname === "/my-gcp";
+  const showMyBoanClaw = location.pathname === "/my-boanclaw";
+  const showMyGCP = location.pathname === "/my-gcp";
+  const showPersistentSurface = showMyBoanClaw || showMyGCP;
 
   return (
     <div className="flex h-screen overflow-hidden">
@@ -115,24 +132,46 @@ function Shell() {
         )}
       </aside>
 
-      <main className="flex-1 overflow-y-auto bg-gray-50">
-        {!canEdit && (
+      <main className={`flex-1 bg-gradient-to-br from-boan-200 via-boan-100 to-white ${fullBleed ? "overflow-hidden flex flex-col" : "overflow-y-auto"}`}>
+        {!canEdit && !fullBleed && (
           <div className="bg-yellow-50 border-b border-yellow-200 px-6 py-2 text-xs text-yellow-800 flex items-center gap-2">
             <span>👁️</span>
             <span>읽기 전용 모드입니다. 설정을 변경하려면 소유자 권한이 필요합니다.</span>
           </div>
         )}
-        <div className="p-8 max-w-7xl mx-auto">
-          <Routes>
-            <Route path="/" element={<Dashboard />} />
-            <Route path="/org" element={canEdit ? <OrgSettings /> : <ReadOnly />} />
-            <Route path="/policies" element={canEdit ? <Policies /> : <ReadOnly />} />
-            <Route path="/llm-registry" element={<LLMRegistry />} />
-            <Route path="/audit" element={<AuditLog />} />
-            <Route path="/credentials" element={canEdit ? <Credentials /> : <ReadOnly />} />
-            <Route path="/approvals" element={canEdit ? <Approvals /> : <ReadOnly />} />
-            <Route path="/users" element={canEdit ? <Users /> : <ReadOnly />} />
-          </Routes>
+        <div className={fullBleed ? "flex-1 flex min-h-0" : "p-8 max-w-7xl mx-auto"}>
+          {/* 일반 라우트 */}
+          <div className={showPersistentSurface ? "hidden" : "h-full"}>
+            <Routes>
+              <Route path="/" element={canEdit ? <Dashboard /> : <Navigate to="/org-overview" replace />} />
+              <Route path="/org" element={canEdit ? <OrgSettings /> : <ReadOnly />} />
+              <Route path="/org-overview" element={<OrgOverview />} />
+              <Route path="/policies" element={canEdit ? <Policies /> : <ReadOnly />} />
+              <Route path="/llm-registry" element={<LLMRegistry />} />
+              <Route path="/audit" element={<AuditLog />} />
+              <Route path="/credentials" element={canEdit ? <Credentials /> : <ReadOnly />} />
+              <Route path="/approvals" element={canEdit ? <Approvals /> : <ReadOnly />} />
+              <Route path="/users" element={canEdit ? <Users /> : <ReadOnly />} />
+              <Route path="/my-boanclaw" element={null} />
+              <Route path="/my-gcp" element={null} />
+            </Routes>
+          </div>
+
+          {/* 내 BoanClaw - 항상 마운트, 탭 전환시 hide/show */}
+          <div
+            aria-hidden={!showMyBoanClaw}
+            className={`flex-1 h-full relative ${showMyBoanClaw ? "flex" : "hidden"}`}
+          >
+            <MyBoanClaw />
+          </div>
+
+          {/* 내 작업 컴퓨터 - 항상 마운트, 탭 전환시 hide/show → RDP 세션 유지 */}
+          <div
+            aria-hidden={!showMyGCP}
+            className={`flex-1 h-full relative ${showMyGCP ? "flex" : "hidden"}`}
+          >
+            <MyGCP />
+          </div>
         </div>
       </main>
     </div>

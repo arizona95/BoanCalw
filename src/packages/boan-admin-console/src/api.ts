@@ -10,7 +10,9 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
     ...init,
   });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return res.json();
+  const text = await res.text();
+  if (!text) return undefined as T;
+  return JSON.parse(text) as T;
 }
 
 export interface OrgPolicy {
@@ -18,11 +20,40 @@ export interface OrgPolicy {
   org_id: string;
   updated_at: string;
   rules: Record<string, unknown>;
-  network_whitelist?: unknown[];
+  network_whitelist?: NetworkEndpoint[];
   dlp_rules?: unknown[];
   rbac?: unknown;
   allow_models?: string[];
   features?: Record<string, boolean>;
+  version_policy?: VersionPolicy;
+  org_settings?: OrgPolicySettings;
+  guardrail?: GuardrailConfig;
+}
+
+export interface NetworkEndpoint {
+  host: string;
+  ports?: number[];
+  methods?: string[];
+}
+
+export interface VersionPolicy {
+  min_version?: string;
+  blocked_versions?: string[];
+  update_channel?: string;
+}
+
+export interface OrgPolicySettings {
+  org_name?: string;
+  admin_emails?: string[];
+  seat_limit?: number;
+  gcp_org_id?: string;
+  workspace_url?: string;
+  mount_root?: string;
+}
+
+export interface GuardrailConfig {
+  constitution?: string;
+  auto_approve_mode?: boolean;
 }
 
 export interface LLMEntry {
@@ -33,8 +64,19 @@ export interface LLMEntry {
   curl_template?: string;
   image_curl_template?: string;
   is_security_llm?: boolean;
+  is_security_lmm?: boolean;
   healthy?: boolean;
   last_checked?: string;
+  registered_at?: string;
+}
+
+export interface LLMRegistrationHistory {
+  name: string;
+  endpoint: string;
+  type: "llm" | "image";
+  curl_template?: string;
+  image_curl_template?: string;
+  registered_at: string;
 }
 
 export interface AuditEvent {
@@ -52,6 +94,11 @@ export interface Credential {
   org_id: string;
   status: "ok" | "expired" | "missing";
   expires_at: string;
+}
+
+export interface CredentialPassthrough {
+  name: string;
+  value: string;
 }
 
 export interface DashboardStats {
@@ -95,10 +142,12 @@ export interface RegisterLLMPayload {
   curl_template?: string;
   image_curl_template?: string;
   endpoint?: string;
+  store_detected_credentials?: boolean;
 }
 
 export const registryApi = {
   list: () => request<LLMEntry[]>(`${REGISTRY_BASE}/v1/llms`),
+  history: () => request<LLMRegistrationHistory[]>(`${REGISTRY_BASE}/v1/llms/history`),
   register: (payload: RegisterLLMPayload) =>
     request<LLMEntry>(`${REGISTRY_BASE}/v1/llms`, {
       method: "POST",
@@ -108,8 +157,16 @@ export const registryApi = {
     request<LLMEntry>(`${REGISTRY_BASE}/v1/llms/${name}/bind-security`, {
       method: "POST",
     }),
+  bindSecurityLMM: (name: string) =>
+    request<LLMEntry>(`${REGISTRY_BASE}/v1/llms/${name}/bind-security-lmm`, {
+      method: "POST",
+    }),
   remove: (name: string) =>
     request<void>(`${REGISTRY_BASE}/v1/llms/${name}`, { method: "DELETE" }),
+  clearHistory: () =>
+    request<void>(`${REGISTRY_BASE}/v1/llms/history`, { method: "DELETE" }),
+  deleteHistoryItem: (name: string, registeredAt: string) =>
+    request<void>(`${REGISTRY_BASE}/v1/llms/history/${encodeURIComponent(name)}/${encodeURIComponent(registeredAt)}`, { method: "DELETE" }),
 };
 
 export const auditApi = {
@@ -133,6 +190,16 @@ export const credentialApi = {
       method: "POST",
       body: JSON.stringify({ role, key, ttl_hours: 8760 }),
     }),
+  listPassthrough: () => request<CredentialPassthrough[]>(`${CREDENTIAL_BASE}/v1/passthrough`),
+  addPassthrough: (name: string, value: string) =>
+    request<{ status: string; name: string }>(`${CREDENTIAL_BASE}/v1/passthrough`, {
+      method: "POST",
+      body: JSON.stringify({ name, value }),
+    }),
+  removePassthrough: (name: string) =>
+    request<void>(`${CREDENTIAL_BASE}/v1/passthrough/${encodeURIComponent(name)}`, {
+      method: "DELETE",
+    }),
 };
 
 export interface ApprovalRequest {
@@ -149,6 +216,7 @@ export interface ApprovalRequest {
 
 export const approvalApi = {
   list: () => request<ApprovalRequest[]>(APPROVAL_BASE),
+  get: (id: string) => request<ApprovalRequest>(`${APPROVAL_BASE}/${id}`),
   approve: (id: string) =>
     request<void>(`${APPROVAL_BASE}/${id}/approve`, { method: "POST" }),
   reject: (id: string) =>
@@ -168,6 +236,42 @@ export interface OrgSettingsRecord {
   display_name?: string;
   settings: Record<string, unknown>;
   updated_at: string;
+}
+
+export interface PersonalWorkstation {
+  email: string;
+  org_id: string;
+  provider: string;
+  platform: string;
+  status: string;
+  display_name: string;
+  instance_id: string;
+  region?: string;
+  console_url?: string;
+  web_desktop_url?: string;
+  assigned_at: string;
+}
+
+export interface OpenClawDashboard {
+  url: string;
+}
+
+export interface InputGateRequest {
+  mode: "text" | "key" | "paste" | "chord" | "clipboard_sync";
+  text?: string;
+  key?: string;
+  src_level?: number;
+  dest_level?: number;
+  flow?: string;
+}
+
+export interface InputGateResponse {
+  allowed: boolean;
+  action: string;
+  reason?: string;
+  normalized_text?: string;
+  key?: string;
+  approval_id?: string;
 }
 
 export const orgSettingsApi = {
@@ -203,6 +307,55 @@ export const gcpApi = {
         org_name: orgName,
         allow_domains: allowDomains,
       }),
+    }),
+};
+
+export const openclawApi = {
+  dashboard: () =>
+    request<OpenClawDashboard>("/api/openclaw/dashboard", {
+      credentials: "include",
+    }),
+};
+
+export const workstationApi = {
+  me: () =>
+    fetch("/api/workstation/me", { credentials: "include" }).then((r) => {
+      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+      return r.json() as Promise<PersonalWorkstation>;
+    }),
+};
+
+export const inputGateApi = {
+  evaluate: (payload: InputGateRequest) =>
+    fetch("/api/input-gate/evaluate", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }).then((r) => {
+      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+      return r.json() as Promise<InputGateResponse>;
+    }),
+};
+
+export const chatApi = {
+  forward: (message: string) =>
+    request<{ ok: boolean; runId?: string; error?: string }>("/api/chat/forward", {
+      method: "POST",
+      body: JSON.stringify({ message }),
+    }),
+};
+
+export const computerUseApi = {
+  type: (text: string) =>
+    request<{ ok: boolean; result: string }>("/api/computer-use/type", {
+      method: "POST",
+      body: JSON.stringify({ text }),
+    }),
+  key: (name: string) =>
+    request<{ ok: boolean; result: string }>("/api/computer-use/key", {
+      method: "POST",
+      body: JSON.stringify({ name }),
     }),
 };
 

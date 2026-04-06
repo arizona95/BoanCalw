@@ -131,3 +131,96 @@ variable "smtp_from" {
   type        = string
   default     = ""
 }
+
+variable "workstation_provider" {
+  description = "Personal workstation provider"
+  type        = string
+  default     = "gcp-compute"
+}
+
+variable "workstation_platform" {
+  description = "Personal workstation platform"
+  type        = string
+  default     = "windows"
+}
+
+variable "workstation_region" {
+  description = "Personal workstation cloud region"
+  type        = string
+  default     = "asia-northeast3"
+}
+
+variable "workstation_machine_type" {
+  description = "GCE machine type for personal workstation"
+  type        = string
+  default     = "e2-standard-2"
+}
+
+variable "workstation_project_id" {
+  description = "GCP project ID used for personal workstation VM"
+  type        = string
+  default     = "ai-security-test-473701"
+}
+
+variable "workstation_zone" {
+  description = "GCE zone for personal workstation"
+  type        = string
+  default     = "asia-northeast3-a"
+}
+
+variable "workstation_image_project" {
+  description = "Windows image project"
+  type        = string
+  default     = "windows-cloud"
+}
+
+variable "workstation_image_family" {
+  description = "Windows image family"
+  type        = string
+  default     = "windows-2022"
+}
+
+variable "workstation_subnetwork" {
+  description = "Required GCE subnetwork name or self link. BoanClaw must not fall back to the default network."
+  type        = string
+  validation {
+    condition     = trimspace(var.workstation_subnetwork) != ""
+    error_message = "workstation_subnetwork must be set. BoanClaw must not create instances on the default network or rely on default-allow-* firewall rules."
+  }
+}
+
+variable "workstation_network_tags" {
+  description = "Comma separated network tags for workstation GCE"
+  type        = string
+  default     = ""
+}
+
+variable "workstation_rdp_source_ranges" {
+  description = "CIDR ranges allowed to reach Windows workstations over RDP."
+  type        = list(string)
+  default     = []
+}
+
+variable "workstation_service_account" {
+  description = "Optional service account email for workstation GCE"
+  type        = string
+  default     = ""
+}
+
+variable "workstation_root_volume_gib" {
+  description = "Root volume size for workstation GCE"
+  type        = string
+  default     = "100"
+}
+
+variable "workstation_console_base_url" {
+  description = "Console URL template"
+  type        = string
+  default     = "https://console.cloud.google.com/compute/instancesDetail/zones/{zone}/instances/{instance_name}?project={project}"
+}
+
+variable "workstation_web_base_url" {
+  description = "Web desktop gateway URL template"
+  type        = string
+  default     = ""
+}

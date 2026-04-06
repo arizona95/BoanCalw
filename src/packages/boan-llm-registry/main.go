@@ -15,7 +15,8 @@ import (
 )
 
 func main() {
-	reg := registry.New()
+	dataDir := env("BOAN_DATA_DIR", "/data/registry")
+	reg := registry.New(dataDir)
 	listen := env("BOAN_LISTEN", ":8081")
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -39,7 +40,9 @@ func main() {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(obj)
 	})
 
 	mux.HandleFunc("/llm/list", func(w http.ResponseWriter, r *http.Request) {
@@ -49,6 +52,43 @@ func main() {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(reg.List())
+	})
+
+	mux.HandleFunc("/llm/history", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(reg.History())
+		case http.MethodDelete:
+			// DELETE /llm/history — clear all history
+			reg.ClearHistory()
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{"status": "cleared"})
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
+	mux.HandleFunc("/llm/history/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		// DELETE /llm/history/{name}/{registeredAt}
+		path := strings.TrimPrefix(r.URL.Path, "/llm/history/")
+		idx := strings.Index(path, "/")
+		if idx < 0 {
+			http.Error(w, "missing registeredAt", http.StatusBadRequest)
+			return
+		}
+		name := path[:idx]
+		registeredAt := path[idx+1:]
+		if reg.DeleteHistory(name, registeredAt) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{"status": "deleted", "name": name})
+		} else {
+			http.NotFound(w, r)
+		}
 	})
 
 	mux.HandleFunc("/llm/", func(w http.ResponseWriter, r *http.Request) {
@@ -62,7 +102,8 @@ func main() {
 		switch {
 		case len(parts) == 1 && r.Method == http.MethodDelete:
 			if reg.Delete(name) {
-				w.WriteHeader(http.StatusNoContent)
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]string{"status": "deleted", "name": name})
 			} else {
 				http.NotFound(w, r)
 			}
@@ -73,6 +114,13 @@ func main() {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]string{"status": "bound", "name": name})
+		case len(parts) == 2 && parts[1] == "bind-security-lmm" && r.Method == http.MethodPost:
+			if err := reg.SetSecurityLMM(name); err != nil {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{"status": "bound-lmm", "name": name})
 		default:
 			http.NotFound(w, r)
 		}

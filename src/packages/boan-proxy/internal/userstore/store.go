@@ -21,12 +21,29 @@ const (
 )
 
 type User struct {
-	Email        string    `json:"email"`
-	PasswordHash string    `json:"password_hash"`
-	Role         string    `json:"role"`
-	OrgID        string    `json:"org_id"`
-	Status       Status    `json:"status"`
-	CreatedAt    time.Time `json:"created_at"`
+	Email        string       `json:"email"`
+	PasswordHash string       `json:"password_hash"`
+	Role         string       `json:"role"`
+	OrgID        string       `json:"org_id"`
+	Status       Status       `json:"status"`
+	CreatedAt    time.Time    `json:"created_at"`
+	Workstation  *Workstation `json:"workstation,omitempty"`
+}
+
+type Workstation struct {
+	Provider      string    `json:"provider"`
+	Platform      string    `json:"platform"`
+	Status        string    `json:"status"`
+	DisplayName   string    `json:"display_name"`
+	InstanceID    string    `json:"instance_id"`
+	RemoteHost    string    `json:"remote_host,omitempty"`
+	RemotePort    int       `json:"remote_port,omitempty"`
+	RemoteUser    string    `json:"remote_user,omitempty"`
+	RemotePass    string    `json:"remote_pass,omitempty"`
+	Region        string    `json:"region,omitempty"`
+	ConsoleURL    string    `json:"console_url,omitempty"`
+	WebDesktopURL string    `json:"web_desktop_url,omitempty"`
+	AssignedAt    time.Time `json:"assigned_at"`
 }
 
 type Store struct {
@@ -35,10 +52,10 @@ type Store struct {
 	dataDir string
 }
 
-var ErrExists   = errors.New("email already registered")
+var ErrExists = errors.New("email already registered")
 var ErrNotFound = errors.New("user not found")
-var ErrBadPass  = errors.New("invalid password")
-var ErrPending  = errors.New("account pending approval")
+var ErrBadPass = errors.New("invalid password")
+var ErrPending = errors.New("account pending approval")
 var ErrInvalidRole = errors.New("invalid role")
 
 func New(dataDir string) (*Store, error) {
@@ -145,6 +162,27 @@ func (s *Store) Delete(email string) error {
 	}
 	delete(s.users, email)
 	return s.save()
+}
+
+func (s *Store) AssignWorkstation(email string, ws *Workstation) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.users[email]
+	if !ok {
+		return ErrNotFound
+	}
+	u.Workstation = ws
+	return s.save()
+}
+
+func (s *Store) Workstation(email string) (*Workstation, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	u, ok := s.users[email]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return u.Workstation, nil
 }
 
 func (s *Store) Upsert(email, orgID, role string, status Status) (*User, error) {

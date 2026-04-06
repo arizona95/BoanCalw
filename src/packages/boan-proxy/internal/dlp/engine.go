@@ -60,12 +60,12 @@ type Engine struct {
 	}
 }
 
-func NewEngine(ollamaURL string) *Engine {
-	return &Engine{llm: NewLLMDetector(ollamaURL), mode: ModeOR}
+func NewEngine(ollamaURL, model string) *Engine {
+	return &Engine{llm: NewLLMDetector(ollamaURL, model), mode: ModeOR}
 }
 
-func NewEngineWithMode(ollamaURL string, mode DLPMode) *Engine {
-	return &Engine{llm: NewLLMDetector(ollamaURL), mode: mode}
+func NewEngineWithMode(ollamaURL, model string, mode DLPMode) *Engine {
+	return &Engine{llm: NewLLMDetector(ollamaURL, model), mode: mode}
 }
 
 func (e *Engine) RulesCount() int {

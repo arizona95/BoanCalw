@@ -1,6 +1,10 @@
 variable "project_id" {}
 variable "region" { default = "asia-northeast3" }
 variable "org_id" {}
+variable "workstation_rdp_source_ranges" {
+  type    = list(string)
+  default = []
+}
 
 resource "google_compute_network" "boan_vpc" {
   name                    = "boanclaw-vpc-${var.org_id}"
@@ -61,6 +65,27 @@ resource "google_compute_firewall" "allow_proxy_egress" {
   destination_ranges = ["0.0.0.0/0"]
 }
 
+resource "google_compute_firewall" "allow_workstation_egress" {
+  name      = "boanclaw-allow-workstation-egress"
+  project   = var.project_id
+  network   = google_compute_network.boan_vpc.id
+  direction = "EGRESS"
+  priority  = 1000
+
+  allow {
+    protocol = "tcp"
+    ports    = ["53", "80", "443"]
+  }
+
+  allow {
+    protocol = "udp"
+    ports    = ["53", "123", "443"]
+  }
+
+  target_tags        = ["boan-workstation"]
+  destination_ranges = ["0.0.0.0/0"]
+}
+
 resource "google_compute_firewall" "allow_admin_ingress" {
   name    = "boanclaw-allow-admin"
   project = var.project_id
@@ -73,6 +98,20 @@ resource "google_compute_firewall" "allow_admin_ingress" {
 
   target_tags   = ["boan-admin"]
   source_ranges = ["0.0.0.0/0"]
+}
+
+resource "google_compute_firewall" "allow_workstation_rdp" {
+  name    = "boanclaw-allow-workstation-rdp"
+  project = var.project_id
+  network = google_compute_network.boan_vpc.id
+
+  allow {
+    protocol = "tcp"
+    ports    = ["3389"]
+  }
+
+  target_tags   = ["boan-workstation"]
+  source_ranges = var.workstation_rdp_source_ranges
 }
 
 output "vpc_id" { value = google_compute_network.boan_vpc.id }

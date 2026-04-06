@@ -7,22 +7,13 @@ import type {
   MountResponse,
 } from "../types.js";
 
-const DEFAULT_ALLOWED_DIRS = [
-  "/workspace",
-  "/home",
-  "/tmp/boan",
-];
-
-function getAllowedDirs(): string[] {
-  const envDirs = process.env.BOAN_ALLOWED_DIRS;
-  if (envDirs) {
-    return envDirs.split(":").filter(Boolean);
-  }
-  return DEFAULT_ALLOWED_DIRS;
+interface MountConfigResponse {
+  org_id: string;
+  mount_root: string;
+  allowedDirs: string[];
 }
 
-function isWithinAllowedDirs(targetPath: string): boolean {
-  const allowedDirs = getAllowedDirs();
+function isWithinAllowedDirs(targetPath: string, allowedDirs: string[]): boolean {
   let resolved: string;
   try {
     resolved = realpathSync(targetPath);
@@ -30,6 +21,15 @@ function isWithinAllowedDirs(targetPath: string): boolean {
     resolved = targetPath;
   }
   return allowedDirs.some((dir) => resolved.startsWith(dir));
+}
+
+async function requestProxyMountConfig(): Promise<MountConfigResponse> {
+  const proxyUrl = process.env.BOAN_PROXY_ADMIN ?? "http://boan-proxy:18080";
+  const response = await fetch(`${proxyUrl}/api/mount/config`);
+  if (!response.ok) {
+    throw new Error(`Proxy returned ${response.status}: ${await response.text()}`);
+  }
+  return (await response.json()) as MountConfigResponse;
 }
 
 async function requestProxyMount(req: MountRequest): Promise<MountResponse> {
@@ -66,10 +66,20 @@ export async function registerMountCommand(
     return { text: `Path not found: ${path}` };
   }
 
-  if (!isWithinAllowedDirs(path)) {
+  let mountConfig: MountConfigResponse;
+  try {
+    mountConfig = await requestProxyMountConfig();
+  } catch (e) {
+    api.logger.error(`mount config request failed: ${e}`);
+    return {
+      text: `Mount failed: boan-proxy mount policy unavailable. ${e instanceof Error ? e.message : String(e)}`,
+    };
+  }
+
+  if (!isWithinAllowedDirs(path, mountConfig.allowedDirs)) {
     api.logger.warn(`mount blocked — path outside allowed dirs: ${path}`);
     return {
-      text: `Access denied: ${path} is not within allowed directories.\nAllowed: ${getAllowedDirs().join(", ")}`,
+      text: `Access denied: ${path} is not within allowed directories.\nAllowed: ${mountConfig.allowedDirs.join(", ")}`,
     };
   }
 
@@ -98,13 +108,9 @@ export async function registerMountCommand(
       ].join("\n"),
     };
   } catch (e) {
-    api.logger.warn(`proxy mount request failed, falling back to local: ${e}`);
-    process.env.BOAN_WORKSPACE = path;
+    api.logger.error(`proxy mount request failed: ${e}`);
     return {
-      text: [
-        `Workspace mounted locally: ${path}`,
-        `(boan-proxy unreachable — local mount only)`,
-      ].join("\n"),
+      text: `Mount failed: ${e instanceof Error ? e.message : String(e)}`,
     };
   }
 }
@@ -127,7 +133,22 @@ export async function mountTool(
     };
   }
 
-  if (!isWithinAllowedDirs(path)) {
+  let mountConfig: MountConfigResponse;
+  try {
+    mountConfig = await requestProxyMountConfig();
+  } catch (e) {
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Mount failed: boan-proxy mount policy unavailable. ${e instanceof Error ? e.message : String(e)}`,
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  if (!isWithinAllowedDirs(path, mountConfig.allowedDirs)) {
     return {
       content: [
         {
@@ -159,15 +180,15 @@ export async function mountTool(
         },
       ],
     };
-  } catch {
-    process.env.BOAN_WORKSPACE = path;
+  } catch (e) {
     return {
       content: [
         {
           type: "text",
-          text: JSON.stringify({ mounted: path, local: true, sessionId }),
+          text: `Mount failed: ${e instanceof Error ? e.message : String(e)}`,
         },
       ],
+      isError: true,
     };
   }
 }

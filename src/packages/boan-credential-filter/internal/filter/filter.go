@@ -3,7 +3,10 @@ package filter
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -43,13 +46,27 @@ type Store struct {
 	mu    sync.RWMutex
 	creds map[string]*Credential
 	enc   *kms.LocalKMS
+	path  string
 }
 
-func NewStore(enc *kms.LocalKMS) *Store {
-	return &Store{
+type persistedCredential struct {
+	Role         string    `json:"role"`
+	OrgID        string    `json:"org_id"`
+	EncryptedKey []byte    `json:"encrypted_key"`
+	ExpiresAt    time.Time `json:"expires_at"`
+}
+
+func NewStore(enc *kms.LocalKMS, dataDir string) *Store {
+	s := &Store{
 		creds: make(map[string]*Credential),
 		enc:   enc,
+		path:  filepath.Join(dataDir, "credentials.json"),
 	}
+	if dataDir != "" {
+		_ = os.MkdirAll(dataDir, 0700)
+		_ = s.load()
+	}
+	return s
 }
 
 func credKey(orgID, role string) string {
@@ -112,7 +129,7 @@ func (s *Store) Register(orgID string, req *RegisterRequest) error {
 		ExpiresAt:    time.Now().Add(time.Duration(req.TTLHours) * time.Hour),
 	}
 	s.mu.Unlock()
-	return nil
+	return s.save()
 }
 
 type CredentialMeta struct {
@@ -146,13 +163,65 @@ func (s *Store) List(orgID string) []CredentialMeta {
 
 func (s *Store) Revoke(orgID, role string) bool {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	k := credKey(orgID, role)
 	if _, ok := s.creds[k]; ok {
 		delete(s.creds, k)
+		s.mu.Unlock()
+		_ = s.save()
 		return true
 	}
+	s.mu.Unlock()
 	return false
+}
+
+func (s *Store) save() error {
+	if s.path == "" {
+		return nil
+	}
+	s.mu.RLock()
+	items := make([]persistedCredential, 0, len(s.creds))
+	for _, c := range s.creds {
+		items = append(items, persistedCredential{
+			Role:         c.Role,
+			OrgID:        c.OrgID,
+			EncryptedKey: c.EncryptedKey,
+			ExpiresAt:    c.ExpiresAt,
+		})
+	}
+	s.mu.RUnlock()
+	raw, err := json.MarshalIndent(items, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(s.path, raw, 0600)
+}
+
+func (s *Store) load() error {
+	if s.path == "" {
+		return nil
+	}
+	raw, err := os.ReadFile(s.path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var items []persistedCredential
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, item := range items {
+		s.creds[credKey(item.OrgID, item.Role)] = &Credential{
+			Role:         item.Role,
+			OrgID:        item.OrgID,
+			EncryptedKey: item.EncryptedKey,
+			ExpiresAt:    item.ExpiresAt,
+		}
+	}
+	return nil
 }
 
 func GenerateAPIKey() string {

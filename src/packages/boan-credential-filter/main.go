@@ -14,14 +14,16 @@ import (
 func main() {
 	listen := env("BOAN_LISTEN", ":8082")
 	keyPath := env("BOAN_KMS_KEY", "/etc/boan-cred/aes.key")
+	dataDir := env("BOAN_DATA_DIR", "/data/credentials")
 	os.MkdirAll("/etc/boan-cred", 0700)
+	os.MkdirAll(dataDir, 0700)
 
 	enc, err := kms.New(keyPath)
 	if err != nil {
 		log.Fatalf("kms init: %v", err)
 	}
 
-	store := filter.NewStore(enc)
+	store := filter.NewStore(enc, dataDir)
 
 	mux := http.NewServeMux()
 

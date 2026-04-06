@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { registryApi, credentialApi, type LLMEntry, type RegisterLLMPayload } from "../api";
+import { registryApi, credentialApi, type LLMEntry, type LLMRegistrationHistory, type RegisterLLMPayload } from "../api";
 
 const EXAMPLE_LLM_CURL = `curl -X POST https://api.anthropic.com/v1/messages \\
   -H "x-api-key: sk-ant-api03-YOUR_KEY_HERE" \\
@@ -125,13 +125,15 @@ function CurlInput({
 
 export default function LLMRegistry() {
   const [llms, setLlms] = useState<LLMEntry[]>([]);
+  const [history, setHistory] = useState<LLMRegistrationHistory[]>([]);
   const [loading, setLoading] = useState(true);
-  const [tab, setTab] = useState<"llm" | "image">("llm");
+  const [tab, setTab] = useState<"llm" | "image" | "history">("llm");
   const [name, setName] = useState("");
   const [curlTemplate, setCurlTemplate] = useState("");
   const [imageCurlTemplate, setImageCurlTemplate] = useState("");
   const [registering, setRegistering] = useState(false);
   const [showExample, setShowExample] = useState(false);
+  const [storeDetectedCredentials, setStoreDetectedCredentials] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
 
@@ -140,8 +142,11 @@ export default function LLMRegistry() {
 
   const load = () => {
     setLoading(true);
-    registryApi.list()
-      .then(setLlms)
+    Promise.all([registryApi.list(), registryApi.history()])
+      .then(([entries, historyEntries]) => {
+        setLlms(entries);
+        setHistory(historyEntries);
+      })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
   };
@@ -150,6 +155,7 @@ export default function LLMRegistry() {
 
   const handleRegister = async () => {
     if (!name.trim()) { setError("모델 이름을 입력하세요."); return; }
+    if (tab === "history") { setError("History 탭에서는 등록할 수 없습니다."); return; }
     const curl = currentCurl;
     if (!curl.trim()) { setError("curl 명령어를 입력하세요."); return; }
     if (!parseCurlEndpoint(curl)) { setError("curl에서 URL을 파싱할 수 없습니다."); return; }
@@ -160,30 +166,29 @@ export default function LLMRegistry() {
 
     try {
       const keys = detectKeys(curl);
-      for (const k of keys) {
-        const role = `${name.trim()}-apikey`;
-        await credentialApi.storeForLLM(role, k.original);
-      }
-
-      const safeCurl = keys.length > 0 ? sanitizeCurl(curl, name.trim()) : curl;
+      const registerType = tab === "image" ? "image" : "llm";
 
       const payload: RegisterLLMPayload = {
         name: name.trim(),
-        type: tab,
-        ...(tab === "llm"
-          ? { curl_template: safeCurl }
-          : { image_curl_template: safeCurl }),
+        type: registerType,
+        store_detected_credentials: storeDetectedCredentials,
+        ...(registerType === "llm"
+          ? { curl_template: curl }
+          : { image_curl_template: curl }),
       };
 
       await registryApi.register(payload);
 
-      const msg = keys.length > 0
-        ? `등록 완료. API 키 ${keys.length}개가 credential-filter에 암호화 저장되었습니다.`
+      const msg = keys.length > 0 && storeDetectedCredentials
+        ? `등록 완료. 감지된 API 키 ${keys.length}개가 credential-filter에 암호화 저장되었습니다.`
+        : keys.length > 0
+        ? `등록 완료. 감지된 API 키 ${keys.length}개는 저장하지 않고 placeholder로만 치환했습니다.`
         : `등록 완료: ${name}`;
       setSuccess(msg);
       setName("");
       setCurlTemplate("");
       setImageCurlTemplate("");
+      setStoreDetectedCredentials(false);
       load();
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "등록 실패");
@@ -203,10 +208,42 @@ export default function LLMRegistry() {
     }
   };
 
+  const handleBindLMM = async (name: string) => {
+    setError(null);
+    try {
+      await registryApi.bindSecurityLMM(name);
+      setSuccess(`${name}을 Security LMM(Vision)으로 설정했습니다.`);
+      load();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "바인딩 실패");
+    }
+  };
+
   const handleRemove = async (name: string) => {
     setError(null);
     try {
       await registryApi.remove(name);
+      load();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "삭제 실패");
+    }
+  };
+
+  const handleClearHistory = async () => {
+    if (!confirm("전체 히스토리를 삭제하시겠습니까?")) return;
+    setError(null);
+    try {
+      await registryApi.clearHistory();
+      load();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "삭제 실패");
+    }
+  };
+
+  const handleDeleteHistoryItem = async (name: string, registeredAt: string) => {
+    setError(null);
+    try {
+      await registryApi.deleteHistoryItem(name, registeredAt);
       load();
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "삭제 실패");
@@ -242,7 +279,7 @@ export default function LLMRegistry() {
           </button>
         </div>
 
-        {showExample && (
+        {showExample && tab !== "history" && (
           <div className="mb-4 rounded-lg overflow-hidden border border-gray-700">
             <div className="flex items-center justify-between px-4 py-2 bg-gray-800 text-xs text-gray-400">
               <span>예시: {tab === "llm" ? "텍스트 LLM (Anthropic)" : "멀티모달 (Anthropic Vision)"}</span>
@@ -262,8 +299,28 @@ export default function LLMRegistry() {
           </div>
         )}
 
+        {tab !== "history" && detectedKeys.length > 0 && (
+          <div className="mb-4 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+            <div className="font-medium mb-1">Credential 감지됨</div>
+            <p className="mb-3">
+              이 curl에는 credential로 보이는 값이 {detectedKeys.length}개 있습니다. 저장을 선택하면
+              <span className="font-medium text-boan-700"> Credentials</span>에 등록하고, 저장하지 않으면
+              placeholder만 남깁니다.
+            </p>
+            <label className="inline-flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={storeDetectedCredentials}
+                onChange={(e) => setStoreDetectedCredentials(e.target.checked)}
+                className="rounded border-gray-300 text-boan-600 focus:ring-boan-500"
+              />
+              <span>감지된 credential을 Credentials에 저장</span>
+            </label>
+          </div>
+        )}
+
         <div className="flex gap-2 mb-5 border-b border-gray-200">
-          {(["llm", "image"] as const).map((t) => (
+          {(["llm", "image", "history"] as const).map((t) => (
             <button
               key={t}
               onClick={() => setTab(t)}
@@ -273,11 +330,58 @@ export default function LLMRegistry() {
                   : "border-transparent text-gray-500 hover:text-gray-700"
               }`}
             >
-              {t === "llm" ? "💬 LLM (텍스트)" : "🖼️ Image (멀티모달)"}
+              {t === "llm" ? "💬 LLM (텍스트)" : t === "image" ? "🖼️ Image (멀티모달)" : "🕘 History"}
             </button>
           ))}
         </div>
 
+        {tab === "history" ? (
+          loading ? (
+            <p className="text-gray-500 text-sm">로딩 중...</p>
+          ) : history.length === 0 ? (
+            <p className="text-gray-400 text-sm">등록 성공 이력이 없습니다.</p>
+          ) : (
+            <div className="space-y-3">
+              <div className="flex justify-end">
+                <button
+                  onClick={handleClearHistory}
+                  className="text-xs text-red-600 hover:underline"
+                >
+                  전체 삭제
+                </button>
+              </div>
+              {history.map((item, idx) => {
+                const curl = item.curl_template ?? item.image_curl_template ?? "";
+                return (
+                  <div key={`${item.name}-${item.registered_at}-${idx}`} className="rounded-lg border border-gray-200 bg-gray-50 p-4">
+                    <div className="flex items-center justify-between gap-4 mb-2">
+                      <div>
+                        <div className="font-medium text-sm">{item.name}</div>
+                        <div className="text-xs text-gray-500">
+                          {item.type === "image" ? "Image" : "LLM"} · {new Date(item.registered_at).toLocaleString()}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-3">
+                        <span className="text-xs px-2 py-1 rounded-full bg-white border border-gray-200 text-gray-600 font-mono">
+                          {item.endpoint || "—"}
+                        </span>
+                        <button
+                          onClick={() => handleDeleteHistoryItem(item.name, item.registered_at)}
+                          className="text-xs text-red-500 hover:underline flex-shrink-0"
+                        >
+                          삭제
+                        </button>
+                      </div>
+                    </div>
+                    <pre className="bg-white text-gray-700 text-xs p-3 rounded border border-gray-200 overflow-x-auto whitespace-pre-wrap break-all">
+                      {curl || "curl 템플릿 없음"}
+                    </pre>
+                  </div>
+                );
+              })}
+            </div>
+          )
+        ) : (
         <div className="flex flex-col gap-4">
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">모델 이름</label>
@@ -345,12 +449,13 @@ export default function LLMRegistry() {
             </button>
           </div>
         </div>
+        )}
       </div>
 
       {[
-        { label: "💬 LLM (텍스트)", list: llmList },
-        { label: "🖼️ Image (멀티모달)", list: imageList },
-      ].map(({ label, list }) => (
+        { label: "💬 LLM (텍스트)", list: llmList, isImage: false },
+        { label: "🖼️ Image (멀티모달)", list: imageList, isImage: true },
+      ].map(({ label, list, isImage }) => (
         <div key={label} className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden mb-4">
           <div className="px-6 py-3 bg-gray-50 border-b border-gray-200">
             <h3 className="text-sm font-semibold text-gray-700">{label}</h3>
@@ -367,7 +472,9 @@ export default function LLMRegistry() {
                   <th className="text-left px-6 py-3 font-medium text-gray-500">엔드포인트</th>
                   <th className="text-left px-6 py-3 font-medium text-gray-500">상태</th>
                   <th className="text-left px-6 py-3 font-medium text-gray-500">키 저장</th>
-                  <th className="text-left px-6 py-3 font-medium text-gray-500">Security LLM</th>
+                  <th className="text-left px-6 py-3 font-medium text-gray-500">
+                    {isImage ? "보안 LMM" : "보안 LLM"}
+                  </th>
                   <th className="text-right px-6 py-3 font-medium text-gray-500">액션</th>
                 </tr>
               </thead>
@@ -393,15 +500,28 @@ export default function LLMRegistry() {
                         )}
                       </td>
                       <td className="px-6 py-3">
-                        {llm.is_security_llm ? (
-                          <span className="text-xs px-2 py-1 rounded-full bg-blue-50 text-blue-700">✓ 보안 LLM</span>
+                        {isImage ? (
+                          llm.is_security_lmm ? (
+                            <span className="text-xs px-2 py-1 rounded-full bg-purple-50 text-purple-700">✓ 보안 LMM</span>
+                          ) : (
+                            <button
+                              onClick={() => handleBindLMM(llm.name)}
+                              className="text-xs px-2 py-1 rounded-full bg-gray-100 text-gray-600 hover:bg-purple-50 hover:text-purple-700"
+                            >
+                              bind
+                            </button>
+                          )
                         ) : (
-                          <button
-                            onClick={() => handleBind(llm.name)}
-                            className="text-xs px-2 py-1 rounded-full bg-gray-100 text-gray-600 hover:bg-blue-50 hover:text-blue-700"
-                          >
-                            bind
-                          </button>
+                          llm.is_security_llm ? (
+                            <span className="text-xs px-2 py-1 rounded-full bg-blue-50 text-blue-700">✓ 보안 LLM</span>
+                          ) : (
+                            <button
+                              onClick={() => handleBind(llm.name)}
+                              className="text-xs px-2 py-1 rounded-full bg-gray-100 text-gray-600 hover:bg-blue-50 hover:text-blue-700"
+                            >
+                              bind
+                            </button>
+                          )
                         )}
                       </td>
                       <td className="px-6 py-3 text-right">

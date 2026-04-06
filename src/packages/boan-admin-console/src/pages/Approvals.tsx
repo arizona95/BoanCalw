@@ -1,6 +1,16 @@
 import { useEffect, useState, useCallback } from "react";
 import { approvalApi, type ApprovalRequest } from "../api";
 
+function formatApprovalCommand(command: string): string {
+  switch (command) {
+    case "critical-guardrail:review":
+    case "guardrail:review":
+      return "Critical Guardrail Review";
+    default:
+      return command;
+  }
+}
+
 export default function Approvals() {
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
   const [loading, setLoading] = useState(true);
@@ -79,7 +89,7 @@ export default function Approvals() {
                     {pending.map((req) => (
                       <tr key={req.id} className="hover:bg-gray-50">
                         <td className="px-4 py-3 font-mono font-medium text-gray-900">
-                          {req.command}
+                          {formatApprovalCommand(req.command)}
                         </td>
                         <td className="px-4 py-3 font-mono text-gray-600 max-w-xs truncate">
                           {req.args.join(" ")}
@@ -135,7 +145,7 @@ export default function Approvals() {
                     {decided.map((req) => (
                       <tr key={req.id} className="hover:bg-gray-50">
                         <td className="px-4 py-3 font-mono font-medium text-gray-900">
-                          {req.command}
+                          {formatApprovalCommand(req.command)}
                         </td>
                         <td className="px-4 py-3 font-mono text-gray-600 max-w-xs truncate">
                           {req.args.join(" ")}

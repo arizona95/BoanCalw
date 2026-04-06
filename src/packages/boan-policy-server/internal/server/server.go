@@ -8,29 +8,38 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/samsung-sds/boanclaw/boan-policy-server/internal/policy"
 	"github.com/samsung-sds/boanclaw/boan-policy-server/internal/signing"
 )
 
 type Config struct {
-	Listen  string
-	DataDir string
-	KeyDir  string
+	Listen            string
+	DataDir           string
+	KeyDir            string
+	GuardrailLLMURL   string
+	GuardrailLLMModel string
+	GuardrailLLMKey   string
 }
 
 func LoadConfig() Config {
 	return Config{
-		Listen:  env("BOAN_LISTEN", ":8080"),
-		DataDir: env("BOAN_DATA_DIR", "/data/policies"),
-		KeyDir:  env("BOAN_KEY_DIR", "/etc/boan-policy"),
+		Listen:            env("BOAN_LISTEN", ":8080"),
+		DataDir:           env("BOAN_DATA_DIR", "/data/policies"),
+		KeyDir:            env("BOAN_KEY_DIR", "/etc/boan-policy"),
+		GuardrailLLMURL:   env("BOAN_GUARDRAIL_LLM_URL", ""),
+		GuardrailLLMModel: env("BOAN_GUARDRAIL_LLM_MODEL", ""),
+		GuardrailLLMKey:   env("BOAN_GUARDRAIL_LLM_KEY", ""),
 	}
 }
 
 type Server struct {
-	cfg    Config
-	store  *policy.Store
-	signer *signing.Signer
+	cfg         Config
+	store       *policy.Store
+	signer      *signing.Signer
+	guardrail   *GuardrailEvaluator
+	trainingLog *HITLTrainingLog
 }
 
 type checkinRequest struct {
@@ -59,7 +68,17 @@ func New(cfg Config) *Server {
 	store := policy.NewStore(cfg.DataDir)
 	os.MkdirAll(cfg.KeyDir, 0700)
 	signer, _ := signing.LoadOrCreate(cfg.KeyDir+"/ed25519.priv", cfg.KeyDir+"/ed25519.pub")
-	return &Server{cfg: cfg, store: store, signer: signer}
+	trainingLogPath := ""
+	if cfg.DataDir != "" {
+		trainingLogPath = cfg.DataDir + "/hitl_training.jsonl"
+	}
+	return &Server{
+		cfg:         cfg,
+		store:       store,
+		signer:      signer,
+		guardrail:   NewGuardrailEvaluator(cfg.GuardrailLLMURL, cfg.GuardrailLLMModel, cfg.GuardrailLLMKey),
+		trainingLog: NewHITLTrainingLog(trainingLogPath),
+	}
 }
 
 func (s *Server) Start(ctx context.Context) error {
@@ -81,6 +100,7 @@ func (s *Server) Start(ctx context.Context) error {
 				"/org/{org_id}/v1/policy",
 				"/org/{org_id}/v1/org-settings",
 				"/org/{org_id}/v1/checkin",
+				"/org/{org_id}/v1/guardrail/evaluate",
 			},
 		})
 	})
@@ -131,6 +151,12 @@ func (s *Server) handleOrg(w http.ResponseWriter, r *http.Request) {
 		s.getOrgSettings(w, orgID)
 	case rest == "v1/org-settings" && (r.Method == http.MethodPut || r.Method == http.MethodPatch):
 		s.updateOrgSettings(w, r, orgID)
+	case rest == "v1/guardrail/evaluate" && r.Method == http.MethodPost:
+		s.evaluateGuardrail(w, r, orgID)
+	case rest == "v1/guardrail/auto-judge" && r.Method == http.MethodPost:
+		s.autoJudge(w, r, orgID)
+	case rest == "v1/guardrail/training-log" && r.Method == http.MethodGet:
+		s.getTrainingLog(w, orgID)
 	case rest == "policy.json" && r.Method == http.MethodGet:
 		s.getPolicy(w, orgID)
 	case rest == "policy" && r.Method == http.MethodPost:
@@ -192,8 +218,11 @@ func (s *Server) updatePolicy(w http.ResponseWriter, r *http.Request, orgID stri
 	if incoming.VersionPolicy.MinVersion != "" || len(incoming.VersionPolicy.BlockedVersions) > 0 || incoming.VersionPolicy.UpdateChannel != "" {
 		p.VersionPolicy = incoming.VersionPolicy
 	}
-	if incoming.OrgSettings.OrgName != "" || len(incoming.OrgSettings.AllowedSSO) > 0 || len(incoming.OrgSettings.AdminEmails) > 0 || incoming.OrgSettings.SeatLimit != 0 || incoming.OrgSettings.GCPOrgID != "" || incoming.OrgSettings.WorkspaceURL != "" {
+	if incoming.OrgSettings.OrgName != "" || len(incoming.OrgSettings.AllowedSSO) > 0 || len(incoming.OrgSettings.AdminEmails) > 0 || incoming.OrgSettings.SeatLimit != 0 || incoming.OrgSettings.GCPOrgID != "" || incoming.OrgSettings.WorkspaceURL != "" || incoming.OrgSettings.MountRoot != "" {
 		p.OrgSettings = incoming.OrgSettings
+	}
+	if strings.TrimSpace(incoming.Guardrail.Constitution) != "" {
+		p.Guardrail = incoming.Guardrail
 	}
 
 	p.OrgID = orgID
@@ -403,6 +432,8 @@ func (s *Server) registerUser(w http.ResponseWriter, r *http.Request, orgID stri
 		Password string `json:"password"`
 		Role     string `json:"role"`
 		Status   string `json:"status"`
+		MachineID   string `json:"machine_id"`
+		MachineName string `json:"machine_name"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -412,7 +443,7 @@ func (s *Server) registerUser(w http.ResponseWriter, r *http.Request, orgID stri
 		http.Error(w, "email and password are required", http.StatusBadRequest)
 		return
 	}
-	user, err := s.store.RegisterUserWithRole(orgID, body.Email, body.Password, body.Role, policy.UserStatus(body.Status))
+	user, err := s.store.RegisterUserWithRole(orgID, body.Email, body.Password, body.Role, policy.UserStatus(body.Status), body.MachineID, body.MachineName)
 	if err != nil {
 		if err == policy.ErrUserExists {
 			http.Error(w, err.Error(), http.StatusConflict)
@@ -433,6 +464,8 @@ func (s *Server) syncSSOUser(w http.ResponseWriter, r *http.Request, orgID strin
 		Role     string `json:"role"`
 		Provider string `json:"provider"`
 		Status   string `json:"status"`
+		MachineID   string `json:"machine_id"`
+		MachineName string `json:"machine_name"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -445,7 +478,7 @@ func (s *Server) syncSSOUser(w http.ResponseWriter, r *http.Request, orgID strin
 	if body.Provider == "" {
 		body.Provider = "google"
 	}
-	user, err := s.store.UpsertSSOUser(orgID, body.Email, body.Name, body.Role, body.Provider, policy.UserStatus(body.Status))
+	user, err := s.store.UpsertSSOUser(orgID, body.Email, body.Name, body.Role, body.Provider, policy.UserStatus(body.Status), body.MachineID, body.MachineName)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -456,9 +489,12 @@ func (s *Server) syncSSOUser(w http.ResponseWriter, r *http.Request, orgID strin
 
 func (s *Server) updateUser(w http.ResponseWriter, r *http.Request, orgID string) {
 	var body struct {
-		Email  string `json:"email"`
-		Role   string `json:"role"`
-		Status string `json:"status"`
+		Email       string              `json:"email"`
+		Role        string              `json:"role"`
+		Status      string              `json:"status"`
+		Workstation *policy.Workstation `json:"workstation"`
+		MachineID   string              `json:"machine_id"`
+		MachineName string              `json:"machine_name"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -468,7 +504,7 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request, orgID string
 		http.Error(w, "email is required", http.StatusBadRequest)
 		return
 	}
-	user, err := s.store.UpdateUser(orgID, body.Email, body.Role, policy.UserStatus(body.Status))
+	user, err := s.store.UpdateUser(orgID, body.Email, body.Role, policy.UserStatus(body.Status), body.Workstation, body.MachineID, body.MachineName)
 	if err != nil {
 		if err == policy.ErrUserNotFound {
 			http.Error(w, err.Error(), http.StatusNotFound)
@@ -564,6 +600,13 @@ func applyOrgSettingsPatch(p *policy.Policy, settings map[string]interface{}) er
 		}
 		p.Features = features
 	}
+	if raw, ok := settings["auto_approve_mode"]; ok {
+		var v bool
+		if err := remarshal(raw, &v); err != nil {
+			return fmt.Errorf("auto_approve_mode: %w", err)
+		}
+		p.Guardrail.AutoApproveMode = v
+	}
 	return nil
 }
 
@@ -619,6 +662,52 @@ func parseVersion(v string) []int {
 		out = append(out, n)
 	}
 	return out
+}
+
+func (s *Server) autoJudge(w http.ResponseWriter, r *http.Request, orgID string) {
+	w.Header().Set("Content-Type", "application/json")
+	var req AutoJudgeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	p, err := s.store.EnsureDefault(orgID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	resp, err := s.guardrail.AutoJudge(r.Context(), p.Guardrail, s.trainingLog, orgID, req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	s.trainingLog.Append(HITLDecision{
+		Timestamp:  time.Now().UTC().Format(time.RFC3339),
+		OrgID:      orgID,
+		Text:       req.Text,
+		Mode:       req.Mode,
+		Reason:     req.Reason,
+		Decision:   resp.Decision,
+		Reasoning:  resp.Reasoning,
+		Confidence: resp.Confidence,
+		Source:     "auto",
+	})
+	json.NewEncoder(w).Encode(resp)
+}
+
+func (s *Server) getTrainingLog(w http.ResponseWriter, orgID string) {
+	w.Header().Set("Content-Type", "application/json")
+	entries := s.trainingLog.Recent(200)
+	var filtered []HITLDecision
+	for _, e := range entries {
+		if e.OrgID == orgID || e.OrgID == "" {
+			filtered = append(filtered, e)
+		}
+	}
+	if filtered == nil {
+		filtered = []HITLDecision{}
+	}
+	json.NewEncoder(w).Encode(filtered)
 }
 
 func env(key, fallback string) string {

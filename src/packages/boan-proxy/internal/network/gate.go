@@ -86,6 +86,10 @@ func (g *Gate) StartRefresh(ctx context.Context, interval time.Duration) {
 }
 
 func (g *Gate) Allow(host, method string) error {
+	return g.AllowWithPort(host, method, 0)
+}
+
+func (g *Gate) AllowWithPort(host, method string, port int) error {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	if len(g.policy.Endpoints) == 0 {
@@ -98,6 +102,9 @@ func (g *Gate) Allow(host, method string) error {
 	}
 	for _, ep := range g.policy.Endpoints {
 		if !matchHost(ep.Host, bare) {
+			continue
+		}
+		if len(ep.Ports) > 0 && !containsPort(ep.Ports, port) {
 			continue
 		}
 		if len(ep.Methods) == 0 {
@@ -113,6 +120,10 @@ func (g *Gate) Allow(host, method string) error {
 	}
 	g.stats.blocked.Add(1)
 	return fmt.Errorf("network gate: %s not in whitelist", host)
+}
+
+func AllowRequest(g *Gate, r *http.Request) error {
+	return g.AllowWithPort(r.Host, r.Method, requestPort(r))
 }
 
 func (g *Gate) EndpointCount() int {
@@ -165,17 +176,16 @@ func (g *Gate) refresh() {
 }
 
 func (g *Gate) decodePolicy(body []byte) (*Policy, error) {
-	if g.pubKey != nil {
-		var signed SignedPayload
-		if err := json.Unmarshal(body, &signed); err != nil {
-			return nil, fmt.Errorf("unmarshal signed payload: %w", err)
-		}
-		sig, err := base64.StdEncoding.DecodeString(signed.Signature)
-		if err != nil {
-			return nil, fmt.Errorf("decode signature: %w", err)
-		}
-		if !ed25519.Verify(g.pubKey, signed.Policy, sig) {
-			return nil, fmt.Errorf("ed25519 signature verification failed")
+	var signed SignedPayload
+	if err := json.Unmarshal(body, &signed); err == nil && len(signed.Policy) > 0 {
+		if g.pubKey != nil {
+			sig, err := base64.StdEncoding.DecodeString(signed.Signature)
+			if err != nil {
+				return nil, fmt.Errorf("decode signature: %w", err)
+			}
+			if !ed25519.Verify(g.pubKey, signed.Policy, sig) {
+				return nil, fmt.Errorf("ed25519 signature verification failed")
+			}
 		}
 		var p Policy
 		if err := json.Unmarshal(signed.Policy, &p); err != nil {
@@ -204,4 +214,32 @@ func matchHost(pattern, host string) bool {
 		}
 	}
 	return false
+}
+
+func containsPort(ports []int, port int) bool {
+	if port == 0 {
+		return false
+	}
+	for _, candidate := range ports {
+		if candidate == port {
+			return true
+		}
+	}
+	return false
+}
+
+func requestPort(r *http.Request) int {
+	if _, p, err := net.SplitHostPort(r.Host); err == nil {
+		if port, err := net.LookupPort("tcp", p); err == nil {
+			return port
+		}
+	}
+	switch {
+	case r.URL != nil && r.URL.Scheme == "https":
+		return 443
+	case r.TLS != nil:
+		return 443
+	default:
+		return 80
+	}
 }

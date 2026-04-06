@@ -5,6 +5,36 @@ networks:
     driver: bridge
 
 services:
+  boan-guac-db:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_DB=guacamole_db
+      - POSTGRES_USER=guacamole_user
+      - POSTGRES_PASSWORD=guacamole_pass
+    volumes:
+      - boan-guac-db:/var/lib/postgresql/data
+      - ./deploy/guacamole-initdb-postgresql.sql:/docker-entrypoint-initdb.d/001-guacamole-initdb.sql:ro
+    networks: [boanclaw]
+
+  boan-guacd:
+    image: guacamole/guacd:latest
+    networks: [boanclaw]
+
+  boan-guacamole:
+    image: guacamole/guacamole:latest
+    environment:
+      - GUACD_HOSTNAME=boan-guacd
+      - POSTGRESQL_HOSTNAME=boan-guac-db
+      - POSTGRESQL_PORT=5432
+      - POSTGRESQL_DATABASE=guacamole_db
+      - POSTGRESQL_USER=guacamole_user
+      - POSTGRESQL_PASSWORD=guacamole_pass
+      - WEBAPP_CONTEXT=ROOT
+    depends_on:
+      - boan-guac-db
+      - boan-guacd
+    networks: [boanclaw]
+
   boan-policy-server:
     build:
       context: src/packages/boan-policy-server
@@ -14,6 +44,8 @@ services:
       - BOAN_LISTEN=:8081
       - BOAN_DATA_DIR=/data/policies
       - BOAN_KEY_DIR=/etc/boan-policy
+      - BOAN_GUARDRAIL_LLM_URL=http://boan-sandbox:8083/v1/messages
+      - BOAN_GUARDRAIL_LLM_MODEL=claude-haiku-4-5-20251001
     volumes:
       - boan-policy-data:/data/policies
       - boan-policy-keys:/etc/boan-policy
@@ -27,6 +59,7 @@ services:
       retries: 3
 
   boan-credential-filter:
+    profiles: ["legacy-host"]
     build:
       context: src/packages/boan-credential-filter
     environment:
@@ -45,6 +78,7 @@ services:
       retries: 3
 
   boan-whitelist-proxy:
+    profiles: ["legacy-host"]
     build:
       context: src/packages/boan-whitelist-proxy
     environment:
@@ -54,10 +88,12 @@ services:
     networks: [boanclaw]
 
   boan-llm-registry:
+    profiles: ["legacy-host"]
     build:
       context: src/packages/boan-llm-registry
     environment:
       - BOAN_LISTEN=:8086
+      - BOAN_DATA_DIR=/data/registry
     volumes:
       - boan-registry-data:/data/registry
     ports:
@@ -83,11 +119,13 @@ services:
     networks: [boanclaw]
 
   boan-proxy:
+    profiles: ["legacy-host"]
     build:
       context: src/packages/boan-proxy
     env_file:
       - deploy/config/gcp.env
     environment:
+      - TEST=true
       - BOAN_LISTEN=:18080
       - BOAN_ADMIN_LISTEN=:18081
       - BOAN_ADMIN_PASSWORD=boan-admin
@@ -100,17 +138,36 @@ services:
       - BOAN_LLM_REGISTRY_URL=http://boan-llm-registry:8086
       - BOAN_OTEL_ENDPOINT=http://boan-audit-agent:8084
       - BOAN_USER_DATA_DIR=/data/users
+      - BOAN_GUACAMOLE_URL=http://boan-guacamole:8080
+      - BOAN_GUACAMOLE_USERNAME=guacadmin
+      - BOAN_GUACAMOLE_PASSWORD=guacadmin
+      - BOAN_GUACAMOLE_BASE_PATH=/remote
+      - BOAN_OPENCLAW_GATEWAY_TOKEN=boan-openclaw-local
+      - GOOGLE_APPLICATION_CREDENTIALS=/var/run/gcp/service-account.json
     volumes:
       - boan-user-data:/data/users
+      - ${BOAN_GCP_SERVICE_ACCOUNT_KEY_PATH:-${HOME}/.config/gcp/boanclaw-terraform-sa.json}:/var/run/gcp/service-account.json:ro
     ports:
       - "18080:18080"
       - "18081:18081"
     networks: [boanclaw]
-    depends_on: [boan-policy-server, boan-credential-filter, boan-audit-agent]
+    depends_on: [boan-policy-server, boan-credential-filter, boan-audit-agent, boan-guacamole, boan-llm-registry]
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:18081/healthz"]
       interval: 10s
       timeout: 5s
+      retries: 3
+
+  boan-computer-use:
+    build:
+      context: src/packages/boan-computer-use
+    ports:
+      - "8090:8090"
+    networks: [boanclaw]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8090/healthz"]
+      interval: 15s
+      timeout: 10s
       retries: 3
 
   boan-admin-console:
@@ -119,7 +176,7 @@ services:
     ports:
       - "19080:80"
     networks: [boanclaw]
-    depends_on: [boan-proxy]
+    depends_on: [boan-sandbox, boan-guacamole]
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:80/ > /dev/null 2>&1 || exit 1"]
       interval: 10s
@@ -130,19 +187,55 @@ services:
     build:
       context: src/packages
       dockerfile: boan-sandbox/Dockerfile
+    env_file:
+      - deploy/config/gcp.env
     environment:
-      - HTTP_PROXY=http://boan-proxy:18080
-      - HTTPS_PROXY=http://boan-proxy:18080
-      - BOAN_PROXY_ADMIN=http://boan-proxy:18081
+      - TEST=true
+      - HTTP_PROXY=http://localhost:18080
+      - HTTPS_PROXY=http://localhost:18080
+      - NO_PROXY=localhost,127.0.0.1,boan-proxy,boan-policy-server,boan-guacamole,boan-audit-agent,boan-credential-filter,boan-llm-registry,boan-whitelist-proxy,boan-computer-use
+      - no_proxy=localhost,127.0.0.1,boan-proxy,boan-policy-server,boan-guacamole,boan-audit-agent,boan-credential-filter,boan-llm-registry,boan-whitelist-proxy,boan-computer-use
+      - BOAN_PROXY_ADMIN=http://localhost:18081
       - BOAN_SESSION_ID=dev-session-001
-      - BOAN_ONECLI_CRED_FILTER_URL=http://boan-credential-filter:8082
-      - BOAN_ONECLI_ORG_ID=dev-org
+      - BOAN_ONECLI_CRED_FILTER_URL=http://localhost:8082
+      - BOAN_ONECLI_ORG_ID=sds-corp
+      - BOAN_ONECLI_CREDENTIAL_NAME=anthropic-apikey-65a1f06a
+      - BOAN_ONECLI_CREDENTIAL_TYPE=api_key
+      - BOAN_ONECLI_UPSTREAM_URL=https://api.anthropic.com
+      - BOAN_ORG_ID=sds-corp
+      - BOAN_LISTEN=:18080
+      - BOAN_ADMIN_LISTEN=:18081
+      - BOAN_POLICY_URL=http://boan-policy-server:8081
+      - BOAN_AUDIT_ENDPOINT=http://boan-audit-agent:8084
+      - BOAN_CREDENTIAL_FILTER_URL=http://localhost:8082
+      - BOAN_LLM_REGISTRY_URL=http://localhost:8086
+      - BOAN_USER_DATA_DIR=/data/users
+      - BOAN_CREDENTIAL_DATA_DIR=/data/credentials
+      - BOAN_GUACAMOLE_URL=http://boan-guacamole:8080
+      - BOAN_GUACAMOLE_USERNAME=guacadmin
+      - BOAN_GUACAMOLE_PASSWORD=guacadmin
+      - BOAN_GUACAMOLE_BASE_PATH=/remote
+      - BOAN_COMPUTER_USE_URL=http://boan-computer-use:8090
+      - BOAN_KMS_KEY=/etc/boan-cred/aes.key
+      - BOAN_DATA_DIR=/data/registry
+      - BOAN_CA_CERT=/tmp/boan/ca.crt
+      - BOAN_CA_KEY=/tmp/boan/ca.key
+      - GOOGLE_APPLICATION_CREDENTIALS=/var/run/gcp/service-account.json
+      - BOAN_OPENCLAW_GATEWAY_TOKEN=boan-openclaw-local
     ports:
       - "18789:18789"
+    volumes:
+      - ${BOAN_HOST_MOUNT_ROOT:-${HOME}/boanclaw}:/workspace/boanclaw
+      - ${BOAN_GCP_SERVICE_ACCOUNT_KEY_PATH:-${HOME}/.config/gcp/boanclaw-terraform-sa.json}:/var/run/gcp/service-account.json:ro
+      - boan-user-data:/data/users
+      - boan-registry-data:/data/registry
+      - boan-cred-data:/data/credentials
+      - boan-cred-keys:/etc/boan-cred
     networks: [boanclaw]
-    depends_on: [boan-proxy, boan-credential-filter]
+    depends_on: [boan-policy-server, boan-audit-agent, boan-guacamole, boan-computer-use]
 
 volumes:
+  boan-guac-db:
   boan-policy-data:
   boan-policy-keys:
   boan-cred-keys:
