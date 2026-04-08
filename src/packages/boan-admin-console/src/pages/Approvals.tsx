@@ -6,12 +6,37 @@ function formatApprovalCommand(command: string): string {
     case "critical-guardrail:review":
     case "guardrail:review":
       return "Critical Guardrail Review";
+    case "constitution-amendment:review":
+      return "Constitution Amendment";
     default:
       return command;
   }
 }
 
+function renderArgs(req: ApprovalRequest): JSX.Element {
+  if (req.command === "constitution-amendment:review") {
+    const diff = req.args.find((a) => a.startsWith("diff="))?.slice(5) ?? "";
+    const reasoning = req.args.find((a) => a.startsWith("reasoning="))?.slice(10) ?? "";
+    return (
+      <div className="max-w-lg">
+        {reasoning && <p className="text-xs text-gray-600 mb-2">{reasoning}</p>}
+        <pre className="text-xs bg-gray-900 text-gray-100 p-3 rounded-lg overflow-x-auto whitespace-pre-wrap">
+          {diff.split("\n").map((line, i) => (
+            <span key={i} className={line.startsWith("+") ? "text-green-400" : line.startsWith("-") ? "text-red-400" : ""}>
+              {line}{"\n"}
+            </span>
+          ))}
+        </pre>
+      </div>
+    );
+  }
+  return <span className="font-mono text-gray-600 max-w-xs truncate">{req.args.join(" ")}</span>;
+}
+
+type ApprovalTab = "actions" | "amendments";
+
 export default function Approvals() {
+  const [tab, setTab] = useState<ApprovalTab>("actions");
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -47,16 +72,24 @@ export default function Approvals() {
     }
   };
 
-  const pending = approvals.filter((a) => a.status === "pending");
-  const decided = approvals.filter((a) => a.status !== "pending");
+  const isAmendment = (a: ApprovalRequest) => a.command === "constitution-amendment:review";
+  const filtered = approvals.filter((a) => tab === "amendments" ? isAmendment(a) : !isAmendment(a));
+  const pending = filtered.filter((a) => a.status === "pending");
+  const decided = filtered.filter((a) => a.status !== "pending");
 
   return (
     <div>
-      <div className="flex items-center justify-between mb-6">
-        <h1 className="text-2xl font-bold">Exec Approvals</h1>
+      <div className="flex items-center justify-between mb-4">
+        <h1 className="text-2xl font-bold">Approvals</h1>
         <span className="text-sm text-gray-500">
           {pending.length} pending
         </span>
+      </div>
+
+      <div className="flex border-b border-gray-200 mb-4">
+        {([["actions", "User Actions"], ["amendments", "Constitution Diff"]] as const).map(([k, label]) => (
+          <button key={k} onClick={() => setTab(k)} className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${tab === k ? "border-boan-600 text-boan-700" : "border-transparent text-gray-500 hover:text-gray-700"}`}>{label}</button>
+        ))}
       </div>
 
       {error && (
@@ -91,8 +124,8 @@ export default function Approvals() {
                         <td className="px-4 py-3 font-mono font-medium text-gray-900">
                           {formatApprovalCommand(req.command)}
                         </td>
-                        <td className="px-4 py-3 font-mono text-gray-600 max-w-xs truncate">
-                          {req.args.join(" ")}
+                        <td className="px-4 py-3">
+                          {renderArgs(req)}
                         </td>
                         <td className="px-4 py-3 text-gray-700">
                           {req.requester}
@@ -147,8 +180,8 @@ export default function Approvals() {
                         <td className="px-4 py-3 font-mono font-medium text-gray-900">
                           {formatApprovalCommand(req.command)}
                         </td>
-                        <td className="px-4 py-3 font-mono text-gray-600 max-w-xs truncate">
-                          {req.args.join(" ")}
+                        <td className="px-4 py-3">
+                          {renderArgs(req)}
                         </td>
                         <td className="px-4 py-3 text-gray-700">
                           {req.requester}

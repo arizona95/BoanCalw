@@ -8,6 +8,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/jpeg"
+	_ "image/png"
 	"io"
 	"log"
 	"net/http"
@@ -736,6 +739,288 @@ func (s *Server) StartAdmin() {
 		return id
 	}
 
+	// ── queueComputerUseCommand ──────────────────────────────────────────────
+	// 브라우저 폴링 큐에 커맨드 추가. BOAN_COMPUTER_USE_URL 설정 시 외부 프록시로 위임.
+	queueComputerUseCommand := func(params map[string]any, timeout time.Duration) (map[string]any, error) {
+		if delegateURL := os.Getenv("BOAN_COMPUTER_USE_URL"); delegateURL != "" {
+			body, _ := json.Marshal(params)
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+			client := &http.Client{Transport: &http.Transport{
+				Proxy: func(*http.Request) (*url.URL, error) { return nil, nil },
+			}}
+			req, _ := http.NewRequestWithContext(ctx, http.MethodPost, delegateURL+"/api/computer-use/execute", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := client.Do(req)
+			if err != nil {
+				return nil, err
+			}
+			defer resp.Body.Close()
+			var result map[string]any
+			json.NewDecoder(resp.Body).Decode(&result)
+			if resp.StatusCode >= 400 {
+				if errMsg, _ := result["error"].(string); errMsg != "" {
+					return nil, fmt.Errorf(errMsg)
+				}
+				return nil, fmt.Errorf("computer-use delegate failed: %d", resp.StatusCode)
+			}
+			return result, nil
+		}
+		idBytes := make([]byte, 8)
+		crand.Read(idBytes)
+		id := hex.EncodeToString(idBytes)
+		done := make(chan []byte, 1)
+		cuQueueMu.Lock()
+		cuPendingQueue = append(cuPendingQueue, &cuQueuedCmd{id: id, params: params, done: done})
+		cuQueueMu.Unlock()
+		select {
+		case result := <-done:
+			var decoded map[string]any
+			if err := json.Unmarshal(result, &decoded); err != nil {
+				return nil, fmt.Errorf("decode command result: %w", err)
+			}
+			return decoded, nil
+		case <-time.After(timeout):
+			cuQueueMu.Lock()
+			for i, c := range cuPendingQueue {
+				if c.id == id {
+					cuPendingQueue = append(cuPendingQueue[:i], cuPendingQueue[i+1:]...)
+					break
+				}
+			}
+			for i, c := range cuInFlight {
+				if c.id == id {
+					cuInFlight = append(cuInFlight[:i], cuInFlight[i+1:]...)
+					break
+				}
+			}
+			cuQueueMu.Unlock()
+			return nil, fmt.Errorf("timeout waiting for browser to execute command")
+		}
+	}
+
+	writeOpenAITextResponse := func(w http.ResponseWriter, content string) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":      "chatcmpl-" + hex.EncodeToString(func() []byte { b := make([]byte, 6); crand.Read(b); return b }()),
+			"object":  "chat.completion",
+			"created": time.Now().Unix(),
+			"model":   "boan/operator",
+			"choices": []map[string]any{
+				{
+					"index": 0,
+					"message": map[string]any{
+						"role":    "assistant",
+						"content": content,
+					},
+					"finish_reason": "stop",
+				},
+			},
+		})
+	}
+
+	parseOperatorMode := func(raw, defaultMode string) (string, string) {
+		trimmed := strings.TrimSpace(raw)
+		switch {
+		case strings.HasPrefix(strings.ToLower(trimmed), "chat "):
+			return "chat", strings.TrimSpace(trimmed[5:])
+		case strings.HasPrefix(trimmed, "전송 "):
+			return "gcp_send", strings.TrimSpace(strings.TrimPrefix(trimmed, "전송 "))
+		case strings.HasPrefix(trimmed, "실행 "):
+			return "gcp_exec", strings.TrimSpace(strings.TrimPrefix(trimmed, "실행 "))
+		case strings.HasPrefix(trimmed, "[gcp_send] "):
+			return "gcp_send", strings.TrimSpace(strings.TrimPrefix(trimmed, "[gcp_send] "))
+		case strings.HasPrefix(trimmed, "[gcp_exec] "):
+			return "gcp_exec", strings.TrimSpace(strings.TrimPrefix(trimmed, "[gcp_exec] "))
+		default:
+			return defaultMode, trimmed
+		}
+	}
+
+	runGCPSend := func(ctx context.Context, requester, orgID, text string) (string, error) {
+		resp := evaluateInputGate(ctx, s.dlpEng, s.guardrail, orgID,
+			InputGateRequest{Mode: "text", Text: text, SrcLevel: 3, DestLevel: 1, Flow: "openclaw-chat-to-remote-workstation"},
+			func(reason string, req InputGateRequest) string {
+				approvalID := createInputGateApproval(requester, orgID, reason, req)
+				if s.cfg.PolicyURL != "" {
+					go s.runAutoJudgeForApproval(approvalID, orgID, req.Text, req.Mode, reason)
+				}
+				return approvalID
+			},
+		)
+		if resp.Action == "credential_required" && text != "" {
+			gateResult := s.applyCredentialGate(ctx, orgID, text, func(keys []string, previews []string, fps []string) string {
+				return createCredentialGateApproval(orgID, keys, previews, fps)
+			})
+			resp = InputGateResponse{Allowed: true, Action: "allow", NormalizedText: gateResult.Prompt, Reason: "credential substituted", ApprovalID: gateResult.ApprovalID}
+			if gateResult.HITLRequired {
+				resp.Reason = "credential detected; unknown values redacted, HITL created"
+			}
+		}
+		if !resp.Allowed {
+			if resp.Action == "hitl_required" && resp.ApprovalID != "" {
+				return fmt.Sprintf("입력이 보류되었습니다. 관리자 승인 대기 중입니다. approval=%s", resp.ApprovalID), nil
+			}
+			return "", fmt.Errorf("가드레일에 통과되지 못하였습니다: 사유 - %s", firstNonEmptyString(resp.Reason, "input blocked"))
+		}
+		// 실제 타이핑은 클라이언트(브라우저)가 직접 injectTextToRemote로 처리.
+		// 여기서는 가드레일 통과 결과만 반환.
+		return "입력이 검사를 통과했고 원격 화면에 전달되었습니다.", nil
+	}
+
+	runComputerUseAgent := func(ctx context.Context, orgID, prompt string, sendEvent func(map[string]any)) (string, int, error) {
+		send := func(evt map[string]any) {
+			if sendEvent != nil {
+				sendEvent(evt)
+			}
+		}
+		visionEntry, visionErr := s.loadSecurityLMM(ctx)
+		if visionErr != nil {
+			return "", 0, fmt.Errorf("보안 LMM이 등록되지 않았습니다: %w", visionErr)
+		}
+		log.Printf("[computer-use/agent] vision LMM=%s", visionEntry.Name)
+		const maxSteps = 10
+		executed := 0
+		// visionPromptTemplate: %d=width, %d=height, %s=objective, %d=width, %d=height
+		visionPromptTemplate := "This image IS the screenshot of the current display of the computer (resolution: %dx%d pixels). " +
+			"It has already been automatically captured and sent to the user — you do NOT need to press PrtScn or any screenshot key.\n" +
+			"The objective is: %s\n" +
+			"Describe what is visible on screen. For each UI element (window, button, text field), " +
+			"estimate its center position as pixel coordinates (x, y) in the full %dx%d resolution.\n" +
+			"IMPORTANT: If the objective is to take/show/capture/send a screenshot, it is ALREADY COMPLETE — the image above IS the screenshot.\n" +
+			"End your response with exactly one of these two lines:\n" +
+			"OBJECTIVE: COMPLETE\n" +
+			"OBJECTIVE: INCOMPLETE\n" +
+			"If INCOMPLETE, describe the single next action: [click|type|press key] at approximately (x, y) in order to [expected result]."
+		// actionSystemPromptFmt: %d=width, %d=height
+		actionSystemPromptFmt := "You control a GCP Windows workstation via computer-use.\n" +
+			"The screen resolution is %dx%d pixels.\n" +
+			"You will be given a description of the current screen and the next step to take.\n" +
+			"Respond with ONLY a JSON array of actions — no explanation, no markdown fences.\n" +
+			"To indicate the task is complete, respond with: [{\"action\":\"stop\"}]\n" +
+			"Available actions:\n" +
+			`{"action":"screenshot"}` + " – capture current screen (returns image; use this to see the screen)\n" +
+			`{"action":"type","text":"..."}` + " – type text\n" +
+			`{"action":"key","name":"..."}` + " – press key: Return, Tab, Escape, BackSpace, ctrl+s, ctrl+a, ctrl+c, ctrl+v, ctrl+z (WARNING: do NOT use alt+F4)\n" +
+			`{"action":"click","x":N,"y":N}` + " – left click at screen coords (use actual pixel coords, not percentages)\n" +
+			`{"action":"double_click","x":N,"y":N}` + " – double click\n" +
+			`{"action":"right_click","x":N,"y":N}` + " – right click\n" +
+			`{"action":"scroll","x":N,"y":N,"direction":"down","amount":3}` + " – scroll\n" +
+			`{"action":"stop"}` + " – task complete\n\n" +
+			"NOTE: A screenshot is already taken automatically at the start of each step. Do NOT press PrtScn or PrintScreen keys to take a screenshot.\n" +
+			`Example: [{"action":"click","x":100,"y":200},{"action":"stop"}]`
+		for step := 0; step < maxSteps; step++ {
+			send(map[string]any{"type": "status", "text": fmt.Sprintf("화면 캡처 중... (스텝 %d)", step+1)})
+			ssResult, ssErr := queueComputerUseCommand(map[string]any{"action": "screenshot"}, 45*time.Second)
+			if ssErr != nil {
+				return "", executed, fmt.Errorf("스크린샷 실패: %w", ssErr)
+			}
+			screenshotB64, _ := ssResult["image"].(string)
+			if screenshotB64 == "" {
+				screenshotB64, _ = ssResult["data"].(string)
+			}
+			if screenshotB64 == "" {
+				return "", executed, fmt.Errorf("스크린샷 데이터 없음")
+			}
+			send(map[string]any{"type": "screenshot", "data": screenshotB64, "label": fmt.Sprintf("스텝 %d 화면", step+1)})
+
+			// 스크린샷 해상도 추출 (좌표 정확도 향상)
+			scrW, scrH := getImageDimensions(screenshotB64)
+			log.Printf("[computer-use/agent] step=%d screen resolution=%dx%d", step, scrW, scrH)
+
+			send(map[string]any{"type": "status", "text": "Vision LMM이 화면을 분석 중..."})
+			visionPrompt := fmt.Sprintf(visionPromptTemplate, scrW, scrH, prompt, scrW, scrH)
+			thought, vErr := s.forwardVisionLLM(ctx, visionEntry, screenshotB64, visionPrompt)
+			if vErr != nil {
+				return "", executed, fmt.Errorf("Vision LMM 오류: %w", vErr)
+			}
+			send(map[string]any{"type": "thinking", "text": thought})
+			lowerThought := strings.ToLower(thought)
+			isComplete := strings.Contains(lowerThought, "objective: complete") &&
+				!strings.Contains(lowerThought, "objective: incomplete") &&
+				!strings.Contains(lowerThought, "not complete")
+			if isComplete {
+				return thought, executed, nil
+			}
+			send(map[string]any{"type": "status", "text": "Action LLM이 다음 동작을 결정 중..."})
+			actionSystemPrompt := fmt.Sprintf(actionSystemPromptFmt, scrW, scrH)
+			actionPrompt := actionSystemPrompt + "\n\nVision analysis:\n" + thought
+			actionResp, aErr := s.forwardSelectedLLM(ctx, orgID, actionPrompt, map[string]any{"max_tokens": 512})
+			if aErr != nil {
+				return "", executed, fmt.Errorf("Action LLM 오류: %w", aErr)
+			}
+			actionText := ""
+			if rawChoices, _ := json.Marshal(actionResp["choices"]); len(rawChoices) > 0 {
+				var choices []struct {
+					Message struct{ Content string `json:"content"` } `json:"message"`
+				}
+				if json.Unmarshal(rawChoices, &choices) == nil && len(choices) > 0 {
+					actionText = choices[0].Message.Content
+				}
+			}
+			start := strings.Index(actionText, "[")
+			end := strings.LastIndex(actionText, "]")
+			if start < 0 || end <= start {
+				break
+			}
+			var actions []map[string]any
+			if err := json.Unmarshal([]byte(actionText[start:end+1]), &actions); err != nil {
+				return "", executed, fmt.Errorf("액션 파싱 실패: %s", actionText)
+			}
+			stopped := false
+			for i, action := range actions {
+				if action["action"] == "stop" {
+					stopped = true
+					break
+				}
+				actionJSON, _ := json.Marshal(action)
+				log.Printf("[computer-use/agent] step=%d action[%d]: %s", step, i, actionJSON)
+				send(map[string]any{"type": "action", "index": executed, "action": action})
+				result, err := queueComputerUseCommand(action, 45*time.Second)
+				if err != nil {
+					send(map[string]any{"type": "action_result", "index": executed, "error": err.Error()})
+					log.Printf("[computer-use/agent] step=%d action[%d] ERROR: %v", step, i, err)
+					return "", executed, err
+				}
+				resultJSON, _ := json.Marshal(result)
+				log.Printf("[computer-use/agent] step=%d action[%d] result: %s", step, i, resultJSON)
+				send(map[string]any{"type": "action_result", "index": executed, "result": result})
+				executed++
+			}
+			if stopped {
+				break
+			}
+		}
+		return fmt.Sprintf("[BoanClaw 실행 완료] %s → %d개 액션 완료", prompt, executed), executed, nil
+	}
+
+	dispatchOperatorAction := func(ctx context.Context, requester, orgID, mode, payload string, sendEvent func(map[string]any)) (string, error) {
+		switch mode {
+		case "chat":
+			runID, err := openClawChatSend(payload, hex.EncodeToString(func() []byte { b := make([]byte, 8); crand.Read(b); return b }()))
+			if err != nil {
+				return "", err
+			}
+			if strings.TrimSpace(runID) == "" {
+				return "BoanClaw 채팅으로 전달했습니다.", nil
+			}
+			return "BoanClaw 채팅으로 전달했습니다. runId=" + runID, nil
+		case "gcp_send":
+			return runGCPSend(ctx, requester, orgID, payload)
+		case "gcp_exec":
+			resultText, executed, err := runComputerUseAgent(ctx, orgID, payload, sendEvent)
+			if err != nil {
+				return "", err
+			}
+			if executed > 0 && !strings.Contains(resultText, "액션") {
+				resultText = fmt.Sprintf("%s\n\n실행 완료: %d개 액션", resultText, executed)
+			}
+			return resultText, nil
+		default:
+			return "", fmt.Errorf("unsupported mode: %s", mode)
+		}
+	}
+
 	mux.HandleFunc("/api/openclaw/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.NotFound(w, r)
@@ -748,6 +1033,75 @@ func (s *Server) StartAdmin() {
 		}
 		orgID := resolveOrg(r)
 		prompt := extractPromptFromMessages(body["messages"])
+		mode, payload := parseOperatorMode(prompt, "chat")
+		log.Printf("[openclaw/v1] mode=%s payload=%.80q org=%s", mode, payload, orgID)
+
+		if mode != "chat" {
+			isStream, _ := body["stream"].(bool)
+			buildResp := func(content string) map[string]any {
+				return map[string]any{
+					"id":      "chatcmpl-" + hex.EncodeToString(func() []byte { b := make([]byte, 6); crand.Read(b); return b }()),
+					"object":  "chat.completion",
+					"created": time.Now().Unix(),
+					"model":   "boan/operator",
+					"choices": []map[string]any{
+						{"index": 0, "message": map[string]any{"role": "assistant", "content": content}, "finish_reason": "stop"},
+					},
+				}
+			}
+			writeResp := func(content string) {
+				if isStream {
+					writeOpenAIStream(w, buildResp(content))
+				} else {
+					writeOpenAITextResponse(w, content)
+				}
+			}
+
+			var collectedScreenshots []string
+			var collectMu sync.Mutex
+			var sendEvt func(map[string]any)
+			if mode == "gcp_exec" {
+				sendEvt = func(evt map[string]any) {
+					if evt["type"] == "screenshot" {
+						if data, ok := evt["data"].(string); ok && data != "" {
+							collectMu.Lock()
+							collectedScreenshots = append(collectedScreenshots, data)
+							collectMu.Unlock()
+						}
+					}
+				}
+			}
+			resultText, err := dispatchOperatorAction(r.Context(), "openclaw-control-ui", orgID, mode, payload, sendEvt)
+			if err != nil {
+				if !isStream {
+					w.WriteHeader(http.StatusBadGateway)
+				}
+				writeResp(err.Error())
+				return
+			}
+			if len(collectedScreenshots) > 0 {
+				contentParts := []map[string]any{{"type": "text", "text": resultText}}
+				for _, ss := range collectedScreenshots {
+					contentParts = append(contentParts, map[string]any{
+						"type":      "image_url",
+						"image_url": map[string]any{"url": "data:image/png;base64," + ss},
+					})
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"id":      "chatcmpl-" + hex.EncodeToString(func() []byte { b := make([]byte, 6); crand.Read(b); return b }()),
+					"object":  "chat.completion",
+					"created": time.Now().Unix(),
+					"model":   "boan/operator",
+					"choices": []map[string]any{
+						{"index": 0, "message": map[string]any{"role": "assistant", "content": contentParts}, "finish_reason": "stop"},
+					},
+				})
+				return
+			}
+			writeResp(resultText)
+			return
+		}
 
 		// Apply credential gate: replace registered creds, redact unknown, HITL for new.
 		gateResult := s.applyCredentialGate(r.Context(), orgID, prompt, func(keys []string, previews []string, fps []string) string {
@@ -1220,12 +1574,17 @@ func (s *Server) StartAdmin() {
 				Role              string `json:"role"`
 				OrgID             string `json:"org_id"`
 				Status            string `json:"status"`
+				AccessLevel       string `json:"access_level"`
 				CreatedAt         string `json:"created_at"`
 				WorkstationStatus string `json:"workstation_status,omitempty"`
 				InstanceID        string `json:"instance_id,omitempty"`
 			}
 			out := make([]userView, 0, len(list))
 			for _, u := range list {
+				accessLevel := string(u.AccessLevel)
+				if accessLevel == "" {
+					accessLevel = "ask" // 기존 사용자 기본값
+				}
 				out = append(out, userView{
 					Email: u.Email,
 					Role: func() string {
@@ -1234,9 +1593,10 @@ func (s *Server) StartAdmin() {
 						}
 						return string(roles.User)
 					}(),
-					OrgID:     u.OrgID,
-					Status:    string(u.Status),
-					CreatedAt: u.CreatedAt.Format("2006-01-02 15:04"),
+					OrgID:       u.OrgID,
+					Status:      string(u.Status),
+					AccessLevel: accessLevel,
+					CreatedAt:   u.CreatedAt.Format("2006-01-02 15:04"),
 					WorkstationStatus: func() string {
 						if u.Workstation == nil {
 							return ""
@@ -1257,9 +1617,10 @@ func (s *Server) StartAdmin() {
 
 		if r.Method == http.MethodPatch {
 			var body struct {
-				Email  string `json:"email"`
-				Role   string `json:"role"`
-				Action string `json:"action"`
+				Email       string `json:"email"`
+				Role        string `json:"role"`
+				Action      string `json:"action"`
+				AccessLevel string `json:"access_level"`
 			}
 			json.NewDecoder(r.Body).Decode(&body)
 			if ownerMatch(body.Email) {
@@ -1296,6 +1657,18 @@ func (s *Server) StartAdmin() {
 					return
 				}
 			}
+			if body.AccessLevel != "" {
+				if !userstore.ValidAccessLevel(body.AccessLevel) {
+					w.WriteHeader(http.StatusBadRequest)
+					json.NewEncoder(w).Encode(map[string]string{"error": "유효하지 않은 권한 레벨: " + body.AccessLevel})
+					return
+				}
+				if err := s.users.SetAccessLevel(body.Email, userstore.AccessLevel(body.AccessLevel)); err != nil {
+					w.WriteHeader(http.StatusNotFound)
+					json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+					return
+				}
+			}
 			role := strings.TrimSpace(body.Role)
 			if role == "" {
 				if u, err := s.users.Get(body.Email); err == nil {
@@ -1312,7 +1685,7 @@ func (s *Server) StartAdmin() {
 					workstation = toOrgWorkstation(ws)
 				}
 			}
-			if err := s.orgServer.UpdateUser(defaultOrgID, body.Email, role, status, workstation, machineID, machineName); err != nil {
+			if err := s.orgServer.UpdateUser(defaultOrgID, body.Email, role, status, body.AccessLevel, workstation, machineID, machineName); err != nil {
 				w.WriteHeader(http.StatusBadGateway)
 				json.NewEncoder(w).Encode(map[string]string{"error": "조직 서버 반영 실패: " + err.Error()})
 				return
@@ -1346,6 +1719,42 @@ func (s *Server) StartAdmin() {
 		}
 
 		http.NotFound(w, r)
+	})
+
+	// POST /api/admin/propose-amendment — wiki가 헌법 개정안 생성 → approval 큐에 등록
+	mux.HandleFunc("/api/admin/propose-amendment", func(w http.ResponseWriter, r *http.Request) {
+		if cors(w, r) { return }
+		if r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		proposal, err := s.orgServer.ProposeAmendment(defaultOrgID)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		diff, _ := proposal["diff"].(string)
+		reasoning, _ := proposal["reasoning"].(string)
+		if diff == "" {
+			json.NewEncoder(w).Encode(map[string]string{"status": "no_amendment", "reasoning": reasoning})
+			return
+		}
+		// approval 큐에 등록
+		id := fmt.Sprintf("apr-%s", randomMachineID()[:12])
+		approvalsMu.Lock()
+		approvalsStore = append(approvalsStore, map[string]any{
+			"id":          id,
+			"sessionId":   "constitution",
+			"command":     "constitution-amendment:review",
+			"args":        []string{"diff=" + diff, "reasoning=" + reasoning},
+			"requester":   "wiki-guardrail",
+			"org_id":      defaultOrgID,
+			"requestedAt": time.Now().UTC().Format(time.RFC3339),
+			"status":      "pending",
+		})
+		approvalsMu.Unlock()
+		json.NewEncoder(w).Encode(map[string]string{"status": "proposed", "approval_id": id})
 	})
 
 	mux.HandleFunc("/api/admin/org-settings", func(w http.ResponseWriter, r *http.Request) {
@@ -1436,6 +1845,162 @@ func (s *Server) StartAdmin() {
 			"success":    true,
 			"mountPoint": target,
 			"sessionId":  body.SessionID,
+		})
+	})
+
+	// ── 파일 매니저 API: S2(sandbox) ↔ S1(GCP) 파일 전송 ────────────────────
+
+	// GET /api/files/list?path=&side=s2|s1 — 디렉토리 내용 조회
+	mux.HandleFunc("/api/files/list", func(w http.ResponseWriter, r *http.Request) {
+		if cors(w, r) { return }
+		w.Header().Set("Content-Type", "application/json")
+		side := r.URL.Query().Get("side")
+		reqPath := r.URL.Query().Get("path")
+		orgID := resolveOrg(r)
+		root := mountRootForOrg(orgID)
+
+		var baseDir string
+		switch side {
+		case "s2":
+			baseDir = root // sandbox mount directory
+		case "s1":
+			baseDir = "/workspace/gcp" // GCP workstation directory
+		default:
+			http.Error(w, `{"error":"side must be s2 or s1"}`, http.StatusBadRequest)
+			return
+		}
+
+		target := filepath.Clean(filepath.Join(baseDir, reqPath))
+		if !strings.HasPrefix(target, baseDir) {
+			http.Error(w, `{"error":"path escapes base directory"}`, http.StatusForbidden)
+			return
+		}
+
+		entries, err := os.ReadDir(target)
+		if err != nil {
+			// 디렉토리 없으면 빈 목록 반환
+			if os.IsNotExist(err) {
+				os.MkdirAll(target, 0755)
+				json.NewEncoder(w).Encode(map[string]any{"path": reqPath, "side": side, "files": []any{}})
+				return
+			}
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		type fileEntry struct {
+			Name  string `json:"name"`
+			IsDir bool   `json:"is_dir"`
+			Size  int64  `json:"size"`
+		}
+		files := make([]fileEntry, 0, len(entries))
+		for _, e := range entries {
+			info, _ := e.Info()
+			size := int64(0)
+			if info != nil {
+				size = info.Size()
+			}
+			files = append(files, fileEntry{Name: e.Name(), IsDir: e.IsDir(), Size: size})
+		}
+		json.NewEncoder(w).Encode(map[string]any{"path": reqPath, "side": side, "files": files})
+	})
+
+	// POST /api/files/transfer — 파일 전송 (S2→S1: 가드레일 검사, S1→S2: 통과)
+	mux.HandleFunc("/api/files/transfer", func(w http.ResponseWriter, r *http.Request) {
+		if cors(w, r) { return }
+		if r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		var body struct {
+			FileName string `json:"file_name"`
+			SrcSide  string `json:"src_side"`  // s2 or s1
+			SrcPath  string `json:"src_path"`  // relative path within side
+			DstPath  string `json:"dst_path"`  // relative path within other side
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		orgID := resolveOrg(r)
+		root := mountRootForOrg(orgID)
+		s2Base := root
+		s1Base := "/workspace/gcp"
+
+		var srcFull, dstFull string
+		switch body.SrcSide {
+		case "s2":
+			srcFull = filepath.Clean(filepath.Join(s2Base, body.SrcPath, body.FileName))
+			dstFull = filepath.Clean(filepath.Join(s1Base, body.DstPath, body.FileName))
+		case "s1":
+			srcFull = filepath.Clean(filepath.Join(s1Base, body.SrcPath, body.FileName))
+			dstFull = filepath.Clean(filepath.Join(s2Base, body.DstPath, body.FileName))
+		default:
+			http.Error(w, `{"error":"src_side must be s2 or s1"}`, http.StatusBadRequest)
+			return
+		}
+
+		// 경로 탈출 방지
+		if (body.SrcSide == "s2" && !strings.HasPrefix(srcFull, s2Base)) ||
+			(body.SrcSide == "s1" && !strings.HasPrefix(srcFull, s1Base)) {
+			http.Error(w, `{"error":"source path escapes base"}`, http.StatusForbidden)
+			return
+		}
+		if (body.SrcSide == "s2" && !strings.HasPrefix(dstFull, s1Base)) ||
+			(body.SrcSide == "s1" && !strings.HasPrefix(dstFull, s2Base)) {
+			http.Error(w, `{"error":"dest path escapes base"}`, http.StatusForbidden)
+			return
+		}
+
+		// 소스 파일 읽기
+		info, err := os.Stat(srcFull)
+		if err != nil {
+			http.Error(w, `{"error":"source file not found"}`, http.StatusNotFound)
+			return
+		}
+		if info.IsDir() {
+			http.Error(w, `{"error":"directory transfer not allowed, files only"}`, http.StatusBadRequest)
+			return
+		}
+
+		// S2 → S1: 가드레일 검사 (파일 내용)
+		if body.SrcSide == "s2" {
+			content, readErr := os.ReadFile(srcFull)
+			if readErr != nil {
+				http.Error(w, `{"error":"cannot read source file"}`, http.StatusInternalServerError)
+				return
+			}
+			// 텍스트 파일만 가드레일 검사 (바이너리는 DLP)
+			textContent := string(content)
+			if len(textContent) > 0 {
+				gateResp := evaluateInputGate(r.Context(), s.dlpEng, s.guardrail, defaultOrgID, InputGateRequest{
+					Mode: "text", Text: textContent, SrcLevel: 2, DestLevel: 1,
+					Flow: "file-transfer-s2-to-s1",
+				}, nil)
+				if !gateResp.Allowed {
+					w.Header().Set("Content-Type", "application/json")
+					json.NewEncoder(w).Encode(map[string]any{
+						"ok": false, "error": "guardrail blocked file transfer",
+						"action": gateResp.Action, "reason": gateResp.Reason,
+					})
+					return
+				}
+			}
+		}
+		// S1 → S2: 무조건 통과
+
+		// 파일 복사
+		os.MkdirAll(filepath.Dir(dstFull), 0755)
+		srcData, _ := os.ReadFile(srcFull)
+		if err := os.WriteFile(dstFull, srcData, 0644); err != nil {
+			http.Error(w, `{"error":"failed to write destination file: `+err.Error()+`"}`, http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"ok": true, "src": srcFull, "dst": dstFull,
+			"size": info.Size(), "guardrail": body.SrcSide == "s2",
 		})
 	})
 
@@ -1995,16 +2560,53 @@ func (s *Server) StartAdmin() {
 				}
 			}
 		}
+		// approval 레코드에서 메타데이터 추출 (training log 피드백용)
+		var approvalText, approvalMode, approvalReason, approvalRequester string
 		approvalsMu.Lock()
 		for i, a := range approvalsStore {
 			if a["id"] == id {
 				approvalsStore[i]["status"] = status
 				approvalsStore[i]["decided_at"] = time.Now().UTC().Format(time.RFC3339)
+				// guardrail 관련 approval이면 training log에 피드백
+				if cmd, _ := a["command"].(string); strings.Contains(cmd, "guardrail") {
+					if args, ok := a["args"].([]any); ok {
+						for _, arg := range args {
+							s := fmt.Sprint(arg)
+							if strings.HasPrefix(s, "text=") {
+								approvalText = strings.TrimPrefix(s, "text=")
+							} else if strings.HasPrefix(s, "mode=") {
+								approvalMode = strings.TrimPrefix(s, "mode=")
+							} else if strings.HasPrefix(s, "reason=") {
+								approvalReason = strings.TrimPrefix(s, "reason=")
+							}
+						}
+					}
+					approvalRequester, _ = a["requester"].(string)
+				}
 				break
 			}
 		}
 		delete(pendingCredentialApprovals, id)
 		approvalsMu.Unlock()
+
+		// 인간 결정 → wiki training log에 피드백 (Tier 2 학습)
+		if approvalText != "" && orgID != "" {
+			decision := "reject"
+			if status == "approved" {
+				decision = "approve"
+			}
+			go s.orgServer.AppendTrainingLog(orgID, map[string]any{
+				"text":           approvalText,
+				"mode":           approvalMode,
+				"flagged_reason": approvalReason,
+				"decision":       decision,
+				"reasoning":      "human decision by owner",
+				"confidence":     1.0,
+				"source":         "human",
+				"decided_by":     approvalRequester,
+			})
+		}
+
 		// Persist declined fingerprints outside the lock.
 		for _, fp := range declinedFPs {
 			s.declinedFPs.AddFingerprint(fp)
@@ -2039,6 +2641,24 @@ func (s *Server) StartAdmin() {
 			http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 			return
 		}
+
+		// computer-use type/key 액션은 S1으로 정보가 흐르므로 input-gate 검사 필수
+		action, _ := params["action"].(string)
+		if action == "type" {
+			text, _ := params["text"].(string)
+			if text != "" {
+				gateResp := evaluateInputGate(r.Context(), s.dlpEng, s.guardrail, defaultOrgID, InputGateRequest{
+					Mode: "text", Text: text, SrcLevel: 3, DestLevel: 1,
+					Flow: "computer-use-type-to-remote-workstation",
+				}, nil)
+				if !gateResp.Allowed {
+					w.Header().Set("Content-Type", "application/json")
+					json.NewEncoder(w).Encode(map[string]any{"error": "input-gate blocked", "action": gateResp.Action, "reason": gateResp.Reason})
+					return
+				}
+			}
+		}
+
 		idBytes := make([]byte, 8)
 		crand.Read(idBytes)
 		id := hex.EncodeToString(idBytes)
@@ -2121,6 +2741,10 @@ func (s *Server) StartAdmin() {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		// 클릭/액션 결과 디버그 로그 (스크린샷 제외)
+		if !strings.Contains(string(result), `"media_type"`) {
+			log.Printf("[cu-result] id=%s body=%s", id, string(result))
+		}
 		cuQueueMu.Lock()
 		for i, cmd := range cuInFlight {
 			if cmd.id == id {
@@ -2155,6 +2779,16 @@ func (s *Server) StartAdmin() {
 			return
 		}
 		msg := strings.TrimSpace(req.Message)
+		// 채팅 메시지도 S1으로 가므로 input-gate 검사
+		gateResp := evaluateInputGate(r.Context(), s.dlpEng, s.guardrail, defaultOrgID, InputGateRequest{
+			Mode: "text", Text: msg, SrcLevel: 3, DestLevel: 1,
+			Flow: "openclaw-chat-to-agent",
+		}, nil)
+		if !gateResp.Allowed {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "input-gate: " + gateResp.Reason, "action": gateResp.Action})
+			return
+		}
 		idKey := hex.EncodeToString(func() []byte { b := make([]byte, 8); crand.Read(b); return b }())
 		runID, sendErr := openClawChatSend(msg, idKey)
 		w.Header().Set("Content-Type", "application/json")
@@ -2165,6 +2799,90 @@ func (s *Server) StartAdmin() {
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{"ok": true, "runId": runID})
+	})
+
+	// POST /api/chat/inject — role("user"|"assistant") 말풍선을 OpenClaw에 주입 (AI 트리거 없음)
+	mux.HandleFunc("/api/chat/inject", func(w http.ResponseWriter, r *http.Request) {
+		if cors(w, r) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		var req struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Content) == "" {
+			http.Error(w, `{"error":"content required"}`, http.StatusBadRequest)
+			return
+		}
+		role := req.Role
+		if role != "user" && role != "assistant" {
+			role = "assistant"
+		}
+		injectOpenClawMessageWithRole(strings.TrimSpace(req.Content), role)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	})
+
+	// POST /api/operator/action — unified operator path for chat / gcp_send / gcp_exec
+	mux.HandleFunc("/api/operator/action", func(w http.ResponseWriter, r *http.Request) {
+		if cors(w, r) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		sess, err := auth.SessionFromRequest(r, s.authProv)
+		if err != nil {
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]any{"authenticated": false})
+			return
+		}
+		var req struct {
+			Mode   string `json:"mode"`
+			Prompt string `json:"prompt"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, `{"error":"invalid payload"}`, http.StatusBadRequest)
+			return
+		}
+		mode := strings.TrimSpace(req.Mode)
+		prompt := strings.TrimSpace(req.Prompt)
+		if prompt == "" {
+			http.Error(w, `{"error":"prompt required"}`, http.StatusBadRequest)
+			return
+		}
+		if mode == "" {
+			mode = "chat"
+		}
+		w.Header().Set("Content-Type", "application/json")
+
+		// gcp_send / gcp_exec: chat.send로 유저버블 표시 후 실행
+		if mode == "gcp_send" || mode == "gcp_exec" {
+			prefix := map[string]string{"gcp_send": "[gcp_send]", "gcp_exec": "[gcp_exec]"}[mode]
+			taggedMsg := prefix + " " + prompt
+			idKey := hex.EncodeToString(func() []byte { b := make([]byte, 8); crand.Read(b); return b }())
+			runID, err := openClawChatSend(taggedMsg, idKey)
+			if err != nil {
+				w.WriteHeader(http.StatusBadGateway)
+				_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "mode": mode, "runId": runID})
+			return
+		}
+
+		result, err := dispatchOperatorAction(r.Context(), sess.Email, sess.OrgID, mode, prompt, nil)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "mode": mode, "result": result})
 	})
 
 	// POST /api/computer-use/agent — LLM이 직접 computer-use 명령 생성 및 실행
@@ -2186,9 +2904,6 @@ func (s *Server) StartAdmin() {
 		}
 		orgID := resolveOrg(r)
 		log.Printf("[computer-use/agent] received prompt=%q org=%s", agentReq.Prompt, orgID)
-
-		// 사용자 입력을 BoanClaw 채팅에 먼저 표시 (chat.inject, AI 트리거 없음)
-		go injectOpenClawMessage("🖥️ " + agentReq.Prompt)
 
 		// 스트리밍 NDJSON — nginx buffering 비활성화
 		w.Header().Set("Content-Type", "application/x-ndjson")
@@ -2238,26 +2953,40 @@ func (s *Server) StartAdmin() {
 
 		const maxSteps = 10
 		executed := 0
+		lastScreenshotB64 := ""
 
-		visionPromptTemplate := "This image shows the current display of the computer.\n" +
+		// ── 히스토리: 이전 스텝의 행동/결과를 누적하여 LLM에 전달 (Claude Computer Use 패턴)
+		// 매 스텝마다 vision/action 이 이전 시도를 참조할 수 있도록 함
+		type stepRecord struct {
+			Step    int    `json:"step"`
+			Thought string `json:"thought"`
+			Actions string `json:"actions"`
+			Result  string `json:"result"`
+		}
+		var stepHistory []stepRecord
+
+		// visionPromptTemplate: %s=objective, %d=width, %d=height, %s=history
+		visionPromptTemplate := "This image IS the screenshot of the current display (resolution: %dx%d pixels).\n" +
 			"The objective is: %s\n" +
-			"On the screen, I see: [describe what is visible]\n" +
-			"This means the objective is: [complete|not complete]\n\n" +
-			"(Only continue if the objective is not complete.)\n" +
-			"The next step is to [click|type|press key] [describe the exact next single action] " +
-			"in order to [describe the expected result]."
+			"%s" +
+			"Describe what is visible. For each UI element, estimate its center (x, y) in %dx%d pixels.\n" +
+			"If the objective is to capture/show a screenshot, it is ALREADY COMPLETE.\n" +
+			"End with exactly one line: OBJECTIVE: COMPLETE or OBJECTIVE: INCOMPLETE\n" +
+			"If INCOMPLETE, describe the single next action and target coordinates."
 
-		actionSystemPrompt := "You control a GCP Windows workstation via computer-use.\n" +
-			"You will be given a description of the current screen and the next step to take.\n" +
-			"Respond with ONLY a JSON array of actions — no explanation, no markdown fences.\n" +
-			"To indicate the task is complete, respond with: [{\"action\":\"stop\"}]\n" +
+		// actionSystemPromptFmt: %d=width, %d=height
+		actionSystemPromptFmt := "You control a remote Windows workstation. Screen: %dx%d pixels.\n" +
+			"Respond with ONLY a JSON array of actions. No explanation, no markdown.\n" +
 			"Available actions:\n" +
-			`{"action":"type","text":"..."}` + " – type text\n" +
-			`{"action":"key","name":"..."}` + " – press key: Return, Tab, Escape, BackSpace, ctrl+s, ctrl+a, ctrl+c, ctrl+v, ctrl+z, alt+F4\n" +
-			`{"action":"click","x":N,"y":N}` + " – left click at screen coords\n" +
-			`{"action":"double_click","x":N,"y":N}` + " – double click\n" +
-			`{"action":"stop"}` + " – task complete\n\n" +
-			`Example: [{"action":"key","name":"ctrl+s"},{"action":"stop"}]`
+			`{"action":"screenshot"}` + "\n" +
+			`{"action":"type","text":"..."}` + "\n" +
+			`{"action":"key","name":"..."}` + " – Return, Tab, Escape, BackSpace, ctrl+s, ctrl+c, ctrl+v, ctrl+z\n" +
+			`{"action":"click","x":N,"y":N}` + "\n" +
+			`{"action":"double_click","x":N,"y":N}` + "\n" +
+			`{"action":"right_click","x":N,"y":N}` + "\n" +
+			`{"action":"scroll","x":N,"y":N,"direction":"down","amount":3}` + "\n" +
+			`{"action":"stop"}` + " – task complete\n" +
+			`Example: [{"action":"click","x":100,"y":200}]`
 
 		for step := 0; step < maxSteps; step++ {
 			// Step A: 스크린샷 캡처
@@ -2284,32 +3013,63 @@ func (s *Server) StartAdmin() {
 			}
 			log.Printf("[computer-use/agent] step=%d screenshot ok, len=%d", step, len(screenshotB64))
 			sendEvent(map[string]any{"type": "screenshot", "data": screenshotB64, "label": fmt.Sprintf("스텝 %d 화면", step+1)})
+			lastScreenshotB64 = screenshotB64
+
+			// 스크린샷 해상도 추출 (좌표 정확도 향상)
+			scrW, scrH := getImageDimensions(screenshotB64)
+			log.Printf("[computer-use/agent] step=%d screen resolution=%dx%d", step, scrW, scrH)
+
+			// ── 히스토리 텍스트 구성: 이전 스텝 요약을 vision 프롬프트에 삽입
+			historyText := ""
+			if len(stepHistory) > 0 {
+				historyText = "\n--- PREVIOUS ACTIONS (do NOT repeat failed actions) ---\n"
+				for _, rec := range stepHistory {
+					historyText += fmt.Sprintf("Step %d: thought=%q → actions=%s → result=%s\n",
+						rec.Step, rec.Thought, rec.Actions, rec.Result)
+				}
+				historyText += "--- END PREVIOUS ACTIONS ---\n\n"
+			}
 
 			// Step B: vision LMM 호출 (sandbox_agent.append_screenshot 에 해당)
 			sendEvent(map[string]any{"type": "status", "text": "Vision LMM이 화면을 분석 중..."})
-			visionPrompt := fmt.Sprintf(visionPromptTemplate, agentReq.Prompt)
+			visionPrompt := fmt.Sprintf(visionPromptTemplate, scrW, scrH, agentReq.Prompt, historyText, scrW, scrH)
 			thought, vErr := s.forwardVisionLLM(r.Context(), visionEntry, screenshotB64, visionPrompt)
 			if vErr != nil {
 				log.Printf("[computer-use/agent] vision llm error: %v", vErr)
 				sendEvent(map[string]any{"type": "error", "text": "Vision LMM 오류: " + vErr.Error()})
 				break
 			}
-			log.Printf("[computer-use/agent] step=%d thought len=%d", step, len(thought))
+			log.Printf("[computer-use/agent] step=%d thought len=%d thought=%q", step, len(thought), thought)
 			sendEvent(map[string]any{"type": "thinking", "text": thought})
 
-			// 완료 판단: vision 모델이 "complete" 라고 하면 stop
-			if strings.Contains(strings.ToLower(thought), "objective is: complete") {
+			// 완료 판단: vision 모델이 "OBJECTIVE: COMPLETE" 라고 하면 stop
+			lowerThought := strings.ToLower(thought)
+			isComplete := strings.Contains(lowerThought, "objective: complete") &&
+				!strings.Contains(lowerThought, "objective: incomplete") &&
+				!strings.Contains(lowerThought, "not complete")
+			if isComplete {
 				log.Printf("[computer-use/agent] vision says complete at step %d", step)
-				// thought 내용을 BoanClaw에 주입
-				go injectOpenClawChat(agentReq.Prompt, 0, thought)
-				sendEvent(map[string]any{"type": "done", "actions_executed": 0})
+				compressedB64 := compressScreenshotForChat(screenshotB64)
+				completedMsg := fmt.Sprintf("[gcp_exec] %s : 완료\n\n![](data:image/jpeg;base64,%s)", agentReq.Prompt, compressedB64)
+				go injectOpenClawMessage(completedMsg)
+				sendEvent(map[string]any{"type": "done", "actions_executed": executed})
 				return
 			}
 
 			// Step C: action LMM 호출 (sandbox_agent.action_model.call 에 해당)
+			// system/user 메시지를 분리하여 직접 전송 (forwardSelectedLLM의 고정 system 메시지 회피)
 			sendEvent(map[string]any{"type": "status", "text": "Action LLM이 액션을 결정 중..."})
-			actionPrompt := actionSystemPrompt + "\n\nVision analysis:\n" + thought
-			actionResp, aErr := s.forwardSelectedLLM(r.Context(), orgID, actionPrompt, map[string]any{"max_tokens": 512})
+			actionSystemPrompt := fmt.Sprintf(actionSystemPromptFmt, scrW, scrH)
+			actionUserPrompt := ""
+			if len(stepHistory) > 0 {
+				actionUserPrompt += "Previous steps:\n"
+				for _, rec := range stepHistory {
+					actionUserPrompt += fmt.Sprintf("- Step %d: %s → %s\n", rec.Step, rec.Actions, rec.Result)
+				}
+				actionUserPrompt += "\n"
+			}
+			actionUserPrompt += "Vision analysis:\n" + thought
+			actionResp, aErr := s.forwardActionLLM(r.Context(), orgID, actionSystemPrompt, actionUserPrompt)
 			if aErr != nil {
 				log.Printf("[computer-use/agent] action llm error: %v", aErr)
 				sendEvent(map[string]any{"type": "error", "text": "Action LLM 오류: " + aErr.Error()})
@@ -2324,23 +3084,46 @@ func (s *Server) StartAdmin() {
 					actionText = choices[0].Message.Content
 				}
 			}
+			if actionText == "" {
+				rawResp, _ := json.Marshal(actionResp)
+				log.Printf("[computer-use/agent] step=%d action text EMPTY, raw response keys=%v full=%s", step, func() []string {
+					keys := make([]string, 0)
+					for k := range actionResp { keys = append(keys, k) }
+					return keys
+				}(), string(rawResp))
+				sendEvent(map[string]any{"type": "error", "text": "Action LLM 빈 응답"})
+				break
+			}
 			log.Printf("[computer-use/agent] step=%d action text=%s", step, actionText)
 
-			// JSON 배열 파싱
+			// JSON 배열 파싱 (LLM이 잘못된 JSON을 줄 수 있으므로 정규화 시도)
 			start := strings.Index(actionText, "[")
 			end := strings.LastIndex(actionText, "]")
 			if start < 0 || end <= start {
-				log.Printf("[computer-use/agent] no action array in response, stopping")
-				break
+				log.Printf("[computer-use/agent] no action array in response, continuing")
+				continue
 			}
+			jsonSlice := actionText[start : end+1]
 			var actions []map[string]any
-			if err := json.Unmarshal([]byte(actionText[start:end+1]), &actions); err != nil {
-				sendEvent(map[string]any{"type": "error", "text": "액션 파싱 실패: " + actionText})
-				break
+			if err := json.Unmarshal([]byte(jsonSlice), &actions); err != nil {
+				// LLM이 숫자에 따옴표를 넣는 등의 오류 복구 시도: "285" → 285
+				cleaned := strings.NewReplacer(`"action"`, `"action"`).Replace(jsonSlice)
+				// 숫자값에 잘못 붙은 따옴표 제거: "x":"123" → "x":123
+				numFixRe := regexp.MustCompile(`"(x|y|amount)"\s*:\s*"(\d+)"`)
+				cleaned = numFixRe.ReplaceAllString(cleaned, `"$1":$2`)
+				if err2 := json.Unmarshal([]byte(cleaned), &actions); err2 != nil {
+					log.Printf("[computer-use/agent] action parse failed (original=%s, cleaned=%s): %v", jsonSlice, cleaned, err2)
+					sendEvent(map[string]any{"type": "error", "text": "액션 파싱 실패: " + actionText})
+					// 파싱 실패해도 다음 스텝으로 계속 진행 (break 대신 continue)
+					continue
+				}
+				log.Printf("[computer-use/agent] step=%d action JSON fixed: %s → %s", step, jsonSlice, cleaned)
 			}
 
 			// Step D: 액션 실행
 			stopped := false
+			var stepActionDescs []string
+			var stepResults []string
 			for i, action := range actions {
 				if action["action"] == "stop" {
 					stopped = true
@@ -2349,29 +3132,56 @@ func (s *Server) StartAdmin() {
 				actionJSON, _ := json.Marshal(action)
 				log.Printf("[computer-use/agent] step=%d action[%d]: %s", step, i, actionJSON)
 				sendEvent(map[string]any{"type": "action", "index": executed, "action": action})
+				stepActionDescs = append(stepActionDescs, string(actionJSON))
 
 				result, err := queueAndWait(action)
 				if err != nil {
 					log.Printf("[computer-use/agent] action error: %v", err)
 					sendEvent(map[string]any{"type": "action_result", "index": executed, "error": err.Error()})
+					stepResults = append(stepResults, "error:"+err.Error())
 					if err.Error() == "cancelled" {
 						return
 					}
 					stopped = true
 					break
 				}
+				resultJSON, _ := json.Marshal(result)
+				stepResults = append(stepResults, string(resultJSON))
 				sendEvent(map[string]any{"type": "action_result", "index": executed, "result": result})
 				executed++
+				// 액션 실행 즉시 봇 채팅에 주입
+				actionDesc := formatActionDesc(action)
+				go injectOpenClawMessage(fmt.Sprintf("[gcp_exec] %s : [%d] %s", agentReq.Prompt, executed, actionDesc))
 			}
+
+			// ── 액션 실행 후 원격 데스크탑 반응 대기 (플립북 패턴: 결과 검증 전 대기)
+			// Guacamole → RDP 전달 + 화면 렌더링에 시간이 필요
+			if executed > 0 && !stopped {
+				time.Sleep(800 * time.Millisecond)
+			}
+
+			// ── 히스토리 기록: 이번 스텝의 thought + actions + result 를 누적
+			// thought 는 너무 길 수 있으므로 200자로 자름
+			shortThought := thought
+			if len(shortThought) > 200 {
+				shortThought = shortThought[:200] + "..."
+			}
+			stepHistory = append(stepHistory, stepRecord{
+				Step:    step + 1,
+				Thought: shortThought,
+				Actions: strings.Join(stepActionDescs, ","),
+				Result:  strings.Join(stepResults, ","),
+			})
+
 			if stopped {
 				break
 			}
 		}
 
-		// Step E: OpenClaw 채팅에 실행 결과 주입
-		resultMsg := fmt.Sprintf("[BoanClaw 실행 완료] %s → %d개 액션 완료", agentReq.Prompt, executed)
-		go injectOpenClawChat(agentReq.Prompt, executed, resultMsg)
-
+		// 액션 없이 종료된 경우 — 에러가 아닌 경우에만 스크린샷 주입
+		if executed == 0 && lastScreenshotB64 != "" {
+			go injectOpenClawMessage(fmt.Sprintf("[gcp_exec] %s : 실행 실패 (액션 없음)", agentReq.Prompt))
+		}
 		sendEvent(map[string]any{"type": "done", "actions_executed": executed})
 	})
 
@@ -2385,14 +3195,98 @@ func (s *Server) StartAdmin() {
 	}()
 }
 
-// injectOpenClawMessage — OpenClaw 채팅에 메시지를 chat.inject로 주입 (AI 트리거 없음)
-// gorilla/websocket으로 직접 OpenClaw WebSocket에 연결
+// getImageDimensions — base64 인코딩된 이미지의 너비/높이 반환 (실패 시 0, 0)
+func getImageDimensions(b64 string) (int, int) {
+	raw, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return 0, 0
+	}
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(raw))
+	if err != nil {
+		return 0, 0
+	}
+	return cfg.Width, cfg.Height
+}
+
+// compressScreenshotForChat — PNG base64를 JPEG 소형으로 압축 (OpenClaw MARKDOWN_PARSE_LIMIT 40000자 이내)
+// 최대 너비 400px로 축소 후 JPEG quality 40으로 재인코딩 → ~20-30KB base64
+func compressScreenshotForChat(b64 string) string {
+	raw, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return b64
+	}
+	src, _, err := image.Decode(bytes.NewReader(raw))
+	if err != nil {
+		return b64
+	}
+
+	// 최대 너비 400px 비율 축소
+	bounds := src.Bounds()
+	srcW, srcH := bounds.Dx(), bounds.Dy()
+	maxW := 400
+	dstW, dstH := srcW, srcH
+	if srcW > maxW {
+		dstW = maxW
+		dstH = srcH * maxW / srcW
+	}
+
+	// nearest-neighbor 리사이즈
+	dst := image.NewRGBA(image.Rect(0, 0, dstW, dstH))
+	for y := 0; y < dstH; y++ {
+		for x := 0; x < dstW; x++ {
+			srcX := x * srcW / dstW
+			srcY := y * srcH / dstH
+			dst.Set(x, y, src.At(srcX, srcY))
+		}
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: 40}); err != nil {
+		return b64
+	}
+	return base64.StdEncoding.EncodeToString(buf.Bytes())
+}
+
+// formatActionDesc — computer-use 액션을 사람이 읽기 쉬운 문자열로 변환
+func formatActionDesc(action map[string]any) string {
+	actionType, _ := action["action"].(string)
+	switch actionType {
+	case "key":
+		name, _ := action["name"].(string)
+		return "key: " + name
+	case "type":
+		text, _ := action["text"].(string)
+		if len([]rune(text)) > 30 {
+			text = string([]rune(text)[:30]) + "…"
+		}
+		return "type: " + text
+	case "click":
+		x, _ := action["x"].(float64)
+		y, _ := action["y"].(float64)
+		return fmt.Sprintf("click (%d, %d)", int(x), int(y))
+	case "double_click":
+		x, _ := action["x"].(float64)
+		y, _ := action["y"].(float64)
+		return fmt.Sprintf("double_click (%d, %d)", int(x), int(y))
+	case "screenshot":
+		return "screenshot"
+	default:
+		b, _ := json.Marshal(action)
+		return string(b)
+	}
+}
+
+// injectOpenClawMessage — OpenClaw 채팅에 assistant 메시지를 chat.inject로 주입 (AI 트리거 없음)
 func injectOpenClawMessage(msg string) {
+	injectOpenClawMessageWithRole(msg, "assistant")
+}
+
+// injectOpenClawMessageWithRole — role("user"|"assistant")을 지정해 OpenClaw 채팅에 주입
+func injectOpenClawMessageWithRole(msg, role string) {
 	const openClawURL = "ws://boan-sandbox:18789/vcontrol-ui?token=boan-openclaw-local"
 	idKey := hex.EncodeToString(func() []byte { b := make([]byte, 8); crand.Read(b); return b }())
 
 	dialer := websocket.Dialer{HandshakeTimeout: 5 * time.Second}
-	header := http.Header{"Origin": {"http://boan-sandbox:18789"}}
+	header := http.Header{"Origin": {"http://localhost:19080"}}
 	conn, _, err := dialer.Dial(openClawURL, header)
 	if err != nil {
 		log.Printf("[openclaw-inject] dial failed: %v", err)
@@ -2443,15 +3337,31 @@ func injectOpenClawMessage(msg string) {
 				return
 			}
 		case m.Type == "res" && m.Ok && reqID == 2:
-			// connect ok → chat.inject
-			if err := sendReq("chat.inject", map[string]any{
-				"sessionKey": "agent:main:main",
-				"message":    msg,
+			// connect ok → sessions.patch (세션 없으면 생성, 있으면 no-op)
+			if err := sendReq("sessions.patch", map[string]any{
+				"key": "agent:main:main",
 			}); err != nil {
-				log.Printf("[openclaw-inject] inject send error: %v", err)
+				log.Printf("[openclaw-inject] sessions.patch send error: %v", err)
 				return
 			}
 		case m.Type == "res" && reqID == 3:
+			if !m.Ok {
+				log.Printf("[openclaw-inject] sessions.patch failed: %v", m.Error)
+				return
+			}
+			// patch ok → chat.inject
+			injectParams := map[string]any{
+				"sessionKey": "agent:main:main",
+				"message":    msg,
+			}
+			if role != "" && role != "assistant" {
+				injectParams["role"] = role
+			}
+			if err := sendReq("chat.inject", injectParams); err != nil {
+				log.Printf("[openclaw-inject] inject send error: %v", err)
+				return
+			}
+		case m.Type == "res" && reqID == 4:
 			if !m.Ok {
 				log.Printf("[openclaw-inject] chat.inject failed: %v", m.Error)
 			} else {
@@ -2466,11 +3376,11 @@ func injectOpenClawMessage(msg string) {
 func injectOpenClawChat(prompt string, actionsExecuted int, resultMsg string) {
 	var msg string
 	if resultMsg != "" {
-		msg = resultMsg
+		msg = fmt.Sprintf("[gcp_exec] %s : %s", prompt, resultMsg)
 	} else if actionsExecuted > 0 {
-		msg = fmt.Sprintf("✅ 실행 완료: %s (%d개 액션)", prompt, actionsExecuted)
+		msg = fmt.Sprintf("[gcp_exec] %s : 실행 완료 — %d개 액션", prompt, actionsExecuted)
 	} else {
-		msg = fmt.Sprintf("✅ 실행 완료: %s (액션 없음)", prompt)
+		msg = fmt.Sprintf("[gcp_exec] %s : 실행 완료 (액션 없음)", prompt)
 	}
 	injectOpenClawMessage(msg)
 }
@@ -2479,7 +3389,7 @@ func injectOpenClawChat(prompt string, actionsExecuted int, resultMsg string) {
 func openClawChatSend(msg, idempotencyKey string) (string, error) {
 	const openClawURL = "ws://boan-sandbox:18789/vcontrol-ui?token=boan-openclaw-local"
 	dialer := websocket.Dialer{HandshakeTimeout: 5 * time.Second}
-	header := http.Header{"Origin": {"http://boan-sandbox:18789"}}
+	header := http.Header{"Origin": {"http://localhost:19080"}}
 	conn, _, err := dialer.Dial(openClawURL, header)
 	if err != nil {
 		return "", fmt.Errorf("dial: %w", err)

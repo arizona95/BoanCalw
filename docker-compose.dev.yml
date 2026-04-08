@@ -215,7 +215,6 @@ services:
       - BOAN_GUACAMOLE_USERNAME=guacadmin
       - BOAN_GUACAMOLE_PASSWORD=guacadmin
       - BOAN_GUACAMOLE_BASE_PATH=/remote
-      - BOAN_COMPUTER_USE_URL=http://boan-computer-use:8090
       - BOAN_KMS_KEY=/etc/boan-cred/aes.key
       - BOAN_DATA_DIR=/data/registry
       - BOAN_CA_CERT=/tmp/boan/ca.crt

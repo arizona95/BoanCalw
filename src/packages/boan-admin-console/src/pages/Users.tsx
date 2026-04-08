@@ -5,12 +5,19 @@ interface UserRow {
   role: string;
   org_id: string;
   status: string;
+  access_level: string;
   created_at: string;
 }
 
 const ROLE_BADGE: Record<string, string> = {
   owner: "bg-blue-100 text-blue-700",
   user: "bg-gray-100 text-gray-600",
+};
+
+const ACCESS_LEVEL_STYLE: Record<string, { label: string; bg: string }> = {
+  allow: { label: "Allow", bg: "bg-green-100 text-green-700 border-green-300" },
+  ask:   { label: "Ask",   bg: "bg-yellow-100 text-yellow-700 border-yellow-300" },
+  deny:  { label: "Deny",  bg: "bg-red-100 text-red-700 border-red-300" },
 };
 
 export default function Users() {
@@ -80,6 +87,7 @@ export default function Users() {
               <tr>
                 <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500">이메일</th>
                 <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500">역할</th>
+                <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500">권한</th>
                 <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500">조직</th>
                 <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500">상태</th>
                 <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500">가입일</th>
@@ -94,6 +102,21 @@ export default function Users() {
                     <span className={`text-xs font-medium px-2 py-1 rounded-full ${ROLE_BADGE[u.role] ?? "bg-gray-100 text-gray-600"}`}>
                       {u.role === "owner" ? "소유자" : "사용자"}
                     </span>
+                  </td>
+                  <td className="px-4 py-3">
+                    {u.role === "owner" ? (
+                      <span className="text-xs text-gray-300">-</span>
+                    ) : (
+                      <select
+                        value={u.access_level || "ask"}
+                        onChange={(e) => patch(u.email, { access_level: e.target.value })}
+                        className={`text-xs font-medium px-2 py-1 rounded border cursor-pointer ${ACCESS_LEVEL_STYLE[u.access_level || "ask"]?.bg ?? "bg-gray-100"}`}
+                      >
+                        <option value="allow">Allow</option>
+                        <option value="ask">Ask</option>
+                        <option value="deny">Deny</option>
+                      </select>
+                    )}
                   </td>
                   <td className="px-4 py-3 text-xs text-gray-500 font-mono">{u.org_id || "-"}</td>
                   <td className="px-4 py-3">
@@ -130,9 +153,16 @@ export default function Users() {
         </div>
       )}
 
-      <p className="mt-4 text-xs text-gray-400">
-        * 고정 소유자 메일만 소유자로 로그인할 수 있습니다. 다른 사용자는 승인 후 조직에 편입됩니다.
-      </p>
+      <div className="mt-4 space-y-1">
+        <p className="text-xs text-gray-400">
+          * 소유자는 모든 권한을 가지며 권한 설정 대상이 아닙니다.
+        </p>
+        <p className="text-xs text-gray-400">
+          * <b>Allow</b>: 정보의 낮은 흐름 허용 (모니터링만) &nbsp;|&nbsp;
+          <b>Ask</b>: 가드레일 적용 (사전차단 + 모니터링) &nbsp;|&nbsp;
+          <b>Deny</b>: 낮은 흐름 차단 (같은/높은 레벨만)
+        </p>
+      </div>
     </div>
   );
 }

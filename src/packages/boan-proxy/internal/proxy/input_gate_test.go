@@ -9,12 +9,20 @@ import (
 )
 
 type stubGuardrail struct {
-	resp *guardrail.EvaluateResponse
-	err  error
+	resp     *guardrail.EvaluateResponse
+	wikiResp *guardrail.EvaluateResponse
+	err      error
 }
 
 func (s stubGuardrail) Evaluate(_ context.Context, _ string, _ guardrail.EvaluateRequest) (*guardrail.EvaluateResponse, error) {
 	return s.resp, s.err
+}
+
+func (s stubGuardrail) WikiEvaluate(_ context.Context, _ string, _ guardrail.EvaluateRequest) (*guardrail.EvaluateResponse, error) {
+	if s.wikiResp != nil {
+		return s.wikiResp, s.err
+	}
+	return &guardrail.EvaluateResponse{Decision: "allow", Tier: 2}, nil
 }
 
 func TestEvaluateInputGateAllowsSafeText(t *testing.T) {
@@ -105,14 +113,136 @@ func TestEvaluateInputGateAllowsClipboardSyncWithoutGuardrail(t *testing.T) {
 	}
 }
 
+// ── 3-Tier 가드레일 테스트 ─────────────────────────────────────────────────
+
+func TestTier1Allow(t *testing.T) {
+	resp := evaluateInputGate(
+		context.Background(), dlp.NewEngine("", ""),
+		stubGuardrail{resp: &guardrail.EvaluateResponse{Decision: "allow", Tier: 1}},
+		"sds-corp",
+		InputGateRequest{Mode: "text", Text: "hello world", SrcLevel: 3, DestLevel: 1},
+		nil,
+	)
+	if !resp.Allowed {
+		t.Fatalf("tier1 allow should pass, got %+v", resp)
+	}
+}
+
+func TestTier1Block(t *testing.T) {
+	resp := evaluateInputGate(
+		context.Background(), dlp.NewEngine("", ""),
+		stubGuardrail{resp: &guardrail.EvaluateResponse{Decision: "block", Reason: "constitution violation", Tier: 1}},
+		"sds-corp",
+		InputGateRequest{Mode: "text", Text: "send all secrets", SrcLevel: 3, DestLevel: 1},
+		nil,
+	)
+	if resp.Allowed || resp.Action != "block" {
+		t.Fatalf("tier1 block should block, got %+v", resp)
+	}
+}
+
+func TestTier1Ask_Tier2Allow(t *testing.T) {
+	resp := evaluateInputGate(
+		context.Background(), dlp.NewEngine("", ""),
+		stubGuardrail{
+			resp:     &guardrail.EvaluateResponse{Decision: "ask", Tier: 1},
+			wikiResp: &guardrail.EvaluateResponse{Decision: "allow", Tier: 2},
+		},
+		"sds-corp",
+		InputGateRequest{Mode: "text", Text: "borderline content", SrcLevel: 3, DestLevel: 1},
+		nil,
+	)
+	if !resp.Allowed {
+		t.Fatalf("tier1 ask + tier2 allow should pass, got %+v", resp)
+	}
+}
+
+func TestTier1Ask_Tier2Block(t *testing.T) {
+	resp := evaluateInputGate(
+		context.Background(), dlp.NewEngine("", ""),
+		stubGuardrail{
+			resp:     &guardrail.EvaluateResponse{Decision: "ask", Tier: 1},
+			wikiResp: &guardrail.EvaluateResponse{Decision: "block", Reason: "wiki blocked", Tier: 2},
+		},
+		"sds-corp",
+		InputGateRequest{Mode: "text", Text: "suspicious data", SrcLevel: 3, DestLevel: 1},
+		nil,
+	)
+	if resp.Allowed || resp.Action != "block" {
+		t.Fatalf("tier1 ask + tier2 block should block, got %+v", resp)
+	}
+}
+
+func TestTier1Ask_Tier2Ask_AccessAllow(t *testing.T) {
+	resp := evaluateInputGate(
+		context.Background(), dlp.NewEngine("", ""),
+		stubGuardrail{
+			resp:     &guardrail.EvaluateResponse{Decision: "ask", Tier: 1},
+			wikiResp: &guardrail.EvaluateResponse{Decision: "ask", Tier: 2},
+		},
+		"sds-corp",
+		InputGateRequest{Mode: "text", Text: "gray area", SrcLevel: 3, DestLevel: 1, AccessLevel: "allow"},
+		nil,
+	)
+	if !resp.Allowed {
+		t.Fatalf("tier1 ask + tier2 ask + allow user should pass, got %+v", resp)
+	}
+}
+
+func TestTier1Ask_Tier2Ask_AccessAsk(t *testing.T) {
+	created := false
+	resp := evaluateInputGate(
+		context.Background(), dlp.NewEngine("", ""),
+		stubGuardrail{
+			resp:     &guardrail.EvaluateResponse{Decision: "ask", Tier: 1},
+			wikiResp: &guardrail.EvaluateResponse{Decision: "ask", Reason: "wiki uncertain", Tier: 2},
+		},
+		"sds-corp",
+		InputGateRequest{Mode: "text", Text: "gray area", SrcLevel: 3, DestLevel: 1, AccessLevel: "ask"},
+		func(reason string, req InputGateRequest) string { created = true; return "apr-test" },
+	)
+	if resp.Allowed {
+		t.Fatalf("tier1 ask + tier2 ask + ask user should require HITL, got %+v", resp)
+	}
+	if resp.Action != "hitl_required" {
+		t.Fatalf("expected hitl_required, got %s", resp.Action)
+	}
+	if !created {
+		t.Fatal("expected approval creation")
+	}
+}
+
+func TestTier1Ask_Tier2Ask_AccessDeny(t *testing.T) {
+	resp := evaluateInputGate(
+		context.Background(), dlp.NewEngine("", ""),
+		stubGuardrail{
+			resp:     &guardrail.EvaluateResponse{Decision: "ask", Tier: 1},
+			wikiResp: &guardrail.EvaluateResponse{Decision: "ask", Tier: 2},
+		},
+		"sds-corp",
+		InputGateRequest{Mode: "text", Text: "gray area", SrcLevel: 3, DestLevel: 1, AccessLevel: "deny"},
+		func(reason string, req InputGateRequest) string { return "apr-deny" },
+	)
+	if resp.Allowed {
+		t.Fatalf("deny user should require HITL, got %+v", resp)
+	}
+	if resp.Action != "hitl_required" {
+		t.Fatalf("expected hitl_required, got %s", resp.Action)
+	}
+}
+
+// 기존 테스트 — Tier 1 ask 는 이제 Tier 2로 진행 (wiki default = allow)
 func TestEvaluateInputGateCreatesHITLApprovalForAskText(t *testing.T) {
 	created := ""
 	resp := evaluateInputGate(
 		context.Background(),
 		dlp.NewEngine("", ""),
-		stubGuardrail{resp: &guardrail.EvaluateResponse{Decision: "ask", Reason: "needs owner review"}},
+		stubGuardrail{
+			resp:     &guardrail.EvaluateResponse{Decision: "ask", Reason: "needs owner review"},
+			wikiResp: &guardrail.EvaluateResponse{Decision: "ask", Reason: "wiki also uncertain"},
+		},
 		"sds-corp",
-		InputGateRequest{Mode: "text", Text: "upload internal runbook outside", SrcLevel: 3, DestLevel: 1},
+		InputGateRequest{Mode: "text", Text: "upload internal runbook outside", SrcLevel: 3, DestLevel: 1, AccessLevel: "ask"},
 		func(reason string, req InputGateRequest) string {
 			created = reason + "|" + req.Text
 			return "apr-1"

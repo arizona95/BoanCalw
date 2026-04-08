@@ -11,12 +11,14 @@ import (
 )
 
 type InputGateRequest struct {
-	Mode      string `json:"mode"`
-	Text      string `json:"text"`
-	Key       string `json:"key,omitempty"`
-	SrcLevel  int    `json:"src_level,omitempty"`
-	DestLevel int    `json:"dest_level,omitempty"`
-	Flow      string `json:"flow,omitempty"`
+	Mode        string `json:"mode"`
+	Text        string `json:"text"`
+	Key         string `json:"key,omitempty"`
+	SrcLevel    int    `json:"src_level,omitempty"`
+	DestLevel   int    `json:"dest_level,omitempty"`
+	Flow        string `json:"flow,omitempty"`
+	UserEmail   string `json:"user_email,omitempty"`
+	AccessLevel string `json:"access_level,omitempty"` // allow / ask / deny
 }
 
 type InputGateResponse struct {
@@ -30,6 +32,7 @@ type InputGateResponse struct {
 
 type GuardrailEvaluator interface {
 	Evaluate(ctx context.Context, orgID string, req guardrail.EvaluateRequest) (*guardrail.EvaluateResponse, error)
+	WikiEvaluate(ctx context.Context, orgID string, req guardrail.EvaluateRequest) (*guardrail.EvaluateResponse, error)
 }
 
 var (
@@ -103,32 +106,54 @@ func evaluateInputGate(
 		}
 
 		if req.DestLevel > 0 && req.SrcLevel > 0 && req.DestLevel < req.SrcLevel && guardrailClient != nil {
-			decision, err := guardrailClient.Evaluate(ctx, orgID, guardrail.EvaluateRequest{
-				Text: text,
-				Mode: mode,
-			})
-			if err != nil {
-				return InputGateResponse{Allowed: false, Action: "block", Reason: "guardrail server evaluation failed"}
+			grReq := guardrail.EvaluateRequest{
+				Text: text, Mode: mode,
+				UserEmail: req.UserEmail, AccessLevel: req.AccessLevel,
 			}
-			switch strings.ToLower(strings.TrimSpace(decision.Decision)) {
+
+			// ── Tier 1: 헌법 가드레일 ──
+			tier1, err := guardrailClient.Evaluate(ctx, orgID, grReq)
+			if err != nil {
+				return InputGateResponse{Allowed: false, Action: "block", Reason: "tier1 guardrail failed: " + err.Error()}
+			}
+			switch strings.ToLower(strings.TrimSpace(tier1.Decision)) {
 			case "allow":
-				// Continue to DLP guard below.
-			case "ask":
-				approvalID := ""
-				if createApproval != nil {
-					approvalID = createApproval(decision.Reason, req)
-				}
-				return InputGateResponse{
-					Allowed:    false,
-					Action:     "hitl_required",
-					Reason:     firstNonEmptyString(decision.Reason, "human review required"),
-					ApprovalID: approvalID,
-				}
+				// Tier 1 통과 → DLP 검사로 진행
 			case "block":
-				return InputGateResponse{
-					Allowed: false,
-					Action:  "block",
-					Reason:  firstNonEmptyString(decision.Reason, "guardrail constitution blocked this input"),
+				return InputGateResponse{Allowed: false, Action: "block",
+					Reason: firstNonEmptyString(tier1.Reason, "guardrail constitution blocked this input")}
+			case "ask":
+				// ── Tier 2: Wiki 가드레일 ──
+				tier2, err := guardrailClient.WikiEvaluate(ctx, orgID, grReq)
+				if err != nil {
+					return InputGateResponse{Allowed: false, Action: "block", Reason: "tier2 wiki guardrail failed: " + err.Error()}
+				}
+				switch strings.ToLower(strings.TrimSpace(tier2.Decision)) {
+				case "allow":
+					// Tier 2 통과 → DLP 검사로 진행
+				case "block":
+					return InputGateResponse{Allowed: false, Action: "block",
+						Reason: firstNonEmptyString(tier2.Reason, "wiki guardrail blocked this input")}
+				case "ask":
+					// ── Tier 3 분기: 사용자 access_level에 따라 ──
+					if strings.ToLower(req.AccessLevel) == "allow" {
+						// allow 사용자 → 통과 (모니터링만)
+					} else {
+						// ask/deny 사용자 → 인간 승인 큐
+						approvalID := ""
+						if createApproval != nil {
+							approvalID = createApproval(
+								fmt.Sprintf("[Tier2 ask] %s", firstNonEmptyString(tier2.Reason, "wiki guardrail requires review")),
+								req,
+							)
+						}
+						return InputGateResponse{
+							Allowed:    false,
+							Action:     "hitl_required",
+							Reason:     firstNonEmptyString(tier2.Reason, "human review required"),
+							ApprovalID: approvalID,
+						}
+					}
 				}
 			}
 		}

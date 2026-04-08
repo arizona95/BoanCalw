@@ -4,7 +4,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 export BOAN_ORG_ID="${BOAN_ORG_ID:-dev-org}"
 
-COMPOSE_FILE="$ROOT/src/docker-compose.dev.yml"
+COMPOSE_FILE="$ROOT/docker-compose.dev.yml"
 
 if [ ! -f "$COMPOSE_FILE" ]; then
   echo "docker-compose.dev.yml not found at $COMPOSE_FILE"

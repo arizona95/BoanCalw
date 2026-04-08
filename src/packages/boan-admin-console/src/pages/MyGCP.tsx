@@ -467,13 +467,17 @@ export default function MyGCP() {
         dest_level: 1,
         flow: "local-input-buffer-to-remote-workstation",
       });
+      const botMsg = result.allowed
+        ? `[gcp_send] ${text} : 입력이 검사를 통과했고 원격 화면에 전달되었습니다.`
+        : `[gcp_send] ${text} : 가드레일에 통과되지 못하였습니다 — ${result.reason ?? "차단됨"}`;
+
+      chatApi.inject("assistant", botMsg).catch(() => {});
+
       if (!result.allowed) {
         setGateStatus(result.reason ?? "입력이 차단되었습니다.");
         return;
       }
-
-      const payload = result.normalized_text || text;
-      injectTextToRemote(payload);
+      injectTextToRemote(result.normalized_text || text);
       setBuffer("");
       setGateStatus("입력이 검사를 통과했고 원격 화면에 전달되었습니다.");
       focusGateInputDeferred();
@@ -495,8 +499,11 @@ export default function MyGCP() {
         ? (Array.from(displayEl.querySelectorAll("canvas")) as HTMLCanvasElement[])
         : (Array.from(doc.querySelectorAll("canvas")) as HTMLCanvasElement[]);
       if (canvases.length === 0) return null;
-      const w = (displayEl as HTMLElement | null)?.clientWidth || canvases[0].width || 1280;
-      const h = (displayEl as HTMLElement | null)?.clientHeight || canvases[0].height || 800;
+      // 스크린샷은 반드시 캔버스 실제 픽셀 크기로 캡처해야 좌표 일치
+      // CSS clientWidth/clientHeight(표시 크기)와 canvas.width/height(실제 픽셀)가 다를 수 있음
+      const mainCanvas = canvases[0];
+      const w = mainCanvas.width || 1280;
+      const h = mainCanvas.height || 800;
       const offscreen = document.createElement("canvas");
       offscreen.width = w;
       offscreen.height = h;
@@ -504,7 +511,8 @@ export default function MyGCP() {
       if (!ctx) return null;
       for (const c of canvases) {
         if (c.width > 0 && c.height > 0) {
-          try { ctx.drawImage(c, 0, 0); } catch { /* skip tainted layer */ }
+          // 각 캔버스를 원본 크기(w, h)에 맞춰 그림 — 좌표 1:1 대응
+          try { ctx.drawImage(c, 0, 0, w, h); } catch { /* skip tainted layer */ }
         }
       }
       const dataUrl = offscreen.toDataURL("image/png");
@@ -515,29 +523,66 @@ export default function MyGCP() {
     }
   };
 
-  // ── 마우스 클릭: 기존 세션 iframe에 직접 이벤트 주입 ────────────────────
-  const injectMouseClick = (x: number, y: number, button: string = "left", double: boolean = false) => {
+  // ── Guacamole 좌표 변환: 캔버스 픽셀 좌표(LLM) → CSS clientX/clientY
+  // Guacamole.Mouse는 .display div에 addEventListener로 바인딩되므로
+  // 이벤트 타겟도 .display div이어야 함. 좌표는 .display div 기준으로 변환.
+  const canvasPixelToClient = (canvasX: number, canvasY: number): { clientX: number; clientY: number; target: Element } | null => {
     const win = remoteWindow();
-    if (!win) return;
-    try {
-      const doc = win.document;
-      const target = doc.elementFromPoint(x, y) ?? doc.querySelector("#display, .display, canvas") ?? doc.body;
-      if (!target) return;
-      const btn = button === "right" ? 2 : button === "middle" ? 1 : 0;
-      const opts = { bubbles: true, cancelable: true, clientX: x, clientY: y, button: btn, buttons: btn === 0 ? 1 : btn === 2 ? 2 : 4 };
-      const Ctor = (doc.defaultView?.MouseEvent ?? globalThis.MouseEvent) as typeof MouseEvent;
-      target.dispatchEvent(new Ctor("mousedown", opts));
-      target.dispatchEvent(new Ctor("mouseup", opts));
-      target.dispatchEvent(new Ctor("click", opts));
-      if (double) {
-        target.dispatchEvent(new Ctor("mousedown", opts));
-        target.dispatchEvent(new Ctor("mouseup", opts));
-        target.dispatchEvent(new Ctor("click", opts));
-        target.dispatchEvent(new Ctor("dblclick", opts));
+    if (!win) return null;
+    const doc = win.document;
+    // Guacamole.Mouse가 바인딩된 엘리먼트: .display div
+    const displayEl = doc.querySelector(".display") as HTMLElement | null
+      ?? doc.querySelector("#display") as HTMLElement | null;
+    if (!displayEl) return null;
+    // .display 내의 canvas에서 네이티브 픽셀 크기 얻기
+    const canvas = displayEl.querySelector("canvas") as HTMLCanvasElement | null;
+    if (!canvas) return null;
+    const displayRect = displayEl.getBoundingClientRect();
+    // canvas 네이티브 픽셀 → .display div CSS 좌표 변환
+    const scaleX = displayRect.width / (canvas.width || 1);
+    const scaleY = displayRect.height / (canvas.height || 1);
+    return {
+      clientX: displayRect.left + canvasX * scaleX,
+      clientY: displayRect.top + canvasY * scaleY,
+      target: displayEl,
+    };
+  };
+
+  // ── 마우스 클릭: Guacamole canvas에 직접 DOM 이벤트 dispatch
+  const injectMouseClick = (x: number, y: number, button: string = "left", double: boolean = false): Promise<void> => {
+    return new Promise<void>((resolve) => {
+      const mapped = canvasPixelToClient(x, y);
+      if (!mapped) {
+        console.warn("[BoanClaw] injectMouseClick: canvas not found");
+        resolve();
+        return;
       }
-    } catch (e) {
-      console.warn("[BoanClaw] injectMouseClick error", e);
-    }
+      const { clientX, clientY, target } = mapped;
+      const win = remoteWindow();
+      const Ctor = ((win as any)?.MouseEvent ?? globalThis.MouseEvent) as typeof MouseEvent;
+      const btn = button === "right" ? 2 : button === "middle" ? 1 : 0;
+      const buttons = btn === 0 ? 1 : btn === 2 ? 2 : 4;
+      const baseOpts = { bubbles: true, cancelable: true, clientX, clientY, button: btn, buttons, view: win };
+
+      // mousedown → mouseup (Guacamole의 Mouse 핸들러가 이벤트를 캡처)
+      target.dispatchEvent(new Ctor("mousemove", { ...baseOpts, buttons: 0 }));
+      target.dispatchEvent(new Ctor("mousedown", baseOpts));
+      setTimeout(() => {
+        target.dispatchEvent(new Ctor("mouseup", { ...baseOpts, buttons: 0 }));
+        if (!double) {
+          resolve();
+          return;
+        }
+        setTimeout(() => {
+          target.dispatchEvent(new Ctor("mousedown", baseOpts));
+          setTimeout(() => {
+            target.dispatchEvent(new Ctor("mouseup", { ...baseOpts, buttons: 0 }));
+            target.dispatchEvent(new Ctor("dblclick", { ...baseOpts, buttons: 0 }));
+            resolve();
+          }, 60);
+        }, 60);
+      }, 80);
+    });
   };
 
   const injectMouseMove = (x: number, y: number) => {
@@ -640,15 +685,22 @@ export default function MyGCP() {
         return { ...result, media_type: "image/png" };
       }
       case "click": {
-        injectMouseClick(params.x as number, params.y as number, (params.button as string) ?? "left", false);
-        return { ok: true, result: `clicked (${params.x}, ${params.y})` };
+        const mapped = canvasPixelToClient(params.x as number, params.y as number);
+        await injectMouseClick(params.x as number, params.y as number, (params.button as string) ?? "left", false);
+        return {
+          ok: true,
+          result: `clicked (${params.x}, ${params.y})`,
+          debug_method: "canvas-dom-event",
+          debug_mapped: mapped ? { clientX: Math.round(mapped.clientX), clientY: Math.round(mapped.clientY) } : null,
+          debug_canvasFound: !!mapped,
+        };
       }
       case "double_click": {
-        injectMouseClick(params.x as number, params.y as number, "left", true);
+        await injectMouseClick(params.x as number, params.y as number, "left", true);
         return { ok: true, result: `double-clicked (${params.x}, ${params.y})` };
       }
       case "right_click": {
-        injectMouseClick(params.x as number, params.y as number, "right", false);
+        await injectMouseClick(params.x as number, params.y as number, "right", false);
         return { ok: true, result: `right-clicked (${params.x}, ${params.y})` };
       }
       case "move": {
@@ -685,7 +737,7 @@ export default function MyGCP() {
           const rect = el.getBoundingClientRect();
           const cx = rect.left + rect.width / 2;
           const cy = rect.top + rect.height / 2;
-          injectMouseClick(cx, cy, "left", (params.double as boolean) ?? false);
+          await injectMouseClick(cx, cy, "left", (params.double as boolean) ?? false);
           return { ok: true, result: `clicked element matching: ${query}` };
         } catch (e) {
           return { error: `click_query error: ${e instanceof Error ? e.message : String(e)}` };
@@ -844,7 +896,8 @@ export default function MyGCP() {
 
       if (doneEvt) {
         const n = doneEvt.actions_executed ?? 0;
-        setGateStatus(n > 0 ? `실행 완료 — ${n}개 액션` : "실행 완료 (액션 없음)");
+        const doneMsg = n > 0 ? `실행 완료 — ${n}개 액션` : "실행 완료 (액션 없음)";
+        setGateStatus(doneMsg);
       }
     } catch (e) {
       setGateStatus(e instanceof Error ? e.message : "실행 실패");
@@ -914,6 +967,9 @@ export default function MyGCP() {
       " ": 0x20,
     };
     if (named[key]) return named[key];
+    // case-insensitive lookup: "f4" → "F4", "escape" → "Escape" 등
+    const ciMatch = Object.keys(named).find((k) => k.toLowerCase() === key.toLowerCase());
+    if (ciMatch) return named[ciMatch];
     if (key.length === 1) return key.codePointAt(0) ?? null;
     return null;
   };

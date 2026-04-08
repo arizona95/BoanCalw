@@ -45,6 +45,7 @@ export interface VersionPolicy {
 export interface OrgPolicySettings {
   org_name?: string;
   admin_emails?: string[];
+  allowed_domains?: string[];
   seat_limit?: number;
   gcp_org_id?: string;
   workspace_url?: string;
@@ -343,6 +344,11 @@ export const chatApi = {
     request<{ ok: boolean; runId?: string; error?: string }>("/api/chat/forward", {
       method: "POST",
       body: JSON.stringify({ message }),
+    }),
+  inject: (role: "user" | "assistant", content: string) =>
+    request<{ ok: boolean }>("/api/chat/inject", {
+      method: "POST",
+      body: JSON.stringify({ role, content }),
     }),
 };
 

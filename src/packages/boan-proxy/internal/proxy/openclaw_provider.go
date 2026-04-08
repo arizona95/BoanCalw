@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"regexp"
@@ -39,6 +40,7 @@ var (
 	curlURLRe        = regexp.MustCompile(`https?://[^\s'"\\]+`)
 	curlDataSingleRe = regexp.MustCompile(`(?s)(?:--data-raw|-d)\s+'([^']*)'`)
 	curlDataDoubleRe = regexp.MustCompile(`(?s)(?:--data-raw|-d)\s+"([^"]*)"`)
+	curlModelRe      = regexp.MustCompile(`"model"\s*:\s*"([^"]+)"`)
 	credRefRe        = regexp.MustCompile(`\{\{CREDENTIAL:([^}]+)\}\}`)
 	credentialReadablePatterns = []*regexp.Regexp{
 		regexp.MustCompile(`(?i)-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----`),
@@ -255,12 +257,18 @@ func (s *Server) forwardVisionLLM(ctx context.Context, entry *registryLLM, scree
 	if curlTmpl == "" {
 		curlTmpl = entry.CurlTemplate
 	}
-	_, endpoint, headers, _ := parseCurlTemplate(curlTmpl)
+	_, endpoint, headers, tmplBody := parseCurlTemplate(curlTmpl)
 	if endpoint == "" {
 		endpoint = entry.Endpoint
 	}
 	if endpoint == "" {
 		return "", fmt.Errorf("vision llm endpoint is empty")
+	}
+
+	// curl template body에서 실제 model명 추출 (entry.Name과 다를 수 있음)
+	modelName := entry.Name
+	if m := curlModelRe.FindStringSubmatch(tmplBody); len(m) == 2 {
+		modelName = m[1]
 	}
 
 	// credential placeholder 헤더 값 해석
@@ -279,7 +287,7 @@ func (s *Server) forwardVisionLLM(ctx context.Context, entry *registryLLM, scree
 	if strings.Contains(endpoint, "/api/chat") {
 		// Ollama multimodal 포맷
 		payload = map[string]any{
-			"model": entry.Name,
+			"model": modelName,
 			"messages": []map[string]any{
 				{
 					"role":    "user",
@@ -292,7 +300,7 @@ func (s *Server) forwardVisionLLM(ctx context.Context, entry *registryLLM, scree
 	} else {
 		// OpenAI vision 포맷
 		payload = map[string]any{
-			"model": entry.Name,
+			"model": modelName,
 			"messages": []map[string]any{
 				{
 					"role": "user",
@@ -386,18 +394,22 @@ func extractPromptFromMessages(rawMessages any) string {
 	if !ok {
 		return ""
 	}
-	parts := make([]string, 0, len(list))
-	for _, item := range list {
-		msg, ok := item.(map[string]any)
+	// 마지막 유저 메시지만 추출 — 태그 기반 라우팅([gcp_send] 등)의 정확도를 위해
+	for i := len(list) - 1; i >= 0; i-- {
+		msg, ok := list[i].(map[string]any)
 		if !ok {
+			continue
+		}
+		if role, _ := msg["role"].(string); role != "user" {
 			continue
 		}
 		switch content := msg["content"].(type) {
 		case string:
-			if strings.TrimSpace(content) != "" {
-				parts = append(parts, content)
+			if t := strings.TrimSpace(content); t != "" {
+				return extractLastLine(t)
 			}
 		case []any:
+			var parts []string
 			for _, entry := range content {
 				obj, ok := entry.(map[string]any)
 				if !ok {
@@ -407,9 +419,33 @@ func extractPromptFromMessages(rawMessages any) string {
 					parts = append(parts, text)
 				}
 			}
+			if len(parts) > 0 {
+				return extractLastLine(strings.Join(parts, "\n"))
+			}
 		}
 	}
-	return strings.Join(parts, "\n")
+	return ""
+}
+
+// extractLastLine — openclaw이 유저 메시지 앞에 시스템 컨텍스트를 붙이므로
+// 실제 유저 입력은 마지막 줄에 있음
+func extractLastLine(s string) string {
+	lines := strings.Split(s, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if t := strings.TrimSpace(lines[i]); t != "" {
+			// "[Tue 2026-04-07 05:40 UTC] [gcp_send] text" 형태에서 timestamp 제거
+			// 단, 제거 후 남은 부분도 "[..."로 시작해야 timestamp prefix임
+			// (그렇지 않으면 "[gcp_send] text" 같은 태그 자체가 제거되는 버그 발생)
+			if idx := strings.Index(t, "] "); idx != -1 && strings.HasPrefix(t, "[") {
+				candidate := strings.TrimSpace(t[idx+2:])
+				if candidate != "" && strings.HasPrefix(candidate, "[") {
+					return candidate
+				}
+			}
+			return t
+		}
+	}
+	return strings.TrimSpace(s)
 }
 
 func (s *Server) resolveTemplateCredentials(ctx context.Context, text string) (string, error) {
@@ -454,7 +490,8 @@ func (s *Server) forwardSelectedLLM(ctx context.Context, orgID, prompt string, o
 	}
 	if body == "" {
 		payload := map[string]any{
-			"model": entry.Name,
+			"model":  entry.Name,
+			"stream": false,
 			"messages": []map[string]any{
 				{
 					"role":    "system",
@@ -510,6 +547,77 @@ func (s *Server) forwardSelectedLLM(ctx context.Context, orgID, prompt string, o
 		return nil, err
 	}
 	return s.sanitizeOpenAIResponseForOrg(ctx, orgID, out), nil
+}
+
+// forwardActionLLM — computer-use agent 전용: system/user 메시지를 분리하여 전송
+func (s *Server) forwardActionLLM(ctx context.Context, orgID, systemPrompt, userPrompt string) (map[string]any, error) {
+	entry, err := s.loadSelectedRegistryLLM(ctx)
+	if err != nil {
+		return nil, err
+	}
+	_, endpoint, headers, body := parseCurlTemplate(entry.CurlTemplate)
+	if endpoint == "" {
+		endpoint = entry.Endpoint
+	}
+	if endpoint == "" {
+		return nil, fmt.Errorf("selected llm endpoint is empty")
+	}
+	if body == "" {
+		payload := map[string]any{
+			"model":  entry.Name,
+			"stream": false,
+			"messages": []map[string]any{
+				{"role": "system", "content": systemPrompt},
+				{"role": "user", "content": userPrompt},
+			},
+			"max_tokens": 512,
+		}
+		raw, _ := json.Marshal(payload)
+		body = string(raw)
+	} else {
+		// curl template가 있으면 user prompt만 렌더링
+		normalized, err := renderTemplateBody(body, systemPrompt+"\n\n"+userPrompt)
+		if err != nil {
+			return nil, err
+		}
+		body = normalized
+	}
+	for key, value := range headers {
+		resolved, err := s.resolveTemplateCredentials(ctx, value)
+		if err != nil {
+			return nil, err
+		}
+		headers[key] = resolved
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewBufferString(body))
+	if err != nil {
+		return nil, err
+	}
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
+	if req.Header.Get("Content-Type") == "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	log.Printf("[computer-use/agent] action LLM request: model=%s endpoint=%s bodyLen=%d", entry.Name, endpoint, len(body))
+	resp, err := noProxyHTTPClient(90 * time.Second).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	log.Printf("[computer-use/agent] action LLM response: status=%d bodyLen=%d body=%s", resp.StatusCode, len(raw), func() string {
+		if len(raw) > 500 { return string(raw[:500]) + "..." }
+		return string(raw)
+	}())
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("upstream returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	out, err := translateUpstreamToOpenAI(entry.Name, raw)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func noProxyHTTPClient(timeout time.Duration) *http.Client {
@@ -589,9 +697,6 @@ func translateUpstreamToOpenAI(model string, raw []byte) (map[string]any, error)
 		if content == "" {
 			content = strings.TrimSpace(ollama.Message.Thinking)
 		}
-		if content == "" {
-			content = strings.TrimSpace(string(raw))
-		}
 		finishReason := strings.TrimSpace(ollama.DoneReason)
 		if finishReason == "" {
 			finishReason = "stop"
@@ -618,6 +723,55 @@ func translateUpstreamToOpenAI(model string, raw []byte) (map[string]any, error)
 			},
 		}, nil
 	}
+	// Try NDJSON (Ollama streaming format: multiple JSON objects, one per line)
+	{
+		lines := bytes.Split(bytes.TrimSpace(raw), []byte("\n"))
+		if len(lines) > 1 {
+			var accumulated strings.Builder
+			var ndjsonModel string
+			for _, line := range lines {
+				line = bytes.TrimSpace(line)
+				if len(line) == 0 {
+					continue
+				}
+				var chunk struct {
+					Model   string `json:"model"`
+					Done    bool   `json:"done"`
+					Message struct {
+						Content  string `json:"content"`
+						Thinking string `json:"thinking"`
+					} `json:"message"`
+				}
+				if err := json.Unmarshal(line, &chunk); err == nil {
+					if chunk.Model != "" {
+						ndjsonModel = chunk.Model
+					}
+					if !chunk.Done {
+						accumulated.WriteString(chunk.Message.Content)
+					}
+				}
+			}
+			if accumulated.Len() > 0 {
+				return map[string]any{
+					"id":      fmt.Sprintf("ollama-%d", time.Now().UnixNano()),
+					"object":  "chat.completion",
+					"created": time.Now().Unix(),
+					"model":   firstNonEmpty(ndjsonModel, model),
+					"choices": []map[string]any{
+						{
+							"index": 0,
+							"message": map[string]any{
+								"role":    "assistant",
+								"content": accumulated.String(),
+							},
+							"finish_reason": "stop",
+						},
+					},
+				}, nil
+			}
+		}
+	}
+
 	var anthropic struct {
 		ID      string `json:"id"`
 		Model   string `json:"model"`
@@ -662,7 +816,7 @@ func translateUpstreamToOpenAI(model string, raw []byte) (map[string]any, error)
 				"index": 0,
 				"message": map[string]any{
 					"role":    "assistant",
-					"content": string(raw),
+					"content": "(모델 응답을 파싱할 수 없습니다)",
 				},
 				"finish_reason": "stop",
 			},

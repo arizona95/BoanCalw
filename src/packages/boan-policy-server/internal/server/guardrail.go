@@ -19,14 +19,18 @@ import (
 )
 
 type GuardrailEvaluateRequest struct {
-	Text string `json:"text"`
-	Mode string `json:"mode,omitempty"`
+	Text        string `json:"text"`
+	Mode        string `json:"mode,omitempty"`
+	UserEmail   string `json:"user_email,omitempty"`
+	AccessLevel string `json:"access_level,omitempty"`
 }
 
 type GuardrailEvaluateResponse struct {
 	Decision   string  `json:"decision"`
 	Reason     string  `json:"reason"`
 	Confidence float64 `json:"confidence"`
+	Tier       int     `json:"tier,omitempty"`
+	Response   string  `json:"response,omitempty"`
 }
 
 type GuardrailEvaluator struct {
@@ -103,7 +107,9 @@ func (e *GuardrailEvaluator) Evaluate(ctx context.Context, cfg policy.GuardrailC
 
 func (e *GuardrailEvaluator) evaluateWithLLM(ctx context.Context, cfg policy.GuardrailConfig, req GuardrailEvaluateRequest) (GuardrailEvaluateResponse, error) {
 	systemPrompt := fmt.Sprintf(
-		"You are an S4 guardrail server. Judge whether text may leave the protected boundary. Constitution:\\n%s\\nReturn strict JSON only: {\"decision\":\"allow|ask|block\",\"reason\":\"short reason\",\"confidence\":0.0}.",
+		"You are an S4 guardrail server. Evaluate the user's request against the constitution and provide both a safety decision and an appropriate response.\n"+
+			"Constitution:\n%s\n\n"+
+			"Return strict JSON only: {\"decision\":\"allow|ask|block\",\"reason\":\"short reason\",\"confidence\":0.0,\"response\":\"your answer to the user's question if allowed, or empty if blocked\"}",
 		strings.TrimSpace(cfg.Constitution),
 	)
 	payload := map[string]any{
@@ -178,6 +184,7 @@ func (e *GuardrailEvaluator) evaluateWithLLM(ctx context.Context, cfg policy.Gua
 	if parsed.Reason == "" {
 		parsed.Reason = "llm classified request"
 	}
+	parsed.Tier = 1
 	return parsed, nil
 }
 
@@ -442,4 +449,293 @@ func (e *GuardrailEvaluator) autoJudgeHeuristic(cfg policy.GuardrailConfig, req 
 	default:
 		return AutoJudgeResponse{Decision: "approve", Reasoning: gr.Reason, Confidence: gr.Confidence}
 	}
+}
+
+// ── Tier 2: Wiki Guardrail ──────────────────────────────────────────────────
+
+func (s *Server) wikiEvaluateGuardrail(w http.ResponseWriter, r *http.Request, orgID string) {
+	w.Header().Set("Content-Type", "application/json")
+
+	var body GuardrailEvaluateRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	p, err := s.store.EnsureDefault(orgID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	resp, err := s.wikiGuardrail.WikiEvaluate(r.Context(), p.Guardrail, s.trainingLog, body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	json.NewEncoder(w).Encode(resp)
+}
+
+// WikiEvaluate — Tier 2 평가: training log(wiki)를 few-shot context로 포함하여 LLM 평가
+func (e *GuardrailEvaluator) WikiEvaluate(ctx context.Context, cfg policy.GuardrailConfig, log *HITLTrainingLog, req GuardrailEvaluateRequest) (GuardrailEvaluateResponse, error) {
+	text := strings.TrimSpace(req.Text)
+	if text == "" {
+		return GuardrailEvaluateResponse{Decision: "block", Reason: "empty text", Confidence: 1, Tier: 2}, nil
+	}
+
+	// training log에서 최근 50건을 wiki context로 구성
+	wikiContext := ""
+	if log != nil {
+		recent := log.Recent(50)
+		if len(recent) > 0 {
+			var sb strings.Builder
+			sb.WriteString("Past decisions (wiki knowledge):\n")
+			for _, d := range recent {
+				sb.WriteString(fmt.Sprintf("- text=%q reason=%q → %s (confidence=%.2f, source=%s)\n",
+					truncate(d.Text, 80), d.Reason, d.Decision, d.Confidence, d.Source))
+			}
+			wikiContext = sb.String()
+		}
+	}
+
+	if e.llmURL != "" && e.llmModel != "" {
+		resp, err := e.wikiEvaluateWithLLM(ctx, cfg, wikiContext, req)
+		if err == nil && isValidGuardrailDecision(resp.Decision) {
+			return resp, nil
+		}
+	}
+
+	// LLM 불가 시 heuristic fallback
+	heuristic := evaluateGuardrailHeuristic(cfg, req)
+	heuristic.Tier = 2
+	return heuristic, nil
+}
+
+func (e *GuardrailEvaluator) wikiEvaluateWithLLM(ctx context.Context, cfg policy.GuardrailConfig, wikiContext string, req GuardrailEvaluateRequest) (GuardrailEvaluateResponse, error) {
+	systemPrompt := fmt.Sprintf(
+		"You are the BoanClaw Wiki Guardrail (Tier 2). Use accumulated knowledge from past decisions to evaluate this request.\n\n"+
+			"Constitution:\n%s\n\n"+
+			"%s\n"+
+			"Evaluate the user's request. Return strict JSON only: {\"decision\":\"allow|ask|block\",\"reason\":\"short reason\",\"confidence\":0.0,\"response\":\"answer if allowed\"}",
+		strings.TrimSpace(cfg.Constitution), wikiContext,
+	)
+	payload := map[string]any{
+		"model": e.llmModel,
+		"messages": []map[string]string{
+			{"role": "system", "content": systemPrompt},
+			{"role": "user", "content": fmt.Sprintf("mode=%s\ntext=%s", req.Mode, req.Text)},
+		},
+		"temperature": 0,
+		"stream":      false,
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return GuardrailEvaluateResponse{}, err
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, e.llmURL, bytes.NewReader(raw))
+	if err != nil {
+		return GuardrailEvaluateResponse{}, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if e.llmKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+e.llmKey)
+	}
+
+	resp, err := e.client.Do(httpReq)
+	if err != nil {
+		return GuardrailEvaluateResponse{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return GuardrailEvaluateResponse{}, fmt.Errorf("wiki llm returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var upstream struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+		Response string `json:"response"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&upstream); err != nil {
+		return GuardrailEvaluateResponse{}, err
+	}
+	content := ""
+	if len(upstream.Choices) > 0 {
+		content = strings.TrimSpace(upstream.Choices[0].Message.Content)
+	}
+	if content == "" {
+		content = strings.TrimSpace(upstream.Message.Content)
+	}
+	if content == "" {
+		content = strings.TrimSpace(upstream.Response)
+	}
+	if content == "" {
+		return GuardrailEvaluateResponse{}, fmt.Errorf("wiki llm returned no content")
+	}
+
+	var parsed GuardrailEvaluateResponse
+	if err := decodeLooseJSON(content, &parsed); err != nil {
+		return GuardrailEvaluateResponse{}, err
+	}
+	parsed.Decision = strings.ToLower(strings.TrimSpace(parsed.Decision))
+	if parsed.Confidence < 0 || parsed.Confidence > 1 || math.IsNaN(parsed.Confidence) {
+		parsed.Confidence = 0.5
+	}
+	if parsed.Reason == "" {
+		parsed.Reason = "wiki guardrail classified request"
+	}
+	parsed.Tier = 2
+	return parsed, nil
+}
+
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..."
+}
+
+// ── Training Log 쓰기 엔드포인트 (인간 결정 피드백용) ─────────────────────────
+
+func (s *Server) appendTrainingLog(w http.ResponseWriter, r *http.Request, orgID string) {
+	var entry HITLDecision
+	if err := json.NewDecoder(r.Body).Decode(&entry); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	entry.OrgID = orgID
+	if entry.Source == "" {
+		entry.Source = "human"
+	}
+	if entry.Timestamp == "" {
+		entry.Timestamp = time.Now().UTC().Format(time.RFC3339)
+	}
+	s.trainingLog.Append(entry)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ── 헌법 개정 제안 ──────────────────────────────────────────────────────────
+
+type AmendmentProposal struct {
+	Diff       string `json:"diff"`
+	Reasoning  string `json:"reasoning"`
+	ProposedAt string `json:"proposed_at"`
+}
+
+func (s *Server) proposeAmendment(w http.ResponseWriter, r *http.Request, orgID string) {
+	w.Header().Set("Content-Type", "application/json")
+
+	p, err := s.store.EnsureDefault(orgID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	proposal, err := s.wikiGuardrail.ProposeAmendment(r.Context(), p.Guardrail, s.trainingLog)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	json.NewEncoder(w).Encode(proposal)
+}
+
+// ProposeAmendment — training log 분석 → 헌법 개정안(diff) 생성
+func (e *GuardrailEvaluator) ProposeAmendment(ctx context.Context, cfg policy.GuardrailConfig, log *HITLTrainingLog) (*AmendmentProposal, error) {
+	if e.llmURL == "" || e.llmModel == "" {
+		return nil, fmt.Errorf("wiki LLM not configured for amendment proposals")
+	}
+
+	// training log에서 최근 100건 분석
+	wikiContext := ""
+	if log != nil {
+		recent := log.Recent(100)
+		if len(recent) > 0 {
+			var sb strings.Builder
+			sb.WriteString("Recent guardrail decisions:\n")
+			for _, d := range recent {
+				sb.WriteString(fmt.Sprintf("- text=%q reason=%q → %s (source=%s)\n",
+					truncate(d.Text, 60), d.Reason, d.Decision, d.Source))
+			}
+			wikiContext = sb.String()
+		}
+	}
+
+	systemPrompt := fmt.Sprintf(
+		"You are the BoanClaw Constitution Amendment Advisor.\n\n"+
+			"Current constitution:\n%s\n\n"+
+			"%s\n"+
+			"Based on the pattern of recent decisions, propose amendments to the constitution.\n"+
+			"Return strict JSON: {\"diff\":\"unified diff of the constitution (lines starting with + for additions, - for removals)\",\"reasoning\":\"why this amendment is needed\"}",
+		strings.TrimSpace(cfg.Constitution), wikiContext,
+	)
+	payload := map[string]any{
+		"model": e.llmModel,
+		"messages": []map[string]string{
+			{"role": "system", "content": systemPrompt},
+			{"role": "user", "content": "Propose constitution amendments based on the accumulated wiki knowledge."},
+		},
+		"temperature": 0,
+		"stream":      false,
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, e.llmURL, bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if e.llmKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+e.llmKey)
+	}
+
+	resp, err := e.client.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return nil, fmt.Errorf("amendment llm returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var upstream struct {
+		Choices []struct {
+			Message struct{ Content string `json:"content"` } `json:"message"`
+		} `json:"choices"`
+		Message  struct{ Content string `json:"content"` } `json:"message"`
+		Response string                                     `json:"response"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&upstream); err != nil {
+		return nil, err
+	}
+	content := ""
+	if len(upstream.Choices) > 0 {
+		content = strings.TrimSpace(upstream.Choices[0].Message.Content)
+	}
+	if content == "" {
+		content = strings.TrimSpace(upstream.Message.Content)
+	}
+	if content == "" {
+		content = strings.TrimSpace(upstream.Response)
+	}
+	if content == "" {
+		return nil, fmt.Errorf("amendment llm returned no content")
+	}
+
+	var parsed AmendmentProposal
+	if err := decodeLooseJSON(content, &parsed); err != nil {
+		return nil, err
+	}
+	parsed.ProposedAt = time.Now().UTC().Format(time.RFC3339)
+	return &parsed, nil
 }

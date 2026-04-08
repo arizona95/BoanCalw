@@ -20,12 +20,33 @@ const (
 	StatusApproved Status = "approved"
 )
 
+// AccessLevel — 사용자 정보 흐름 권한
+// allow: 낮은 흐름 허용 + 모니터링만
+// ask:   낮은 흐름에 가드레일 적용 (사전차단 + 모니터링)
+// deny:  낮은 흐름 차단, 같은/높은 레벨만 허용
+type AccessLevel string
+
+const (
+	AccessAllow AccessLevel = "allow"
+	AccessAsk   AccessLevel = "ask"
+	AccessDeny  AccessLevel = "deny"
+)
+
+func ValidAccessLevel(s string) bool {
+	switch AccessLevel(s) {
+	case AccessAllow, AccessAsk, AccessDeny:
+		return true
+	}
+	return false
+}
+
 type User struct {
 	Email        string       `json:"email"`
 	PasswordHash string       `json:"password_hash"`
 	Role         string       `json:"role"`
 	OrgID        string       `json:"org_id"`
 	Status       Status       `json:"status"`
+	AccessLevel  AccessLevel  `json:"access_level"`
 	CreatedAt    time.Time    `json:"created_at"`
 	Workstation  *Workstation `json:"workstation,omitempty"`
 }
@@ -86,6 +107,7 @@ func (s *Store) Register(email, password, orgID, role string, status Status) (*U
 		Role:         string(roles.Normalize(roles.Role(role))),
 		OrgID:        orgID,
 		Status:       status,
+		AccessLevel:  AccessAsk,
 		CreatedAt:    time.Now().UTC(),
 	}
 	s.users[email] = u
@@ -140,6 +162,20 @@ func (s *Store) SetRole(email, role string) error {
 		return ErrNotFound
 	}
 	u.Role = string(roles.Normalize(roles.Role(role)))
+	return s.save()
+}
+
+func (s *Store) SetAccessLevel(email string, level AccessLevel) error {
+	if !ValidAccessLevel(string(level)) {
+		return errors.New("invalid access level")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.users[email]
+	if !ok {
+		return ErrNotFound
+	}
+	u.AccessLevel = level
 	return s.save()
 }
 
@@ -201,11 +237,12 @@ func (s *Store) Upsert(email, orgID, role string, status Status) (*User, error) 
 	}
 
 	u := &User{
-		Email:     email,
-		Role:      role,
-		OrgID:     orgID,
-		Status:    status,
-		CreatedAt: time.Now().UTC(),
+		Email:       email,
+		Role:        role,
+		OrgID:       orgID,
+		Status:      status,
+		AccessLevel: AccessAsk,
+		CreatedAt:   time.Now().UTC(),
 	}
 	s.users[email] = u
 	if err := s.save(); err != nil {

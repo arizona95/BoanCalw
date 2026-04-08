@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -106,19 +107,52 @@ func (c *Client) SyncUser(orgID, email, name, role, provider, status, machineID,
 	return c.postJSON(fmt.Sprintf("%s/org/%s/v1/users/sso-sync", c.baseURL, orgID), body)
 }
 
-func (c *Client) UpdateUser(orgID, email, role, status string, workstation *Workstation, machineID, machineName string) error {
+func (c *Client) UpdateUser(orgID, email, role, status, accessLevel string, workstation *Workstation, machineID, machineName string) error {
 	if !c.Enabled() {
 		return nil
 	}
 	body := map[string]any{
-		"email":       email,
-		"role":        role,
-		"status":      status,
-		"workstation": workstation,
-		"machine_id":  machineID,
+		"email":        email,
+		"role":         role,
+		"status":       status,
+		"access_level": accessLevel,
+		"workstation":  workstation,
+		"machine_id":   machineID,
 		"machine_name": machineName,
 	}
 	return c.doJSON(http.MethodPatch, fmt.Sprintf("%s/org/%s/v1/users", c.baseURL, orgID), body)
+}
+
+func (c *Client) ProposeAmendment(orgID string) (map[string]any, error) {
+	if !c.Enabled() {
+		return nil, fmt.Errorf("org server not configured")
+	}
+	url := fmt.Sprintf("%s/org/%s/v1/guardrail/propose-amendment", c.baseURL, orgID)
+	raw, _ := json.Marshal(map[string]string{})
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return nil, fmt.Errorf("propose-amendment returned %d: %s", resp.StatusCode, string(body))
+	}
+	var result map[string]any
+	json.NewDecoder(resp.Body).Decode(&result)
+	return result, nil
+}
+
+func (c *Client) AppendTrainingLog(orgID string, entry map[string]any) error {
+	if !c.Enabled() {
+		return nil
+	}
+	return c.doJSON(http.MethodPost, fmt.Sprintf("%s/org/%s/v1/guardrail/training-log", c.baseURL, orgID), entry)
 }
 
 func (c *Client) DeleteUser(orgID, email string) error {

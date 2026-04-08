@@ -49,13 +49,14 @@ type SSOProvider struct {
 }
 
 type OrgSettings struct {
-	OrgName      string        `json:"org_name,omitempty"`
-	AllowedSSO   []SSOProvider `json:"allowed_sso,omitempty"`
-	AdminEmails  []string      `json:"admin_emails,omitempty"`
-	SeatLimit    int           `json:"seat_limit,omitempty"`
-	GCPOrgID     string        `json:"gcp_org_id,omitempty"`
-	WorkspaceURL string        `json:"workspace_url,omitempty"`
-	MountRoot    string        `json:"mount_root,omitempty"`
+	OrgName        string        `json:"org_name,omitempty"`
+	AllowedSSO     []SSOProvider `json:"allowed_sso,omitempty"`
+	AllowedDomains []string      `json:"allowed_domains,omitempty"` // SSO 허용 이메일 도메인
+	AdminEmails    []string      `json:"admin_emails,omitempty"`
+	SeatLimit      int           `json:"seat_limit,omitempty"`
+	GCPOrgID       string        `json:"gcp_org_id,omitempty"`
+	WorkspaceURL   string        `json:"workspace_url,omitempty"`
+	MountRoot      string        `json:"mount_root,omitempty"`
 }
 
 type GuardrailConfig struct {

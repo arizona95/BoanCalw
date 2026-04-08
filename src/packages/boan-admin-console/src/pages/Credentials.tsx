@@ -11,7 +11,7 @@ const STATUS_STYLE: Record<string, string> = {
   missing: "bg-yellow-50 text-yellow-700",
 };
 
-type TabKey = "stored" | "passthrough";
+type TabKey = "org" | "personal" | "passthrough";
 
 function maskKey(k: string) {
   if (!k) return "";
@@ -20,7 +20,7 @@ function maskKey(k: string) {
 }
 
 export default function Credentials() {
-  const [tab, setTab] = useState<TabKey>("stored");
+  const [tab, setTab] = useState<TabKey>("org");
   const [creds, setCreds] = useState<Credential[]>([]);
   const [passthrough, setPassthrough] = useState<CredentialPassthrough[]>([]);
   const [loading, setLoading] = useState(true);
@@ -147,32 +147,13 @@ export default function Credentials() {
         </div>
       )}
 
-      <div className="mb-4 flex gap-2">
-        <button
-          type="button"
-          onClick={() => setTab("stored")}
-          className={`rounded-lg px-3 py-2 text-sm font-medium ${
-            tab === "stored"
-              ? "bg-boan-600 text-white"
-              : "bg-white text-gray-600 border border-gray-200"
-          }`}
-        >
-          저장된 Credentials
-        </button>
-        <button
-          type="button"
-          onClick={() => setTab("passthrough")}
-          className={`rounded-lg px-3 py-2 text-sm font-medium ${
-            tab === "passthrough"
-              ? "bg-amber-500 text-white"
-              : "bg-white text-gray-600 border border-gray-200"
-          }`}
-        >
-          안 바꾸는 키
-        </button>
+      <div className="flex border-b border-gray-200 mb-4">
+        {([["org", "Organization"], ["personal", "Personal"], ["passthrough", "Passthrough"]] as const).map(([k, label]) => (
+          <button key={k} onClick={() => setTab(k)} className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${tab === k ? "border-boan-600 text-boan-700" : "border-transparent text-gray-500 hover:text-gray-700"}`}>{label}</button>
+        ))}
       </div>
 
-      {tab === "stored" ? (
+      {tab === "org" ? (
         <>
           <div className="mb-6 rounded-xl border border-gray-200 bg-white p-6 shadow-sm">
             <h2 className="mb-1 text-lg font-semibold">Credential 추가</h2>
@@ -297,6 +278,37 @@ export default function Credentials() {
             )}
           </div>
         </>
+      ) : tab === "personal" ? (
+        <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+          <h2 className="text-lg font-semibold mb-1">Personal Credentials</h2>
+          <p className="text-xs text-gray-500 mb-4">각 사용자가 개인적으로 등록한 API 키. 소유자는 여기서 전체 조회 가능.</p>
+          {loading ? (
+            <p className="text-sm text-gray-500">로딩 중...</p>
+          ) : creds.filter((c) => c.role.includes("personal")).length === 0 ? (
+            <p className="text-sm text-gray-400 py-8 text-center">개인 credential이 없습니다.</p>
+          ) : (
+            <table className="w-full text-sm">
+              <thead className="border-b border-gray-200 bg-gray-50">
+                <tr>
+                  <th className="px-4 py-3 text-left font-medium text-gray-500">Role</th>
+                  <th className="px-4 py-3 text-left font-medium text-gray-500">Org</th>
+                  <th className="px-4 py-3 text-left font-medium text-gray-500">상태</th>
+                  <th className="px-4 py-3 text-right font-medium text-gray-500">액션</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {creds.filter((c) => c.role.includes("personal")).map((c) => (
+                  <tr key={c.role} className="hover:bg-gray-50">
+                    <td className="px-4 py-3 font-mono text-xs">{c.role}</td>
+                    <td className="px-4 py-3 text-xs text-gray-500">{c.org_id || "-"}</td>
+                    <td className="px-4 py-3"><span className={`rounded-full px-2 py-1 text-xs ${STATUS_STYLE[c.status] ?? STATUS_STYLE.ok}`}>{c.status}</span></td>
+                    <td className="px-4 py-3 text-right"><button onClick={() => handleRevoke(c.role)} className="text-xs text-red-600 hover:underline">revoke</button></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
       ) : (
         <>
           <div className="mb-6 rounded-xl border border-amber-200 bg-white p-6 shadow-sm">

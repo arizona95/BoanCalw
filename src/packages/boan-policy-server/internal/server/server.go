@@ -21,6 +21,9 @@ type Config struct {
 	GuardrailLLMURL   string
 	GuardrailLLMModel string
 	GuardrailLLMKey   string
+	WikiLLMURL        string
+	WikiLLMModel      string
+	WikiLLMKey        string
 }
 
 func LoadConfig() Config {
@@ -31,15 +34,19 @@ func LoadConfig() Config {
 		GuardrailLLMURL:   env("BOAN_GUARDRAIL_LLM_URL", ""),
 		GuardrailLLMModel: env("BOAN_GUARDRAIL_LLM_MODEL", ""),
 		GuardrailLLMKey:   env("BOAN_GUARDRAIL_LLM_KEY", ""),
+		WikiLLMURL:        env("BOAN_WIKI_LLM_URL", ""),
+		WikiLLMModel:      env("BOAN_WIKI_LLM_MODEL", ""),
+		WikiLLMKey:        env("BOAN_WIKI_LLM_KEY", ""),
 	}
 }
 
 type Server struct {
-	cfg         Config
-	store       *policy.Store
-	signer      *signing.Signer
-	guardrail   *GuardrailEvaluator
-	trainingLog *HITLTrainingLog
+	cfg           Config
+	store         *policy.Store
+	signer        *signing.Signer
+	guardrail     *GuardrailEvaluator
+	wikiGuardrail *GuardrailEvaluator
+	trainingLog   *HITLTrainingLog
 }
 
 type checkinRequest struct {
@@ -73,11 +80,12 @@ func New(cfg Config) *Server {
 		trainingLogPath = cfg.DataDir + "/hitl_training.jsonl"
 	}
 	return &Server{
-		cfg:         cfg,
-		store:       store,
-		signer:      signer,
-		guardrail:   NewGuardrailEvaluator(cfg.GuardrailLLMURL, cfg.GuardrailLLMModel, cfg.GuardrailLLMKey),
-		trainingLog: NewHITLTrainingLog(trainingLogPath),
+		cfg:           cfg,
+		store:         store,
+		signer:        signer,
+		guardrail:     NewGuardrailEvaluator(cfg.GuardrailLLMURL, cfg.GuardrailLLMModel, cfg.GuardrailLLMKey),
+		wikiGuardrail: NewGuardrailEvaluator(cfg.WikiLLMURL, cfg.WikiLLMModel, cfg.WikiLLMKey),
+		trainingLog:   NewHITLTrainingLog(trainingLogPath),
 	}
 }
 
@@ -153,6 +161,12 @@ func (s *Server) handleOrg(w http.ResponseWriter, r *http.Request) {
 		s.updateOrgSettings(w, r, orgID)
 	case rest == "v1/guardrail/evaluate" && r.Method == http.MethodPost:
 		s.evaluateGuardrail(w, r, orgID)
+	case rest == "v1/guardrail/wiki-evaluate" && r.Method == http.MethodPost:
+		s.wikiEvaluateGuardrail(w, r, orgID)
+	case rest == "v1/guardrail/training-log" && r.Method == http.MethodPost:
+		s.appendTrainingLog(w, r, orgID)
+	case rest == "v1/guardrail/propose-amendment" && r.Method == http.MethodPost:
+		s.proposeAmendment(w, r, orgID)
 	case rest == "v1/guardrail/auto-judge" && r.Method == http.MethodPost:
 		s.autoJudge(w, r, orgID)
 	case rest == "v1/guardrail/training-log" && r.Method == http.MethodGet:

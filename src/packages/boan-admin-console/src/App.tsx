@@ -13,6 +13,7 @@ import AuditLog from "./pages/AuditLog";
 import Credentials from "./pages/Credentials";
 import Approvals from "./pages/Approvals";
 import Users from "./pages/Users";
+import FileManager from "./pages/FileManager";
 import MyBoanClaw from "./pages/MyBoanClaw";
 import MyGCP from "./pages/MyGCP";
 
@@ -40,23 +41,24 @@ function Shell() {
 
   const canEdit = user.can_edit;
 
-  const NAV_ITEMS = canEdit
+  type NavItem = { path: string; label: string; icon: string; separator?: boolean };
+  const NAV_ITEMS: NavItem[] = canEdit
     ? [
         { path: "/", label: "Dashboard", icon: "📊" },
-        { path: "/org", label: "Org Settings", icon: "🏢" },
-        { path: "/policies", label: "Policies", icon: "📋" },
-        { path: "/llm-registry", label: "LLM Registry", icon: "🤖" },
-        { path: "/audit", label: "Audit Log", icon: "📝" },
+        { path: "/gateway", label: "Gateway Policies", icon: "🛡️" },
         { path: "/credentials", label: "Credentials", icon: "🔑" },
         { path: "/approvals", label: "Approvals", icon: "✅" },
+        { path: "/audit", label: "Audit Log", icon: "📝" },
         { path: "/users", label: "Users", icon: "👥" },
-        { path: "/my-boanclaw", label: "내 BoanClaw", icon: "🦞" },
-        { path: "/my-gcp", label: "내 작업 컴퓨터", icon: "🖥️" },
+        { path: "/files", label: "File Manager", icon: "📂", separator: true },
+        { path: "/my-boanclaw", label: "BoanClaw", icon: "🦞" },
+        { path: "/my-gcp", label: "Personal Computer", icon: "🖥️" },
       ]
     : [
         { path: "/org-overview", label: "조직 설정 확인", icon: "🏢" },
-        { path: "/my-boanclaw", label: "내 BoanClaw", icon: "🦞" },
-        { path: "/my-gcp", label: "내 작업 컴퓨터", icon: "🖥️" },
+        { path: "/files", label: "File Manager", icon: "📂", separator: true },
+        { path: "/my-boanclaw", label: "BoanClaw", icon: "🦞" },
+        { path: "/my-gcp", label: "Personal Computer", icon: "🖥️" },
       ];
 
   const fullBleed = location.pathname === "/my-boanclaw" || location.pathname === "/my-gcp";
@@ -83,21 +85,23 @@ function Shell() {
 
         <nav className="flex-1 py-4 space-y-1">
           {NAV_ITEMS.map((item) => (
-            <NavLink
-              key={item.path}
-              to={item.path}
-              end={item.path === "/"}
-              className={({ isActive }) =>
-                `flex items-center gap-3 px-4 py-2.5 text-sm transition-colors ${
-                  isActive
-                    ? "bg-white/10 text-white font-medium"
-                    : "text-white/60 hover:bg-white/5 hover:text-white"
-                }`
-              }
-            >
-              <span>{item.icon}</span>
-              {sidebarOpen && <span>{item.label}</span>}
-            </NavLink>
+            <div key={item.path}>
+              {item.separator && <div className="mx-4 my-2 border-t border-white/10" />}
+              <NavLink
+                to={item.path}
+                end={item.path === "/"}
+                className={({ isActive }) =>
+                  `flex items-center gap-3 px-4 py-2.5 text-sm transition-colors ${
+                    isActive
+                      ? "bg-white/10 text-white font-medium"
+                      : "text-white/60 hover:bg-white/5 hover:text-white"
+                  }`
+                }
+              >
+                <span>{item.icon}</span>
+                {sidebarOpen && <span>{item.label}</span>}
+              </NavLink>
+            </div>
           ))}
         </nav>
 
@@ -146,12 +150,14 @@ function Shell() {
               <Route path="/" element={canEdit ? <Dashboard /> : <Navigate to="/org-overview" replace />} />
               <Route path="/org" element={canEdit ? <OrgSettings /> : <ReadOnly />} />
               <Route path="/org-overview" element={<OrgOverview />} />
-              <Route path="/policies" element={canEdit ? <Policies /> : <ReadOnly />} />
+              <Route path="/gateway" element={canEdit ? <Policies /> : <ReadOnly />} />
+              <Route path="/policies" element={<Navigate to="/gateway" replace />} />
               <Route path="/llm-registry" element={<LLMRegistry />} />
               <Route path="/audit" element={<AuditLog />} />
               <Route path="/credentials" element={canEdit ? <Credentials /> : <ReadOnly />} />
               <Route path="/approvals" element={canEdit ? <Approvals /> : <ReadOnly />} />
               <Route path="/users" element={canEdit ? <Users /> : <ReadOnly />} />
+              <Route path="/files" element={<FileManager />} />
               <Route path="/my-boanclaw" element={null} />
               <Route path="/my-gcp" element={null} />
             </Routes>

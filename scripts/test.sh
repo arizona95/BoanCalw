@@ -37,6 +37,20 @@ else
   echo "  node not found, skipping TS tests"
 fi
 
+# ── 통합 테스트 (실행 중인 서비스 대상) ──
+echo "▶ Integration tests"
+for script in "$ROOT/scripts/test-access-level-api.sh" "$ROOT/scripts/test-network-policy.sh" "$ROOT/scripts/test-computer-use.sh"; do
+  if [ -x "$script" ]; then
+    echo "  running $(basename "$script")..."
+    if bash "$script"; then
+      echo "  PASS $(basename "$script")"
+    else
+      echo "  FAIL $(basename "$script")"
+      ERRORS=$((ERRORS+1))
+    fi
+  fi
+done
+
 if [ $ERRORS -gt 0 ]; then
   echo "tests completed with $ERRORS failure(s)"
   exit 1
