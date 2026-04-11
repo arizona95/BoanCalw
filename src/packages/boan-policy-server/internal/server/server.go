@@ -223,20 +223,74 @@ func (s *Server) updatePolicy(w http.ResponseWriter, r *http.Request, orgID stri
 	if len(incoming.RBAC.Roles) > 0 || incoming.RBAC.DefaultRole != "" || incoming.RBAC.EnforceStrict {
 		p.RBAC = incoming.RBAC
 	}
-	if len(incoming.AllowModels) > 0 {
-		p.AllowModels = incoming.AllowModels
-	}
-	if incoming.Features != nil {
-		p.Features = incoming.Features
-	}
 	if incoming.VersionPolicy.MinVersion != "" || len(incoming.VersionPolicy.BlockedVersions) > 0 || incoming.VersionPolicy.UpdateChannel != "" {
 		p.VersionPolicy = incoming.VersionPolicy
 	}
-	if incoming.OrgSettings.OrgName != "" || len(incoming.OrgSettings.AllowedSSO) > 0 || len(incoming.OrgSettings.AdminEmails) > 0 || incoming.OrgSettings.SeatLimit != 0 || incoming.OrgSettings.GCPOrgID != "" || incoming.OrgSettings.WorkspaceURL != "" || incoming.OrgSettings.MountRoot != "" {
-		p.OrgSettings = incoming.OrgSettings
+	if incoming.OrgSettings.OrgName != "" || len(incoming.OrgSettings.AllowedSSO) > 0 || len(incoming.OrgSettings.AdminEmails) > 0 || incoming.OrgSettings.SeatLimit != 0 || incoming.OrgSettings.GCPOrgID != "" || incoming.OrgSettings.WorkspaceURL != "" || incoming.OrgSettings.MountRules != nil {
+		// Preserve fields that the caller did not provide.
+		merged := p.OrgSettings
+		if incoming.OrgSettings.OrgName != "" {
+			merged.OrgName = incoming.OrgSettings.OrgName
+		}
+		if len(incoming.OrgSettings.AllowedSSO) > 0 {
+			merged.AllowedSSO = incoming.OrgSettings.AllowedSSO
+		}
+		if len(incoming.OrgSettings.AdminEmails) > 0 {
+			merged.AdminEmails = incoming.OrgSettings.AdminEmails
+		}
+		if incoming.OrgSettings.SeatLimit != 0 {
+			merged.SeatLimit = incoming.OrgSettings.SeatLimit
+		}
+		if incoming.OrgSettings.GCPOrgID != "" {
+			merged.GCPOrgID = incoming.OrgSettings.GCPOrgID
+		}
+		if incoming.OrgSettings.WorkspaceURL != "" {
+			merged.WorkspaceURL = incoming.OrgSettings.WorkspaceURL
+		}
+		if incoming.OrgSettings.MountRules != nil {
+			// Normalize each rule's Mode field.
+			rules := make([]policy.MountRule, 0, len(incoming.OrgSettings.MountRules))
+			for _, mr := range incoming.OrgSettings.MountRules {
+				if strings.TrimSpace(mr.Pattern) == "" {
+					continue
+				}
+				rules = append(rules, policy.MountRule{
+					Pattern: strings.TrimSpace(mr.Pattern),
+					Mode:    policy.NormalizeMountMode(mr.Mode),
+				})
+			}
+			merged.MountRules = rules
+		}
+		// MountRoot is not user-writable; always pull from env var.
+		merged.MountRoot = policy.MountRootFromEnv()
+		p.OrgSettings = merged
 	}
+	// Guardrail: 부분 업데이트 (필드별로 merge). 클라이언트가 보낸 필드만 덮어씀.
 	if strings.TrimSpace(incoming.Guardrail.Constitution) != "" {
-		p.Guardrail = incoming.Guardrail
+		p.Guardrail.Constitution = incoming.Guardrail.Constitution
+	}
+	if incoming.Guardrail.G1CustomPatterns != nil {
+		// 빈 패턴 제거 및 trim, mode normalize
+		cleaned := make([]policy.G1CustomPattern, 0, len(incoming.Guardrail.G1CustomPatterns))
+		for _, pat := range incoming.Guardrail.G1CustomPatterns {
+			pattern := strings.TrimSpace(pat.Pattern)
+			if pattern == "" {
+				continue
+			}
+			mode := strings.ToLower(strings.TrimSpace(pat.Mode))
+			if mode != "credential" && mode != "block" {
+				mode = "block" // default to safer block mode
+			}
+			cleaned = append(cleaned, policy.G1CustomPattern{
+				Pattern:     pattern,
+				Description: strings.TrimSpace(pat.Description),
+				Mode:        mode,
+			})
+		}
+		p.Guardrail.G1CustomPatterns = cleaned
+	}
+	if incoming.Guardrail.G3WikiHint != "" {
+		p.Guardrail.G3WikiHint = incoming.Guardrail.G3WikiHint
 	}
 
 	p.OrgID = orgID
@@ -321,9 +375,9 @@ func (s *Server) getOrgSettings(w http.ResponseWriter, orgID string) {
 			"seat_limit":     p.OrgSettings.SeatLimit,
 			"gcp_org_id":     p.OrgSettings.GCPOrgID,
 			"workspace_url":  p.OrgSettings.WorkspaceURL,
+			"mount_root":     p.OrgSettings.MountRoot,
+			"mount_rules":    p.OrgSettings.MountRules,
 			"version_policy": p.VersionPolicy,
-			"allow_models":   p.AllowModels,
-			"features":       p.Features,
 		},
 		"updated_at": p.UpdatedAt,
 	})
@@ -599,27 +653,6 @@ func applyOrgSettingsPatch(p *policy.Policy, settings map[string]interface{}) er
 			return fmt.Errorf("version_policy: %w", err)
 		}
 		p.VersionPolicy = versionPolicy
-	}
-	if raw, ok := settings["allow_models"]; ok {
-		var allowModels []string
-		if err := remarshal(raw, &allowModels); err != nil {
-			return fmt.Errorf("allow_models: %w", err)
-		}
-		p.AllowModels = allowModels
-	}
-	if raw, ok := settings["features"]; ok {
-		var features map[string]bool
-		if err := remarshal(raw, &features); err != nil {
-			return fmt.Errorf("features: %w", err)
-		}
-		p.Features = features
-	}
-	if raw, ok := settings["auto_approve_mode"]; ok {
-		var v bool
-		if err := remarshal(raw, &v); err != nil {
-			return fmt.Errorf("auto_approve_mode: %w", err)
-		}
-		p.Guardrail.AutoApproveMode = v
 	}
 	return nil
 }

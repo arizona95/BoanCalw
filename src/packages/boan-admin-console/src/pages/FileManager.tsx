@@ -1,12 +1,14 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useMemo, useState, useCallback } from "react";
 
 interface FileEntry {
   name: string;
   is_dir: boolean;
   size: number;
+  modified: number; // unix seconds
 }
 
 type Side = "s2" | "s1";
+type SortBy = "modified" | "name";
 
 const SIDE_LABEL: Record<Side, string> = {
   s2: "S2 Sandbox (Mount)",
@@ -39,7 +41,22 @@ function formatSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function FilePane({ side, onDragFile }: { side: Side; onDragFile?: (fileName: string, srcSide: Side, srcPath: string) => void }) {
+// 폴더 탐색기 관례: 디렉토리를 항상 위에 고정하고 그 안에서 선택된 기준으로 정렬.
+// modified 는 최신 우선(desc), name 은 가나다/알파벳(asc, locale-aware).
+function sortFiles(files: FileEntry[], sortBy: SortBy): FileEntry[] {
+  const sorted = [...files];
+  sorted.sort((a, b) => {
+    if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
+    if (sortBy === "modified") {
+      if (b.modified !== a.modified) return b.modified - a.modified;
+      return a.name.localeCompare(b.name);
+    }
+    return a.name.localeCompare(b.name);
+  });
+  return sorted;
+}
+
+function FilePane({ side, sortBy }: { side: Side; sortBy: SortBy }) {
   const [path, setPath] = useState("");
   const [files, setFiles] = useState<FileEntry[]>([]);
   const [loading, setLoading] = useState(true);
@@ -50,6 +67,8 @@ function FilePane({ side, onDragFile }: { side: Side; onDragFile?: (fileName: st
   }, [side, path]);
 
   useEffect(() => { load(); }, [load]);
+
+  const sortedFiles = useMemo(() => sortFiles(files, sortBy), [files, sortBy]);
 
   const navigateUp = () => {
     const parts = path.split("/").filter(Boolean);
@@ -78,11 +97,11 @@ function FilePane({ side, onDragFile }: { side: Side; onDragFile?: (fileName: st
       <div className="bg-white overflow-y-auto" style={{ height: "calc(100% - 80px)" }}>
         {loading ? (
           <p className="p-4 text-xs text-gray-400">Loading...</p>
-        ) : files.length === 0 ? (
+        ) : sortedFiles.length === 0 ? (
           <p className="p-4 text-xs text-gray-400 text-center">Empty</p>
         ) : (
           <div className="divide-y divide-gray-100">
-            {files.map((f) => (
+            {sortedFiles.map((f) => (
               <div
                 key={f.name}
                 className={`flex items-center gap-2 px-3 py-2 text-xs hover:bg-gray-50 ${f.is_dir ? "cursor-pointer" : "cursor-grab"}`}
@@ -112,6 +131,7 @@ export default function FileManager() {
   const [msg, setMsg] = useState<{ type: "ok" | "err" | "warn"; text: string } | null>(null);
   const [transferring, setTransferring] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
+  const [sortBy, setSortBy] = useState<SortBy>("modified");
 
   const handleDrop = async (e: React.DragEvent, targetSide: Side) => {
     e.preventDefault();
@@ -146,9 +166,25 @@ export default function FileManager() {
     <div className="h-full flex flex-col">
       <div className="flex items-center justify-between mb-3">
         <h1 className="text-xl font-bold">File Manager</h1>
-        <p className="text-xs text-gray-500">
-          S2→S1 : 가드레일 검사 &nbsp;|&nbsp; S1→S2 : 통과 &nbsp;|&nbsp; 폴더 전송 불가, 파일만
-        </p>
+        <div className="flex items-center gap-3">
+          <div className="inline-flex rounded-lg border border-gray-200 overflow-hidden text-xs">
+            <button
+              onClick={() => setSortBy("modified")}
+              className={`px-3 py-1 ${sortBy === "modified" ? "bg-gray-800 text-white" : "bg-white text-gray-600 hover:bg-gray-50"}`}
+            >
+              최신수정순
+            </button>
+            <button
+              onClick={() => setSortBy("name")}
+              className={`px-3 py-1 border-l border-gray-200 ${sortBy === "name" ? "bg-gray-800 text-white" : "bg-white text-gray-600 hover:bg-gray-50"}`}
+            >
+              이름순
+            </button>
+          </div>
+          <p className="text-xs text-gray-500">
+            S2→S1 : 가드레일 검사 &nbsp;|&nbsp; S1→S2 : 통과 &nbsp;|&nbsp; 폴더 전송 불가, 파일만
+          </p>
+        </div>
       </div>
 
       {msg && (
@@ -164,7 +200,7 @@ export default function FileManager() {
           onDrop={(e) => handleDrop(e, "s2")}
           key={`s2-${refreshKey}`}
         >
-          <FilePane side="s2" />
+          <FilePane side="s2" sortBy={sortBy} />
         </div>
 
         <div className="flex flex-col items-center justify-center gap-2 px-2">
@@ -179,7 +215,7 @@ export default function FileManager() {
           onDrop={(e) => handleDrop(e, "s1")}
           key={`s1-${refreshKey}`}
         >
-          <FilePane side="s1" />
+          <FilePane side="s1" sortBy={sortBy} />
         </div>
       </div>
     </div>

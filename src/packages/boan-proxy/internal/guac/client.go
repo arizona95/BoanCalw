@@ -47,7 +47,9 @@ func (c *Client) Enabled() bool {
 	return c.baseURL != "" && c.username != "" && c.password != ""
 }
 
-func (c *Client) EnsureSessionURL(ctx context.Context, ws *userstore.Workstation) (string, error) {
+// EnsureSessionURL — drivePath 는 Guacamole RDP 세션에 마운트할 가상 드라이브 경로 (guacd 컨테이너 기준).
+// 비어 있으면 drive redirection 비활성. File Manager S2↔S1 전송이 이 경로를 통해 RDP virtual channel 로 흐름.
+func (c *Client) EnsureSessionURL(ctx context.Context, ws *userstore.Workstation, drivePath string) (string, error) {
 	if !c.Enabled() || ws == nil {
 		return "", nil
 	}
@@ -60,7 +62,7 @@ func (c *Client) EnsureSessionURL(ctx context.Context, ws *userstore.Workstation
 		return "", err
 	}
 
-	connectionID, err := c.ensureConnection(ctx, authToken, dataSource, ws)
+	connectionID, err := c.ensureConnection(ctx, authToken, dataSource, ws, drivePath)
 	if err != nil {
 		return "", err
 	}
@@ -100,19 +102,19 @@ func (c *Client) login(ctx context.Context) (string, string, error) {
 	return out.AuthToken, out.DataSource, nil
 }
 
-func (c *Client) ensureConnection(ctx context.Context, token, dataSource string, ws *userstore.Workstation) (string, error) {
+func (c *Client) ensureConnection(ctx context.Context, token, dataSource string, ws *userstore.Workstation, drivePath string) (string, error) {
 	name := ws.DisplayName
 	connections, err := c.listConnections(ctx, token, dataSource)
 	if err != nil {
 		return "", err
 	}
 	if existingID := findConnectionID(connections, name); existingID != "" {
-		if err := c.updateConnection(ctx, token, dataSource, existingID, ws); err != nil {
+		if err := c.updateConnection(ctx, token, dataSource, existingID, ws, drivePath); err != nil {
 			return "", err
 		}
 		return existingID, nil
 	}
-	return c.createConnection(ctx, token, dataSource, ws)
+	return c.createConnection(ctx, token, dataSource, ws, drivePath)
 }
 
 func (c *Client) listConnections(ctx context.Context, token, dataSource string) (map[string]connection, error) {
@@ -137,8 +139,8 @@ func (c *Client) listConnections(ctx context.Context, token, dataSource string) 
 	return out, nil
 }
 
-func (c *Client) createConnection(ctx context.Context, token, dataSource string, ws *userstore.Workstation) (string, error) {
-	body, err := json.Marshal(connectionPayload(ws))
+func (c *Client) createConnection(ctx context.Context, token, dataSource string, ws *userstore.Workstation, drivePath string) (string, error) {
+	body, err := json.Marshal(connectionPayload(ws, drivePath))
 	if err != nil {
 		return "", err
 	}
@@ -166,8 +168,8 @@ func (c *Client) createConnection(ctx context.Context, token, dataSource string,
 	return out.Identifier, nil
 }
 
-func (c *Client) updateConnection(ctx context.Context, token, dataSource, id string, ws *userstore.Workstation) error {
-	body, err := json.Marshal(connectionPayload(ws))
+func (c *Client) updateConnection(ctx context.Context, token, dataSource, id string, ws *userstore.Workstation, drivePath string) error {
+	body, err := json.Marshal(connectionPayload(ws, drivePath))
 	if err != nil {
 		return err
 	}
@@ -188,10 +190,32 @@ func (c *Client) updateConnection(ctx context.Context, token, dataSource, id str
 	return nil
 }
 
-func connectionPayload(ws *userstore.Workstation) map[string]any {
+func connectionPayload(ws *userstore.Workstation, drivePath string) map[string]any {
 	port := ws.RemotePort
 	if port == 0 {
 		port = 3389
+	}
+	params := map[string]string{
+		"hostname":         ws.RemoteHost,
+		"port":             fmt.Sprintf("%d", port),
+		"username":         ws.RemoteUser,
+		"password":         ws.RemotePass,
+		"security":         "any",
+		"ignore-cert":      "true",
+		"resize-method":    "display-update",
+		"disable-copy":     "false",
+		"disable-paste":    "false",
+		"enable-wallpaper": "true",
+		"enable-theming":   "true",
+	}
+	// RDP drive redirection — File Manager S2↔S1 전송용 가상 드라이브.
+	// drivePath 는 guacd 컨테이너 내부 경로. boan-sandbox 와 boan-guacd 가
+	// 동일 볼륨(boan-rdp-transfer)을 공유해서 양쪽이 같은 파일을 본다.
+	if strings.TrimSpace(drivePath) != "" {
+		params["enable-drive"] = "true"
+		params["create-drive-path"] = "true"
+		params["drive-path"] = drivePath
+		params["drive-name"] = "BoanClaw"
 	}
 	return map[string]any{
 		"parentIdentifier": "ROOT",
@@ -206,19 +230,7 @@ func connectionPayload(ws *userstore.Workstation) map[string]any {
 			"guacd-port":               "",
 			"guacd-encryption":         "",
 		},
-		"parameters": map[string]string{
-			"hostname":         ws.RemoteHost,
-			"port":             fmt.Sprintf("%d", port),
-			"username":         ws.RemoteUser,
-			"password":         ws.RemotePass,
-			"security":         "any",
-			"ignore-cert":      "true",
-			"resize-method":    "display-update",
-			"disable-copy":     "false",
-			"disable-paste":    "false",
-			"enable-wallpaper": "true",
-			"enable-theming":   "true",
-		},
+		"parameters": params,
 	}
 }
 

@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/oauth2"
@@ -20,8 +22,9 @@ import (
 )
 
 type gcpProvisioner struct {
-	cfg    *config.Config
-	client *http.Client
+	cfg            *config.Config
+	client         *http.Client
+	firewallOnce   sync.Once
 }
 
 type gcpInstance struct {
@@ -111,6 +114,13 @@ func (p *gcpProvisioner) Ensure(ctx context.Context, email, orgID string, curren
 	if remotePass == "" {
 		remotePass = randomPassword()
 	}
+
+	// 첫 인스턴스 생성 전에 firewall rules 보장 (RDP 3389 + SSH 22)
+	p.firewallOnce.Do(func() {
+		if err := p.ensureFirewallRules(ctx); err != nil {
+			log.Printf("[gcp-provisioner] firewall ensure failed (proceeding anyway): %v", err)
+		}
+	})
 
 	instance, err := p.findExisting(ctx, email, orgID)
 	if err != nil {
@@ -619,15 +629,107 @@ func randomPassword() string {
 	return string(buf)
 }
 
+// ensureFirewallRules — boan-workstation 태그 인스턴스에 RDP(3389) ingress 허용.
+// 파일 전송도 RDP virtual channel(drive redirection)을 통해 같은 포트로 흐른다.
+// 이미 존재하면 무시.
+func (p *gcpProvisioner) ensureFirewallRules(ctx context.Context) error {
+	tagItems := splitCSV(strings.TrimSpace(p.cfg.WorkstationNetworkTags))
+	if len(tagItems) == 0 {
+		tagItems = []string{"boan-workstation"}
+	}
+
+	rules := []struct {
+		name string
+		port string
+	}{
+		{name: "boan-workstation-allow-rdp", port: "3389"},
+	}
+
+	for _, r := range rules {
+		if err := p.ensureFirewallRule(ctx, r.name, r.port, tagItems); err != nil {
+			return fmt.Errorf("rule %s: %w", r.name, err)
+		}
+	}
+	return nil
+}
+
+func (p *gcpProvisioner) ensureFirewallRule(ctx context.Context, name, port string, targetTags []string) error {
+	getURL := fmt.Sprintf(
+		"https://compute.googleapis.com/compute/v1/projects/%s/global/firewalls/%s",
+		url.PathEscape(p.cfg.WorkstationProjectID),
+		url.PathEscape(name),
+	)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, getURL, nil)
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		log.Printf("[gcp-provisioner] firewall rule %s already exists", name)
+		return nil
+	}
+	if resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("get firewall returned %d", resp.StatusCode)
+	}
+
+	// 없음 → 생성
+	payload := map[string]any{
+		"name":         name,
+		"direction":    "INGRESS",
+		"priority":     1000,
+		"sourceRanges": []string{"0.0.0.0/0"},
+		"targetTags":   targetTags,
+		"allowed": []map[string]any{
+			{"IPProtocol": "tcp", "ports": []string{port}},
+		},
+	}
+	raw, _ := json.Marshal(payload)
+	createURL := fmt.Sprintf(
+		"https://compute.googleapis.com/compute/v1/projects/%s/global/firewalls",
+		url.PathEscape(p.cfg.WorkstationProjectID),
+	)
+	cReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, createURL, bytes.NewReader(raw))
+	cReq.Header.Set("Content-Type", "application/json")
+	cResp, err := p.client.Do(cReq)
+	if err != nil {
+		return err
+	}
+	defer cResp.Body.Close()
+	if cResp.StatusCode < 200 || cResp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(cResp.Body, 4096))
+		return fmt.Errorf("create firewall returned %d: %s", cResp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	log.Printf("[gcp-provisioner] created firewall rule %s (port %s)", name, port)
+	return nil
+}
+
 func startupScript(username, password string) string {
+	// 부팅 시 사용자 계정 생성 + RDP 활성화 + Desktop\boanclaw 폴더 생성.
+	// 파일 전송은 Guacamole RDP drive redirection (3389/RDP virtual channel) 으로 처리하므로
+	// OpenSSH/SCP 설치가 필요 없다.
 	return fmt.Sprintf(`
 $ErrorActionPreference = "Stop"
+
+# ── 계정 생성 / 비밀번호 설정 ─────────────────────────────────────────
 $securePassword = ConvertTo-SecureString "%s" -AsPlainText -Force
 if (-not (Get-LocalUser -Name "%s" -ErrorAction SilentlyContinue)) {
   New-LocalUser -Name "%s" -Password $securePassword -PasswordNeverExpires -AccountNeverExpires
+} else {
+  Set-LocalUser -Name "%s" -Password $securePassword
 }
 Add-LocalGroupMember -Group "Administrators" -Member "%s" -ErrorAction SilentlyContinue
+
+# ── RDP 활성화 ────────────────────────────────────────────────────────
 Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
 Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-`, password, username, username, username)
+
+# ── 사용자 Desktop\boanclaw 폴더 생성 (사용자가 RDP 안에서 BoanClaw 드라이브와 파일을 주고받는 작업 폴더) ─────────────
+$userProfile = "C:\Users\%s"
+$desktopBoanclaw = Join-Path $userProfile "Desktop\boanclaw"
+if (-not (Test-Path $desktopBoanclaw)) {
+  New-Item -ItemType Directory -Path $desktopBoanclaw -Force | Out-Null
+}
+icacls $desktopBoanclaw /grant "%s:(OI)(CI)F" /T 2>&1 | Out-Null
+`, password, username, username, username, username, username, username)
 }

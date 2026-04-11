@@ -9,7 +9,17 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
     headers: { "Content-Type": "application/json" },
     ...init,
   });
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (!res.ok) {
+    // 응답 body에서 error/detail 추출
+    let detail = "";
+    try {
+      const errBody = await res.clone().json() as { error?: string; detail?: string };
+      detail = [errBody.error, errBody.detail].filter(Boolean).join(" — ");
+    } catch {
+      detail = await res.text();
+    }
+    throw new Error(detail || `${res.status} ${res.statusText}`);
+  }
   const text = await res.text();
   if (!text) return undefined as T;
   return JSON.parse(text) as T;
@@ -23,8 +33,6 @@ export interface OrgPolicy {
   network_whitelist?: NetworkEndpoint[];
   dlp_rules?: unknown[];
   rbac?: unknown;
-  allow_models?: string[];
-  features?: Record<string, boolean>;
   version_policy?: VersionPolicy;
   org_settings?: OrgPolicySettings;
   guardrail?: GuardrailConfig;
@@ -50,11 +58,28 @@ export interface OrgPolicySettings {
   gcp_org_id?: string;
   workspace_url?: string;
   mount_root?: string;
+  mount_rules?: MountRule[];
+}
+
+export interface MountRule {
+  pattern: string;        // 정규식 (mount_root 하위 상대경로 기준)
+  mode: "deny" | "ask";   // deny=읽기만 가능, ask=접근 시 사용자 본인에게 HITL 확인
+}
+
+export interface G1CustomPattern {
+  pattern: string;
+  description?: string;
+  mode?: "credential" | "block"; // default "block"
 }
 
 export interface GuardrailConfig {
+  g1_custom_patterns?: G1CustomPattern[];
   constitution?: string;
-  auto_approve_mode?: boolean;
+  g3_wiki_hint?: string;
+  llm_url?: string;
+  llm_model?: string;
+  wiki_llm_url?: string;
+  wiki_llm_model?: string;
 }
 
 export interface LLMEntry {
@@ -64,6 +89,7 @@ export interface LLMEntry {
   scope?: string;
   curl_template?: string;
   image_curl_template?: string;
+  roles?: string[];
   is_security_llm?: boolean;
   is_security_lmm?: boolean;
   healthy?: boolean;
@@ -162,6 +188,14 @@ export const registryApi = {
     request<LLMEntry>(`${REGISTRY_BASE}/v1/llms/${name}/bind-security-lmm`, {
       method: "POST",
     }),
+  bindRole: (name: string, role: "chat" | "vision" | "grounding" | "g2" | "g3") =>
+    request<{ status: string; name: string; role: string }>(`${REGISTRY_BASE}/v1/llms/${name}/bind-role/${role}`, {
+      method: "POST",
+    }),
+  unbindRole: (name: string, role: "chat" | "vision" | "grounding" | "g2" | "g3") =>
+    request<{ status: string; name: string; role: string }>(`${REGISTRY_BASE}/v1/llms/${name}/unbind-role/${role}`, {
+      method: "POST",
+    }),
   remove: (name: string) =>
     request<void>(`${REGISTRY_BASE}/v1/llms/${name}`, { method: "DELETE" }),
   clearHistory: () =>
@@ -201,6 +235,30 @@ export const credentialApi = {
     request<void>(`${CREDENTIAL_BASE}/v1/passthrough/${encodeURIComponent(name)}`, {
       method: "DELETE",
     }),
+};
+
+export interface CredentialRequestItem {
+  id: string;
+  role_name: string;
+  description: string;
+  created_at: string;
+}
+
+export const credentialRequestApi = {
+  list: () =>
+    request<CredentialRequestItem[]>("/api/credential-requests"),
+  create: (roleName: string, description: string) =>
+    request<CredentialRequestItem>("/api/credential-requests", {
+      method: "POST",
+      body: JSON.stringify({ role_name: roleName, description }),
+    }),
+  fulfill: (id: string, key: string, ttlHours = 8760) =>
+    request<{ status: string; role: string }>(`/api/credential-requests/${id}/fulfill`, {
+      method: "POST",
+      body: JSON.stringify({ key, ttl_hours: ttlHours }),
+    }),
+  remove: (id: string) =>
+    request<void>(`/api/credential-requests/${id}`, { method: "DELETE" }),
 };
 
 export interface ApprovalRequest {
@@ -316,6 +374,33 @@ export const openclawApi = {
     request<OpenClawDashboard>("/api/openclaw/dashboard", {
       credentials: "include",
     }),
+};
+
+export interface MountConfigPath {
+  env_var: string;
+  value: string;
+}
+
+export interface MountConfig {
+  org_id: string;
+  mount_root: string;
+  paths: {
+    host_s3: MountConfigPath;
+    sandbox_s2: MountConfigPath;
+    s1_stage: MountConfigPath;
+  };
+}
+
+export const mountApi = {
+  config: () => request<MountConfig>("/api/mount/config"),
+};
+
+export interface G1DefaultsResponse {
+  patterns: string[];
+}
+
+export const guardrailApi = {
+  g1Defaults: () => request<G1DefaultsResponse>("/api/guardrail/g1-defaults"),
 };
 
 export const workstationApi = {

@@ -37,14 +37,72 @@ done
 
 /mount-check.sh
 
+# ── OpenClaw 무결성 검증 (fail-closed) ──────────────────────────────────────
+# Dockerfile 빌드 시점에 핀한 버전과 sha256 을 /opt/boanclaw-meta 에 저장한다.
+# 런타임에 같은 값을 다시 계산해서 (a) 버전 변조, (b) 바이너리 변조 둘 다 검사.
+# 추가로 BOAN_OPENCLAW_ALLOWED_VERSIONS (콤마구분) 가 있으면 그 allowlist 에
+# 포함되어야만 통과 — 정책 서버나 compose 가 동적으로 좁힐 수 있는 두 번째 게이트.
+echo "[boan-sandbox] verifying OpenClaw integrity..."
+OPENCLAW_DIR="$(npm config get prefix)/lib/node_modules/openclaw"
+OPENCLAW_MJS="${OPENCLAW_DIR}/openclaw.mjs"
+META_DIR="/opt/boanclaw-meta"
+
+if [ ! -f "${META_DIR}/openclaw.version" ] || [ ! -f "${META_DIR}/openclaw.mjs.sha256" ]; then
+    echo "[boan-sandbox] FATAL: openclaw integrity metadata missing in ${META_DIR}"
+    echo "[boan-sandbox] sandbox image was not built with version pinning — refusing to start"
+    exit 1
+fi
+
+EXPECTED_VERSION="$(cat "${META_DIR}/openclaw.version")"
+EXPECTED_HASH="$(cat "${META_DIR}/openclaw.mjs.sha256")"
+
+if [ ! -f "${OPENCLAW_MJS}" ]; then
+    echo "[boan-sandbox] FATAL: openclaw entry point not found at ${OPENCLAW_MJS}"
+    exit 1
+fi
+
+ACTUAL_VERSION="$(node -e "console.log(require('${OPENCLAW_DIR}/package.json').version)" 2>/dev/null || echo unknown)"
+ACTUAL_HASH="$(sha256sum "${OPENCLAW_MJS}" | awk '{print $1}')"
+
+if [ "${ACTUAL_VERSION}" != "${EXPECTED_VERSION}" ]; then
+    echo "[boan-sandbox] FATAL: OpenClaw version mismatch"
+    echo "  expected: ${EXPECTED_VERSION}"
+    echo "  actual:   ${ACTUAL_VERSION}"
+    echo "[boan-sandbox] supply-chain integrity broken — refusing to start"
+    exit 1
+fi
+if [ "${ACTUAL_HASH}" != "${EXPECTED_HASH}" ]; then
+    echo "[boan-sandbox] FATAL: OpenClaw binary hash mismatch"
+    echo "  expected: ${EXPECTED_HASH}"
+    echo "  actual:   ${ACTUAL_HASH}"
+    echo "[boan-sandbox] openclaw.mjs has been modified after build — refusing to start"
+    exit 1
+fi
+
+# 옵션: 런타임 allowlist (정책 서버나 compose env 로 좁히기)
+if [ -n "${BOAN_OPENCLAW_ALLOWED_VERSIONS:-}" ]; then
+    case ",${BOAN_OPENCLAW_ALLOWED_VERSIONS}," in
+        *",${ACTUAL_VERSION},"*)
+            : # OK
+            ;;
+        *)
+            echo "[boan-sandbox] FATAL: OpenClaw ${ACTUAL_VERSION} not in allowed versions (${BOAN_OPENCLAW_ALLOWED_VERSIONS})"
+            exit 1
+            ;;
+    esac
+fi
+
+echo "[boan-sandbox] OpenClaw OK: ${ACTUAL_VERSION} (sha256: $(echo "${ACTUAL_HASH}" | cut -c1-16)...)"
+# ───────────────────────────────────────────────────────────────────────────
+
 mkdir -p /workspace/boanclaw
 mkdir -p /tmp/boan/users /tmp/boan/registry /tmp/boan/credentials
 mkdir -p /data/users /data/registry /data/credentials
-chown -R boan:boan /workspace /tmp/boan /data /home/boan /etc/boan-cred 2>/dev/null || true
+chown -R boan:boan /workspace /tmp/boan /data /home/boan 2>/dev/null || true
 
-echo "[boan-sandbox] starting credential-filter on :8082"
-BOAN_LISTEN=:8082 BOAN_KMS_KEY="${BOAN_KMS_KEY:-/etc/boan-cred/aes.key}" BOAN_DATA_DIR="${BOAN_CREDENTIAL_DATA_DIR:-/data/credentials}" as_boan boan-credential-filter &
-CRED_PID=$!
+# credential-filter는 독립 컨테이너(S4)에서 실행 — sandbox 내부 실행 제거
+# BOAN_CREDENTIAL_FILTER_URL=http://boan-credential-filter:8082 로 외부 접근
+echo "[boan-sandbox] credential-filter: external container (http://boan-credential-filter:8082)"
 
 echo "[boan-sandbox] starting llm-registry on :8086"
 BOAN_LISTEN=:8086 BOAN_DATA_DIR="${BOAN_DATA_DIR:-/data/registry}" as_boan boan-llm-registry &

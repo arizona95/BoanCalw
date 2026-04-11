@@ -22,13 +22,28 @@ server {
     }
     location / {
         try_files \$uri \$uri/ /index.html;
+        # index.html 은 절대 캐시하지 말 것 — Vite 의 hashed asset 이름이
+        # 매 빌드마다 바뀌므로 index.html 이 stale 이면 옛 bundle 을 계속 fetch.
+        add_header Cache-Control "no-store, no-cache, must-revalidate" always;
+        add_header Pragma "no-cache" always;
+        expires off;
     }
     location /api/ {
         resolver 127.0.0.11 valid=5s;
         set \$upstream http://boan-sandbox:18081;
         proxy_pass \$upstream;
+        # HTTP/1.1 + buffering off 로 NDJSON 스트리밍 즉시 전달 (computer-use agent).
+        # HTTP/1.0 (nginx proxy_pass 기본값) 에서는 chunked 전송 미지원이라
+        # 긴 스트리밍 응답이 중간에 끊김.
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_buffering off;
+        proxy_request_buffering off;
+        chunked_transfer_encoding on;
         proxy_connect_timeout 3s;
-        proxy_read_timeout 120s;
+        # computer-use agent 같은 장시간 스트리밍 응답 대응 (10분)
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header Cookie \$http_cookie;

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -148,6 +149,18 @@ func (s *Store) List() []*User {
 	for _, u := range s.users {
 		out = append(out, u)
 	}
+	// 안정 정렬 — 소유자 최상단, 그 다음 CreatedAt → Email tiebreaker
+	sort.SliceStable(out, func(i, j int) bool {
+		iOwner := roles.Normalize(roles.Role(out[i].Role)) == roles.Owner
+		jOwner := roles.Normalize(roles.Role(out[j].Role)) == roles.Owner
+		if iOwner != jOwner {
+			return iOwner // owner=true 가 먼저
+		}
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.Before(out[j].CreatedAt)
+		}
+		return out[i].Email < out[j].Email
+	})
 	return out
 }
 

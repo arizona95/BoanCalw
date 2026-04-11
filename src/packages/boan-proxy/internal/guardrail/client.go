@@ -20,6 +20,8 @@ type EvaluateRequest struct {
 	Mode        string `json:"mode,omitempty"`
 	UserEmail   string `json:"user_email,omitempty"`
 	AccessLevel string `json:"access_level,omitempty"`
+	LLMURL      string `json:"llm_url,omitempty"`   // proxy가 registry에서 가져온 security LLM URL
+	LLMModel    string `json:"llm_model,omitempty"` // proxy가 registry에서 가져온 security LLM model
 }
 
 type EvaluateResponse struct {
@@ -67,9 +69,9 @@ func (c *Client) doPost(ctx context.Context, url string, req EvaluateRequest) (*
 func (c *Client) Evaluate(ctx context.Context, orgID string, req EvaluateRequest) (*EvaluateResponse, error) {
 	if c == nil || c.baseURL == "" || strings.TrimSpace(orgID) == "" {
 		return &EvaluateResponse{
-			Decision:   "allow",
-			Reason:     "guardrail server unavailable; fail open disabled path not configured",
-			Confidence: 0,
+			Decision:   "block",
+			Reason:     "guardrail server unavailable — fail-closed",
+			Confidence: 1,
 			Tier:       1,
 		}, nil
 	}
@@ -85,9 +87,9 @@ func (c *Client) Evaluate(ctx context.Context, orgID string, req EvaluateRequest
 func (c *Client) WikiEvaluate(ctx context.Context, orgID string, req EvaluateRequest) (*EvaluateResponse, error) {
 	if c == nil || c.baseURL == "" || strings.TrimSpace(orgID) == "" {
 		return &EvaluateResponse{
-			Decision:   "allow",
-			Reason:     "wiki guardrail server unavailable; fail open",
-			Confidence: 0,
+			Decision:   "block",
+			Reason:     "wiki guardrail server unavailable — fail-closed",
+			Confidence: 1,
 			Tier:       2,
 		}, nil
 	}
@@ -98,4 +100,85 @@ func (c *Client) WikiEvaluate(ctx context.Context, orgID string, req EvaluateReq
 	}
 	resp.Tier = 2
 	return resp, nil
+}
+
+// GetConstitution — policy-server에서 헌법 텍스트만 조회 (LLM 호출은 proxy가 직접)
+func (c *Client) GetConstitution(ctx context.Context, orgID string) (string, error) {
+	if c == nil || c.baseURL == "" || strings.TrimSpace(orgID) == "" {
+		return "", fmt.Errorf("policy server unavailable")
+	}
+	url := fmt.Sprintf("%s/org/%s/v1/policy", c.baseURL, orgID)
+	httpReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	resp, err := c.http.Do(httpReq)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return "", fmt.Errorf("policy server returned %d", resp.StatusCode)
+	}
+	var p struct {
+		Guardrail struct {
+			Constitution string `json:"constitution"`
+		} `json:"guardrail"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
+		return "", err
+	}
+	return p.Guardrail.Constitution, nil
+}
+
+// GuardrailG1Rule — input_gate 로 전달할 G1 정규식 + mode
+type GuardrailG1Rule struct {
+	Pattern string
+	Mode    string // "credential" | "block"
+}
+
+// GetGuardrailRules — policy-server에서 G1 patterns + G3 wiki hint 조회
+// (헌법은 GetConstitution 별도)
+type GuardrailRules struct {
+	G1Patterns []GuardrailG1Rule
+	G3WikiHint string
+}
+
+func (c *Client) GetGuardrailRules(ctx context.Context, orgID string) (*GuardrailRules, error) {
+	if c == nil || c.baseURL == "" || strings.TrimSpace(orgID) == "" {
+		return &GuardrailRules{}, nil
+	}
+	url := fmt.Sprintf("%s/org/%s/v1/policy", c.baseURL, orgID)
+	httpReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	resp, err := c.http.Do(httpReq)
+	if err != nil {
+		return &GuardrailRules{}, nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return &GuardrailRules{}, nil
+	}
+	var p struct {
+		Guardrail struct {
+			G1CustomPatterns []struct {
+				Pattern     string `json:"pattern"`
+				Description string `json:"description"`
+				Mode        string `json:"mode"`
+			} `json:"g1_custom_patterns"`
+			G3WikiHint string `json:"g3_wiki_hint"`
+		} `json:"guardrail"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
+		return &GuardrailRules{}, nil
+	}
+	rules := make([]GuardrailG1Rule, 0, len(p.Guardrail.G1CustomPatterns))
+	for _, pat := range p.Guardrail.G1CustomPatterns {
+		if trimmed := strings.TrimSpace(pat.Pattern); trimmed != "" {
+			rules = append(rules, GuardrailG1Rule{
+				Pattern: trimmed,
+				Mode:    strings.ToLower(strings.TrimSpace(pat.Mode)),
+			})
+		}
+	}
+	return &GuardrailRules{
+		G1Patterns: rules,
+		G3WikiHint: p.Guardrail.G3WikiHint,
+	}, nil
 }

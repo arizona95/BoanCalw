@@ -4,16 +4,15 @@ import { AuthProvider, useAuth } from "./auth";
 import Login from "./pages/Login";
 import Register from "./pages/Register";
 import SelectOrg from "./pages/SelectOrg";
-import Dashboard from "./pages/Dashboard";
 import OrgSettings from "./pages/OrgSettings";
 import OrgOverview from "./pages/OrgOverview";
 import Policies from "./pages/Policies";
 import LLMRegistry from "./pages/LLMRegistry";
-import AuditLog from "./pages/AuditLog";
 import Credentials from "./pages/Credentials";
 import Approvals from "./pages/Approvals";
-import Users from "./pages/Users";
+import Authorization from "./pages/Authorization";
 import FileManager from "./pages/FileManager";
+import Observability from "./pages/Observability";
 import MyBoanClaw from "./pages/MyBoanClaw";
 import MyGCP from "./pages/MyGCP";
 
@@ -44,24 +43,27 @@ function Shell() {
   type NavItem = { path: string; label: string; icon: string; separator?: boolean };
   const NAV_ITEMS: NavItem[] = canEdit
     ? [
-        { path: "/", label: "Dashboard", icon: "📊" },
+        { path: "/llm-registry", label: "LLM Registry", icon: "🤖" },
         { path: "/gateway", label: "Gateway Policies", icon: "🛡️" },
         { path: "/credentials", label: "Credentials", icon: "🔑" },
         { path: "/approvals", label: "Approvals", icon: "✅" },
-        { path: "/audit", label: "Audit Log", icon: "📝" },
-        { path: "/users", label: "Users", icon: "👥" },
-        { path: "/files", label: "File Manager", icon: "📂", separator: true },
-        { path: "/my-boanclaw", label: "BoanClaw", icon: "🦞" },
+        { path: "/observability", label: "Observability", icon: "🔭" },
+        { path: "/authorization", label: "Authorization", icon: "🔐" },
+        { path: "/my-boanclaw", label: "BoanClaw", icon: "🦞", separator: true },
+        { path: "/files", label: "File Manager", icon: "📂" },
         { path: "/my-gcp", label: "Personal Computer", icon: "🖥️" },
       ]
     : [
         { path: "/org-overview", label: "조직 설정 확인", icon: "🏢" },
-        { path: "/files", label: "File Manager", icon: "📂", separator: true },
-        { path: "/my-boanclaw", label: "BoanClaw", icon: "🦞" },
+        { path: "/credentials", label: "Credentials", icon: "🔑" },
+        { path: "/my-boanclaw", label: "BoanClaw", icon: "🦞", separator: true },
+        { path: "/files", label: "File Manager", icon: "📂" },
         { path: "/my-gcp", label: "Personal Computer", icon: "🖥️" },
       ];
 
   const fullBleed = location.pathname === "/my-boanclaw" || location.pathname === "/my-gcp";
+  // FileManager needs a wider content area — ~1.3x default max-w-7xl
+  const wideContent = location.pathname === "/files";
   const showMyBoanClaw = location.pathname === "/my-boanclaw";
   const showMyGCP = location.pathname === "/my-gcp";
   const showPersistentSurface = showMyBoanClaw || showMyGCP;
@@ -143,20 +145,29 @@ function Shell() {
             <span>읽기 전용 모드입니다. 설정을 변경하려면 소유자 권한이 필요합니다.</span>
           </div>
         )}
-        <div className={fullBleed ? "flex-1 flex min-h-0" : "p-8 max-w-7xl mx-auto"}>
+        <div className={fullBleed ? "flex-1 flex min-h-0" : wideContent ? "p-8 w-full max-w-[104rem] mx-auto" : "p-8 max-w-7xl mx-auto"}>
           {/* 일반 라우트 */}
           <div className={showPersistentSurface ? "hidden" : "h-full"}>
             <Routes>
-              <Route path="/" element={canEdit ? <Dashboard /> : <Navigate to="/org-overview" replace />} />
+              {/* default landing — owner: LLM Registry, viewer: org-overview */}
+              <Route path="/" element={canEdit ? <Navigate to="/llm-registry" replace /> : <Navigate to="/org-overview" replace />} />
+              {/* legacy /dashboard URL */}
+              <Route path="/dashboard" element={<Navigate to="/llm-registry" replace />} />
               <Route path="/org" element={canEdit ? <OrgSettings /> : <ReadOnly />} />
               <Route path="/org-overview" element={<OrgOverview />} />
               <Route path="/gateway" element={canEdit ? <Policies /> : <ReadOnly />} />
               <Route path="/policies" element={<Navigate to="/gateway" replace />} />
               <Route path="/llm-registry" element={<LLMRegistry />} />
-              <Route path="/audit" element={<AuditLog />} />
-              <Route path="/credentials" element={canEdit ? <Credentials /> : <ReadOnly />} />
+              <Route path="/audit" element={<Navigate to="/observability" replace />} />
+              {/* Credentials — 모든 사용자가 본인 자격증명을 등록/관리할 수 있어야 함 */}
+              <Route path="/credentials" element={<Credentials />} />
               <Route path="/approvals" element={canEdit ? <Approvals /> : <ReadOnly />} />
-              <Route path="/users" element={canEdit ? <Users /> : <ReadOnly />} />
+              <Route path="/observability" element={canEdit ? <Observability /> : <ReadOnly />} />
+              {/* Authorization = Users + SSO 통합 */}
+              <Route path="/authorization" element={canEdit ? <Authorization /> : <ReadOnly />} />
+              {/* legacy redirects so 직접 URL bookmark 도 동작 */}
+              <Route path="/users" element={<Navigate to="/authorization?tab=users" replace />} />
+              <Route path="/sso" element={<Navigate to="/authorization?tab=sso" replace />} />
               <Route path="/files" element={<FileManager />} />
               <Route path="/my-boanclaw" element={null} />
               <Route path="/my-gcp" element={null} />

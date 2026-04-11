@@ -489,125 +489,229 @@ export default function MyGCP() {
   };
 
   // ── 스크린샷: 현재 세션 iframe canvas 캡처 ───────────────────────────────
-  const captureCanvas = (): { image: string; width: number; height: number } | null => {
-    const win = remoteWindow();
-    if (!win) return null;
+  // 실패 시 풍부한 진단정보를 반환 (서버 로그로 전송돼서 디버깅 가능).
+  // 성공: { image, width, height }
+  // 실패: { error, debug: { ... } }
+  type CaptureResult =
+    | { image: string; width: number; height: number; debug?: Record<string, unknown> }
+    | { error: string; debug: Record<string, unknown> };
+
+  const captureCanvas = (): CaptureResult => {
+    const ts = new Date().toISOString();
+    const iframeExists = !!iframeRef.current;
+    const ifSrc = iframeRef.current?.src ?? null;
+    const win = iframeRef.current?.contentWindow ?? null;
+    if (!win) {
+      return {
+        error: "canvas not found or empty",
+        debug: {
+          ts,
+          reason: "remoteWindow_null",
+          iframeExists,
+          iframeSrc: ifSrc,
+        },
+      };
+    }
+    let doc: Document | null = null;
     try {
-      const doc = win.document;
+      doc = win.document;
+    } catch (e) {
+      return {
+        error: "canvas not found or empty",
+        debug: {
+          ts,
+          reason: "doc_access_threw",
+          iframeExists,
+          iframeSrc: ifSrc,
+          message: e instanceof Error ? e.message : String(e),
+        },
+      };
+    }
+    if (!doc) {
+      return {
+        error: "canvas not found or empty",
+        debug: { ts, reason: "doc_null", iframeExists, iframeSrc: ifSrc },
+      };
+    }
+    try {
       const displayEl = doc.querySelector("#display, .display");
-      const canvases = displayEl
+      const canvasesInDisplay = displayEl
         ? (Array.from(displayEl.querySelectorAll("canvas")) as HTMLCanvasElement[])
-        : (Array.from(doc.querySelectorAll("canvas")) as HTMLCanvasElement[]);
-      if (canvases.length === 0) return null;
-      // 스크린샷은 반드시 캔버스 실제 픽셀 크기로 캡처해야 좌표 일치
-      // CSS clientWidth/clientHeight(표시 크기)와 canvas.width/height(실제 픽셀)가 다를 수 있음
+        : [];
+      const allCanvases = Array.from(doc.querySelectorAll("canvas")) as HTMLCanvasElement[];
+      const canvases = displayEl ? canvasesInDisplay : allCanvases;
+
+      // 항상 함께 첨부할 진단 컨텍스트
+      const baseDebug: Record<string, unknown> = {
+        ts,
+        iframeExists,
+        iframeSrc: ifSrc,
+        docReadyState: doc.readyState,
+        docUrl: (doc.location && doc.location.href) || "(unknown)",
+        docTitle: doc.title,
+        bodyChildren: doc.body?.children.length ?? 0,
+        iframesInDoc: doc.querySelectorAll("iframe").length,
+        displayElFound: !!displayEl,
+        canvasesInDisplay: canvasesInDisplay.length,
+        canvasesAnywhere: allCanvases.length,
+        activeElement: doc.activeElement?.tagName ?? null,
+        // forensics: 어떤 페이지가 떠 있는지 확인용 (HTML 앞 400자)
+        bodyHtmlPreview: (doc.body?.innerHTML ?? "(no body)").slice(0, 400),
+      };
+
+      if (canvases.length === 0) {
+        return {
+          error: "canvas not found or empty",
+          debug: { ...baseDebug, reason: "no_canvases" },
+        };
+      }
+      const sizes = canvases.map((c) => `${c.width}x${c.height}`);
       const mainCanvas = canvases[0];
-      const w = mainCanvas.width || 1280;
-      const h = mainCanvas.height || 800;
+      const w = mainCanvas.width;
+      const h = mainCanvas.height;
+      if (w === 0 || h === 0) {
+        return {
+          error: "canvas not found or empty",
+          debug: { ...baseDebug, reason: "main_canvas_zero", canvasSizes: sizes },
+        };
+      }
       const offscreen = document.createElement("canvas");
       offscreen.width = w;
       offscreen.height = h;
       const ctx = offscreen.getContext("2d");
-      if (!ctx) return null;
+      if (!ctx) {
+        return {
+          error: "canvas not found or empty",
+          debug: { ...baseDebug, reason: "offscreen_2d_ctx_null", canvasSizes: sizes },
+        };
+      }
+      let drawnLayers = 0;
+      const drawErrors: string[] = [];
       for (const c of canvases) {
         if (c.width > 0 && c.height > 0) {
-          // 각 캔버스를 원본 크기(w, h)에 맞춰 그림 — 좌표 1:1 대응
-          try { ctx.drawImage(c, 0, 0, w, h); } catch { /* skip tainted layer */ }
+          try {
+            ctx.drawImage(c, 0, 0, w, h);
+            drawnLayers++;
+          } catch (e) {
+            drawErrors.push(e instanceof Error ? e.message : String(e));
+          }
         }
       }
-      const dataUrl = offscreen.toDataURL("image/png");
+      if (drawnLayers === 0) {
+        return {
+          error: "canvas not found or empty",
+          debug: { ...baseDebug, reason: "no_layers_drawn", canvasSizes: sizes, drawErrors },
+        };
+      }
+      let dataUrl: string;
+      try {
+        dataUrl = offscreen.toDataURL("image/png");
+      } catch (e) {
+        return {
+          error: "canvas not found or empty",
+          debug: {
+            ...baseDebug,
+            reason: "toDataURL_threw",
+            canvasSizes: sizes,
+            message: e instanceof Error ? e.message : String(e),
+          },
+        };
+      }
       return { image: dataUrl.split(",")[1], width: w, height: h };
     } catch (e) {
-      console.warn("[BoanClaw] captureCanvas error", e);
-      return null;
+      console.warn("[BoanClaw] captureCanvas unexpected error", e);
+      return {
+        error: "canvas not found or empty",
+        debug: {
+          ts,
+          reason: "outer_catch",
+          iframeExists,
+          iframeSrc: ifSrc,
+          message: e instanceof Error ? e.message : String(e),
+          stack: e instanceof Error ? e.stack?.slice(0, 500) : null,
+        },
+      };
     }
   };
 
-  // ── Guacamole 좌표 변환: 캔버스 픽셀 좌표(LLM) → CSS clientX/clientY
-  // Guacamole.Mouse는 .display div에 addEventListener로 바인딩되므로
-  // 이벤트 타겟도 .display div이어야 함. 좌표는 .display div 기준으로 변환.
-  const canvasPixelToClient = (canvasX: number, canvasY: number): { clientX: number; clientY: number; target: Element } | null => {
-    const win = remoteWindow();
-    if (!win) return null;
-    const doc = win.document;
-    // Guacamole.Mouse가 바인딩된 엘리먼트: .display div
-    const displayEl = doc.querySelector(".display") as HTMLElement | null
-      ?? doc.querySelector("#display") as HTMLElement | null;
-    if (!displayEl) return null;
-    // .display 내의 canvas에서 네이티브 픽셀 크기 얻기
-    const canvas = displayEl.querySelector("canvas") as HTMLCanvasElement | null;
-    if (!canvas) return null;
-    const displayRect = displayEl.getBoundingClientRect();
-    // canvas 네이티브 픽셀 → .display div CSS 좌표 변환
-    const scaleX = displayRect.width / (canvas.width || 1);
-    const scaleY = displayRect.height / (canvas.height || 1);
-    return {
-      clientX: displayRect.left + canvasX * scaleX,
-      clientY: displayRect.top + canvasY * scaleY,
-      target: displayEl,
-    };
+  // ── 마우스 입력: Guacamole client API 직접 호출
+  //
+  // 이전 구현은 .display div 에 합성 DOM MouseEvent 를 dispatch 했는데, Guacamole.Mouse
+  // 가 그걸 전혀 받지 못해서 (synthetic / wrong target / isTrusted 문제) 모든 클릭이
+  // 무시되고 있었다. Vision LLM 은 좌표를 잘 보내고 있었지만 RDP 측에 도달 자체를 안 함.
+  //
+  // 키보드 (injectKeyName) 가 이미 client.sendKeyEvent 직접 호출로 잘 동작하는 것과
+  // 동일하게, 마우스도 client.sendMouseState 를 직접 부른다. 이게 Guacamole.Mouse 가
+  // 내부적으로 RDP 서버로 보내는 그 메서드 — DOM 이벤트 우회.
+  //
+  // 좌표계: vision LLM 이 보는 screenshot 의 픽셀 == canvas native pixel == RDP 서버
+  // 화면 픽셀 (Guacamole canvas 의 internal 해상도가 곧 remote screen resolution).
+  // 따라서 vision 좌표를 그대로 sendMouseState 에 넘기면 됨 — CSS 변환 일절 불필요.
+  type GuacClient = {
+    sendMouseState?: (state: {
+      x: number; y: number;
+      left?: boolean; middle?: boolean; right?: boolean;
+      up?: boolean; down?: boolean;
+    }) => void;
+    sendKeyEvent?: (pressed: number, keysym: number) => void;
   };
 
-  // ── 마우스 클릭: Guacamole canvas에 직접 DOM 이벤트 dispatch
+  const buttonState = (button: string, pressed: boolean) => {
+    const s = { left: false, middle: false, right: false, up: false, down: false };
+    if (!pressed) return s;
+    if (button === "right") s.right = true;
+    else if (button === "middle") s.middle = true;
+    else s.left = true;
+    return s;
+  };
+
   const injectMouseClick = (x: number, y: number, button: string = "left", double: boolean = false): Promise<void> => {
     return new Promise<void>((resolve) => {
-      const mapped = canvasPixelToClient(x, y);
-      if (!mapped) {
-        console.warn("[BoanClaw] injectMouseClick: canvas not found");
+      const client = getManagedClient() as GuacClient | null;
+      if (!client?.sendMouseState) {
+        console.warn("[BoanClaw] injectMouseClick: guacamole client not available");
         resolve();
         return;
       }
-      const { clientX, clientY, target } = mapped;
-      const win = remoteWindow();
-      const Ctor = ((win as any)?.MouseEvent ?? globalThis.MouseEvent) as typeof MouseEvent;
-      const btn = button === "right" ? 2 : button === "middle" ? 1 : 0;
-      const buttons = btn === 0 ? 1 : btn === 2 ? 2 : 4;
-      const baseOpts = { bubbles: true, cancelable: true, clientX, clientY, button: btn, buttons, view: win };
+      const press = () => client.sendMouseState!({ x, y, ...buttonState(button, true) });
+      const release = () => client.sendMouseState!({ x, y, ...buttonState(button, false) });
 
-      // mousedown → mouseup (Guacamole의 Mouse 핸들러가 이벤트를 캡처)
-      target.dispatchEvent(new Ctor("mousemove", { ...baseOpts, buttons: 0 }));
-      target.dispatchEvent(new Ctor("mousedown", baseOpts));
+      // 1) move (no buttons) → 2) press → 3) release. 더블클릭이면 한 번 더.
+      client.sendMouseState({ x, y, left: false, middle: false, right: false, up: false, down: false });
+      press();
       setTimeout(() => {
-        target.dispatchEvent(new Ctor("mouseup", { ...baseOpts, buttons: 0 }));
-        if (!double) {
-          resolve();
-          return;
-        }
+        release();
+        if (!double) { resolve(); return; }
         setTimeout(() => {
-          target.dispatchEvent(new Ctor("mousedown", baseOpts));
-          setTimeout(() => {
-            target.dispatchEvent(new Ctor("mouseup", { ...baseOpts, buttons: 0 }));
-            target.dispatchEvent(new Ctor("dblclick", { ...baseOpts, buttons: 0 }));
-            resolve();
-          }, 60);
-        }, 60);
-      }, 80);
+          press();
+          setTimeout(() => { release(); resolve(); }, 30);
+        }, 50);
+      }, 50);
     });
   };
 
   const injectMouseMove = (x: number, y: number) => {
-    const win = remoteWindow();
-    if (!win) return;
-    try {
-      const doc = win.document;
-      const target = doc.querySelector("#display, .display, canvas") ?? doc.body;
-      if (!target) return;
-      const Ctor = (doc.defaultView?.MouseEvent ?? globalThis.MouseEvent) as typeof MouseEvent;
-      target.dispatchEvent(new Ctor("mousemove", { bubbles: true, cancelable: true, clientX: x, clientY: y }));
-    } catch { /* ignore */ }
+    const client = getManagedClient() as GuacClient | null;
+    if (!client?.sendMouseState) return;
+    client.sendMouseState({ x, y, left: false, middle: false, right: false, up: false, down: false });
   };
 
   const injectWheelScroll = (x: number, y: number, direction: string, amount: number) => {
-    const win = remoteWindow();
-    if (!win) return;
-    try {
-      const doc = win.document;
-      const target = doc.elementFromPoint(x, y) ?? doc.querySelector("#display, .display, canvas") ?? doc.body;
-      if (!target) return;
-      const deltaY = direction === "up" ? -(amount * 100) : amount * 100;
-      const Ctor = (doc.defaultView?.WheelEvent ?? globalThis.WheelEvent) as typeof WheelEvent;
-      target.dispatchEvent(new Ctor("wheel", { bubbles: true, cancelable: true, clientX: x, clientY: y, deltaY, deltaMode: 0 }));
-    } catch { /* ignore */ }
+    const client = getManagedClient() as GuacClient | null;
+    if (!client?.sendMouseState) return;
+    // Guacamole 의 wheel: up = scroll up, down = scroll down. 한 단위가 wheel notch 1.
+    // amount 만큼 반복해서 click → release.
+    const dir = direction === "up" ? "up" : "down";
+    const ticks = Math.max(1, Math.min(amount | 0, 20));
+    const tick = (i: number) => {
+      if (i >= ticks) return;
+      client.sendMouseState!({ x, y, [dir]: true } as { x: number; y: number; up?: boolean; down?: boolean });
+      setTimeout(() => {
+        client.sendMouseState!({ x, y, [dir]: false } as { x: number; y: number; up?: boolean; down?: boolean });
+        setTimeout(() => tick(i + 1), 20);
+      }, 20);
+    };
+    tick(0);
   };
 
   const injectKeyName = (name: string) => {
@@ -681,41 +785,66 @@ export default function MyGCP() {
     switch (action) {
       case "screenshot": {
         const result = captureCanvas();
-        if (!result) return { error: "canvas not found or empty" };
+        if ("error" in result) {
+          // 진단 정보 그대로 server 로 전송 — proxy 로그에서 원인 추적 가능
+          console.warn("[BoanClaw] screenshot failed", result);
+          return result;
+        }
         return { ...result, media_type: "image/png" };
       }
       case "click": {
-        const mapped = canvasPixelToClient(params.x as number, params.y as number);
+        const c = getManagedClient() as GuacClient | null;
+        if (!c?.sendMouseState) {
+          return { error: "guacamole client not available (stale polling client)", debug: { reason: "no_managed_client", action: "click" } };
+        }
         await injectMouseClick(params.x as number, params.y as number, (params.button as string) ?? "left", false);
-        return {
-          ok: true,
-          result: `clicked (${params.x}, ${params.y})`,
-          debug_method: "canvas-dom-event",
-          debug_mapped: mapped ? { clientX: Math.round(mapped.clientX), clientY: Math.round(mapped.clientY) } : null,
-          debug_canvasFound: !!mapped,
-        };
+        return { ok: true, result: `clicked (${params.x}, ${params.y})`, method: "guac-sendMouseState" };
       }
       case "double_click": {
+        const c = getManagedClient() as GuacClient | null;
+        if (!c?.sendMouseState) {
+          return { error: "guacamole client not available (stale polling client)", debug: { reason: "no_managed_client", action: "double_click" } };
+        }
         await injectMouseClick(params.x as number, params.y as number, "left", true);
         return { ok: true, result: `double-clicked (${params.x}, ${params.y})` };
       }
       case "right_click": {
+        const c = getManagedClient() as GuacClient | null;
+        if (!c?.sendMouseState) {
+          return { error: "guacamole client not available (stale polling client)", debug: { reason: "no_managed_client", action: "right_click" } };
+        }
         await injectMouseClick(params.x as number, params.y as number, "right", false);
         return { ok: true, result: `right-clicked (${params.x}, ${params.y})` };
       }
       case "move": {
+        const c = getManagedClient() as GuacClient | null;
+        if (!c?.sendMouseState) {
+          return { error: "guacamole client not available (stale polling client)", debug: { reason: "no_managed_client", action: "move" } };
+        }
         injectMouseMove(params.x as number, params.y as number);
         return { ok: true, result: `moved to (${params.x}, ${params.y})` };
       }
       case "scroll": {
+        const c = getManagedClient() as GuacClient | null;
+        if (!c?.sendMouseState) {
+          return { error: "guacamole client not available (stale polling client)", debug: { reason: "no_managed_client", action: "scroll" } };
+        }
         injectWheelScroll(params.x as number, params.y as number, (params.direction as string) ?? "down", (params.amount as number) ?? 3);
         return { ok: true, result: `scrolled ${params.direction}` };
       }
       case "type": {
+        const c = getManagedClient() as { sendKeyEvent?: (p: number, k: number) => void } | null;
+        if (!c?.sendKeyEvent) {
+          return { error: "guacamole client not available (stale polling client)", debug: { reason: "no_managed_client", action: "type" } };
+        }
         injectTextToRemote(params.text as string);
         return { ok: true, result: `typed ${(params.text as string)?.length ?? 0} chars` };
       }
       case "key": {
+        const c = getManagedClient() as { sendKeyEvent?: (p: number, k: number) => void } | null;
+        if (!c?.sendKeyEvent) {
+          return { error: "guacamole client not available (stale polling client)", debug: { reason: "no_managed_client", action: "key" } };
+        }
         injectKeyName(params.name as string);
         return { ok: true, result: `pressed key: ${params.name}` };
       }
@@ -749,14 +878,32 @@ export default function MyGCP() {
   };
 
   // ── computer-use 폴링: boan-proxy 큐에서 커맨드 수신 → 기존 세션에서 실행
+  // isActive 와 무관하게 항상 실행. MyGCP 는 persistent surface 로 항상 마운트되어 있고,
+  // BoanClaw 탭에서 [gcp_exec] 커맨드를 보낼 수 있으므로 poll 은 항상 활성이어야 함.
   useEffect(() => {
-    if (!isActive) return;
     let cancelled = false;
 
+    // ── computer-use 큐 polling
+    //
+    // 중요: iframe ref 가 아직 마운트 안 된 (또는 unmount 후 효과가 살아있는) stale
+    // client 는 polling 에 참여하면 안 된다. 안 그러면 cuPendingQueue 에서 액션을
+    // 빼가놓고 정작 click 등을 실행할 client 가 없어서 silent fail (injectMouseClick
+    // 이 client 없이 {ok:true} 반환). 두 client 가 동시에 polling 하면 race 로 절반의
+    // click 이 묵음 처리됨.
+    //
+    // 따라서 poll 호출 전에 iframeRef.current 가 attached 되어 있고 contentWindow
+    // 가 살아있는지 확인. 그 외엔 poll skip + 짧은 backoff 후 재시도.
     const poll = async (): Promise<void> => {
       if (cancelled) return;
+      // Stale client guard — iframe 이 없으면 polling 자체를 안 한다.
+      if (!iframeRef.current || !iframeRef.current.contentWindow) {
+        if (!cancelled) window.setTimeout(() => void poll(), 250);
+        return;
+      }
       try {
-        const resp = await fetch("/api/computer-use/poll", {
+        // ?ready=1 — backend stale-client guard. 옛 cached bundle 은 이 param 을 안 보내서
+        // backend 가 자동으로 무시 → race condition 차단.
+        const resp = await fetch("/api/computer-use/poll?ready=1", {
           signal: AbortSignal.timeout(6000),
         });
         if (resp.ok) {
@@ -777,7 +924,7 @@ export default function MyGCP() {
     void poll();
     return () => { cancelled = true; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isActive]);
+  }, []);
 
   // ── 입력 분기: prefix에 따라 chat / 전송 / 실행 처리 ──────────────────────
   // "chat 내용"  → BoanClaw 채팅으로 전달 (chat.send)
@@ -857,7 +1004,8 @@ export default function MyGCP() {
         headers: { "Content-Type": "application/json" },
         credentials: "include",
         body: JSON.stringify({ prompt: payload }),
-        signal: AbortSignal.timeout(180_000),
+        // computer-use agent 는 multi-step 으로 길게 돌 수 있으므로 10분
+        signal: AbortSignal.timeout(600_000),
       });
       if (!res.ok || !res.body) {
         const err = await res.text().catch(() => "unknown error");

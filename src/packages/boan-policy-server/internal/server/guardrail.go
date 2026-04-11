@@ -23,6 +23,8 @@ type GuardrailEvaluateRequest struct {
 	Mode        string `json:"mode,omitempty"`
 	UserEmail   string `json:"user_email,omitempty"`
 	AccessLevel string `json:"access_level,omitempty"`
+	LLMURL      string `json:"llm_url,omitempty"`   // proxy가 전달한 security LLM URL
+	LLMModel    string `json:"llm_model,omitempty"` // proxy가 전달한 security LLM model
 }
 
 type GuardrailEvaluateResponse struct {
@@ -45,7 +47,7 @@ func NewGuardrailEvaluator(llmURL, llmModel, llmKey string) *GuardrailEvaluator 
 		llmURL:   strings.TrimSpace(llmURL),
 		llmModel: strings.TrimSpace(llmModel),
 		llmKey:   strings.TrimSpace(llmKey),
-		client:   &http.Client{Timeout: 10 * time.Second},
+		client:   &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
@@ -78,7 +80,14 @@ func (s *Server) evaluateGuardrail(w http.ResponseWriter, r *http.Request, orgID
 		return
 	}
 
-	resp, err := s.guardrail.Evaluate(r.Context(), p.Guardrail, body)
+	// LLM 선택 우선순위: 요청에 포함된 registry LLM > 정책 설정 > env 변수
+	evaluator := s.guardrail
+	if body.LLMURL != "" {
+		evaluator = NewGuardrailEvaluator(body.LLMURL, body.LLMModel, s.cfg.GuardrailLLMKey)
+	} else if p.Guardrail.LLMURL != "" {
+		evaluator = NewGuardrailEvaluator(p.Guardrail.LLMURL, p.Guardrail.LLMModel, s.cfg.GuardrailLLMKey)
+	}
+	resp, err := evaluator.Evaluate(r.Context(), p.Guardrail, body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -97,11 +106,20 @@ func (e *GuardrailEvaluator) Evaluate(ctx context.Context, cfg policy.GuardrailC
 	}
 
 	if e.llmURL != "" && e.llmModel != "" {
-		if resp, err := e.evaluateWithLLM(ctx, cfg, req); err == nil && isValidGuardrailDecision(resp.Decision) {
+		resp, err := e.evaluateWithLLM(ctx, cfg, req)
+		if err == nil && isValidGuardrailDecision(resp.Decision) {
 			return resp, nil
 		}
+		// LLM 실패 → fail-closed (heuristic fallback 하지 않음)
+		return GuardrailEvaluateResponse{
+			Decision:   "block",
+			Reason:     fmt.Sprintf("guardrail LLM failed — fail-closed: %v", err),
+			Confidence: 1,
+			Tier:       1,
+		}, nil
 	}
 
+	// LLM 미설정 → heuristic만 사용 (credential 패턴 등 기본 검사)
 	return evaluateGuardrailHeuristic(cfg, req), nil
 }
 
@@ -468,7 +486,14 @@ func (s *Server) wikiEvaluateGuardrail(w http.ResponseWriter, r *http.Request, o
 		return
 	}
 
-	resp, err := s.wikiGuardrail.WikiEvaluate(r.Context(), p.Guardrail, s.trainingLog, body)
+	// LLM 선택 우선순위: 요청에 포함된 registry LLM > 정책 설정 > env 변수
+	wikiEval := s.wikiGuardrail
+	if body.LLMURL != "" {
+		wikiEval = NewGuardrailEvaluator(body.LLMURL, body.LLMModel, s.cfg.WikiLLMKey)
+	} else if p.Guardrail.WikiLLMURL != "" {
+		wikiEval = NewGuardrailEvaluator(p.Guardrail.WikiLLMURL, p.Guardrail.WikiLLMModel, s.cfg.WikiLLMKey)
+	}
+	resp, err := wikiEval.WikiEvaluate(r.Context(), p.Guardrail, s.trainingLog, body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return

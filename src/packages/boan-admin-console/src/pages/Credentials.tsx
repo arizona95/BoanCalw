@@ -1,9 +1,12 @@
 import { useEffect, useState } from "react";
 import {
   credentialApi,
+  credentialRequestApi,
   type Credential,
   type CredentialPassthrough,
+  type CredentialRequestItem,
 } from "../api";
+import { useAuth } from "../auth";
 
 const STATUS_STYLE: Record<string, string> = {
   ok: "bg-green-50 text-green-700",
@@ -11,7 +14,7 @@ const STATUS_STYLE: Record<string, string> = {
   missing: "bg-yellow-50 text-yellow-700",
 };
 
-type TabKey = "org" | "personal" | "passthrough";
+type TabKey = "org" | "personal" | "requests" | "passthrough";
 
 function maskKey(k: string) {
   if (!k) return "";
@@ -20,9 +23,19 @@ function maskKey(k: string) {
 }
 
 export default function Credentials() {
+  const { user } = useAuth();
   const [tab, setTab] = useState<TabKey>("org");
   const [creds, setCreds] = useState<Credential[]>([]);
   const [passthrough, setPassthrough] = useState<CredentialPassthrough[]>([]);
+  const [credRequests, setCredRequests] = useState<CredentialRequestItem[]>([]);
+  const [reqRoleName, setReqRoleName] = useState("");
+  const [reqDescription, setReqDescription] = useState("");
+  const [fulfillKey, setFulfillKey] = useState<Record<string, string>>({});
+
+  const emailPrefix = (user?.email ?? "").split("@")[0];
+  const personalRoleFor = (roleName: string) => `personal-${emailPrefix}-${roleName}`;
+  const isRecommendationFulfilled = (roleName: string) =>
+    creds.some((c) => c.role === personalRoleFor(roleName));
   const [loading, setLoading] = useState(true);
   const [name, setName] = useState("");
   const [key, setKey] = useState("");
@@ -36,10 +49,11 @@ export default function Credentials() {
 
   const load = () => {
     setLoading(true);
-    Promise.all([credentialApi.list(), credentialApi.listPassthrough()])
-      .then(([credentialItems, passthroughItems]) => {
+    Promise.all([credentialApi.list(), credentialApi.listPassthrough(), credentialRequestApi.list()])
+      .then(([credentialItems, passthroughItems, requestItems]) => {
         setCreds(credentialItems);
         setPassthrough(passthroughItems);
+        setCredRequests(requestItems);
       })
       .catch((e: Error) => setError(e.message))
       .finally(() => setLoading(false));
@@ -148,9 +162,11 @@ export default function Credentials() {
       )}
 
       <div className="flex border-b border-gray-200 mb-4">
-        {([["org", "Organization"], ["personal", "Personal"], ["passthrough", "Passthrough"]] as const).map(([k, label]) => (
-          <button key={k} onClick={() => setTab(k)} className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${tab === k ? "border-boan-600 text-boan-700" : "border-transparent text-gray-500 hover:text-gray-700"}`}>{label}</button>
-        ))}
+        {([["org", "Organization"], ["personal", "Personal"], ["requests", "Recommendations"], ["passthrough", "Passthrough"]] as const)
+          .filter(([k]) => k !== "requests" || user?.can_edit)
+          .map(([k, label]) => (
+            <button key={k} onClick={() => setTab(k)} className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${tab === k ? "border-boan-600 text-boan-700" : "border-transparent text-gray-500 hover:text-gray-700"}`}>{label}</button>
+          ))}
       </div>
 
       {tab === "org" ? (
@@ -279,35 +295,140 @@ export default function Credentials() {
           </div>
         </>
       ) : tab === "personal" ? (
-        <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-          <h2 className="text-lg font-semibold mb-1">Personal Credentials</h2>
-          <p className="text-xs text-gray-500 mb-4">각 사용자가 개인적으로 등록한 API 키. 소유자는 여기서 전체 조회 가능.</p>
-          {loading ? (
-            <p className="text-sm text-gray-500">로딩 중...</p>
-          ) : creds.filter((c) => c.role.includes("personal")).length === 0 ? (
-            <p className="text-sm text-gray-400 py-8 text-center">개인 credential이 없습니다.</p>
-          ) : (
-            <table className="w-full text-sm">
-              <thead className="border-b border-gray-200 bg-gray-50">
-                <tr>
-                  <th className="px-4 py-3 text-left font-medium text-gray-500">Role</th>
-                  <th className="px-4 py-3 text-left font-medium text-gray-500">Org</th>
-                  <th className="px-4 py-3 text-left font-medium text-gray-500">상태</th>
-                  <th className="px-4 py-3 text-right font-medium text-gray-500">액션</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-gray-100">
-                {creds.filter((c) => c.role.includes("personal")).map((c) => (
-                  <tr key={c.role} className="hover:bg-gray-50">
-                    <td className="px-4 py-3 font-mono text-xs">{c.role}</td>
-                    <td className="px-4 py-3 text-xs text-gray-500">{c.org_id || "-"}</td>
-                    <td className="px-4 py-3"><span className={`rounded-full px-2 py-1 text-xs ${STATUS_STYLE[c.status] ?? STATUS_STYLE.ok}`}>{c.status}</span></td>
-                    <td className="px-4 py-3 text-right"><button onClick={() => handleRevoke(c.role)} className="text-xs text-red-600 hover:underline">revoke</button></td>
-                  </tr>
+        <div className="space-y-4">
+          <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+            <h2 className="text-lg font-semibold mb-1">My Credentials</h2>
+            <p className="text-xs text-gray-500 mb-4">
+              조직 소유자가 추천한 credential 목록. 빨간색은 아직 내가 등록하지 않은 항목 — 등록 안 해도 기본 기능은 동작하지만, 등록하면 더 정상적으로 작동합니다.
+            </p>
+            {loading ? (
+              <p className="text-sm text-gray-500">로딩 중...</p>
+            ) : credRequests.length === 0 && creds.filter((c) => c.role.startsWith(`personal-${emailPrefix}-`)).length === 0 ? (
+              <p className="text-sm text-gray-400 py-8 text-center">소유자가 추천한 credential 이 없습니다.</p>
+            ) : (
+              <div className="space-y-2">
+                {/* 추천 목록 — 각 사용자별 fulfillment 상태 확인 */}
+                {credRequests.map((cr) => {
+                  const fulfilled = isRecommendationFulfilled(cr.role_name);
+                  return (
+                    <div
+                      key={cr.id}
+                      className={`px-4 py-3 rounded-lg border ${fulfilled ? "border-gray-200 bg-white" : "border-red-300 bg-red-50"}`}
+                    >
+                      <div className="flex items-center justify-between mb-1">
+                        <div>
+                          <span className={`text-sm font-mono font-semibold ${fulfilled ? "text-gray-800" : "text-red-700"}`}>
+                            {cr.role_name}
+                          </span>
+                          <span className={`ml-2 text-xs ${fulfilled ? "text-green-600" : "text-red-600"}`}>
+                            {fulfilled ? "✓ 등록됨" : "⚠ 등록 추천"}
+                          </span>
+                        </div>
+                        {fulfilled && (
+                          <button
+                            onClick={() => handleRevoke(personalRoleFor(cr.role_name))}
+                            className="text-xs text-red-500 hover:underline"
+                          >
+                            삭제
+                          </button>
+                        )}
+                      </div>
+                      {cr.description && (
+                        <p className={`text-xs mb-2 ${fulfilled ? "text-gray-500" : "text-red-600/80"}`}>
+                          {cr.description}
+                        </p>
+                      )}
+                      {!fulfilled && (
+                        <div className="flex gap-2 mt-2">
+                          <input
+                            type="password"
+                            value={fulfillKey[cr.id] ?? ""}
+                            onChange={(e) => setFulfillKey((prev) => ({ ...prev, [cr.id]: e.target.value }))}
+                            placeholder="내 API 키 입력"
+                            className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-xs font-mono"
+                          />
+                          <button
+                            onClick={async () => {
+                              const k = fulfillKey[cr.id];
+                              if (!k) return;
+                              try {
+                                await credentialRequestApi.fulfill(cr.id, k);
+                                setFulfillKey((prev) => { const n = { ...prev }; delete n[cr.id]; return n; });
+                                setSuccess(`${cr.role_name} 등록 완료`);
+                                load();
+                              } catch (e) {
+                                setError(e instanceof Error ? e.message : "등록 실패");
+                              }
+                            }}
+                            className="px-3 py-2 text-xs rounded-lg bg-boan-600 text-white hover:bg-boan-700"
+                          >
+                            등록
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </div>
+      ) : tab === "requests" ? (
+        <div className="space-y-4">
+          {/* 소유자: 추천 credential 등록 (org-wide) */}
+          <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-5">
+            <h2 className="text-sm font-semibold mb-1">추천 Credential 추가</h2>
+            <p className="text-xs text-gray-500 mb-3">
+              여기 등록하면 전체 사용자 Personal 탭에 "등록 추천" 으로 표시됩니다. 각 사용자가 자기 키를 등록하면 빨간색 → 정상 색으로 변경.
+            </p>
+            <div className="grid gap-3 md:grid-cols-2">
+              <input value={reqRoleName} onChange={(e) => setReqRoleName(e.target.value)} placeholder="credential 이름 (예: openai-key)" className="px-3 py-2 border border-gray-300 rounded-lg text-sm" />
+              <input value={reqDescription} onChange={(e) => setReqDescription(e.target.value)} placeholder="설명 (선택)" className="px-3 py-2 border border-gray-300 rounded-lg text-sm" />
+            </div>
+            <button
+              onClick={async () => {
+                if (!reqRoleName.trim()) return;
+                try {
+                  await credentialRequestApi.create(reqRoleName.trim(), reqDescription.trim());
+                  setReqRoleName(""); setReqDescription("");
+                  setSuccess("추천 credential 추가됨");
+                  load();
+                } catch (e) {
+                  setError(e instanceof Error ? e.message : "추가 실패");
+                }
+              }}
+              className="mt-3 px-4 py-2 text-xs rounded-lg bg-boan-600 text-white hover:bg-boan-700"
+            >추천 추가</button>
+          </div>
+
+          {/* 추천 목록 (소유자 관리) */}
+          <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
+            <div className="border-b border-gray-200 bg-gray-50 px-5 py-3">
+              <h3 className="text-sm font-semibold text-gray-700">
+                등록된 추천
+                {credRequests.length > 0 && <span className="ml-2 text-xs bg-blue-100 text-blue-700 px-2 py-0.5 rounded-full">{credRequests.length}</span>}
+              </h3>
+            </div>
+            {credRequests.length === 0 ? (
+              <p className="p-5 text-sm text-gray-400 text-center">등록된 추천이 없습니다.</p>
+            ) : (
+              <div className="divide-y divide-gray-100">
+                {credRequests.map((cr) => (
+                  <div key={cr.id} className="px-5 py-4 flex items-center justify-between">
+                    <div>
+                      <span className="text-sm font-mono font-medium text-gray-800">{cr.role_name}</span>
+                      {cr.description && <p className="text-xs text-gray-500 mt-1">{cr.description}</p>}
+                      <span className="text-xs text-gray-400">{new Date(cr.created_at).toLocaleString()}</span>
+                    </div>
+                    <button
+                      onClick={async () => { await credentialRequestApi.remove(cr.id); load(); }}
+                      className="px-3 py-2 text-xs text-red-500 hover:text-red-700"
+                    >삭제</button>
+                  </div>
                 ))}
-              </tbody>
-            </table>
-          )}
+              </div>
+            )}
+          </div>
         </div>
       ) : (
         <>

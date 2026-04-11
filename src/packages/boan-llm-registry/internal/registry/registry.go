@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +22,15 @@ const (
 	ScopeConnector Scope = "CONNECTOR"
 )
 
+// 역할(Role) — 한 LLM이 여러 역할에 동시 바인딩 가능
+const (
+	RoleChat      = "chat"      // 일반 채팅
+	RoleVision    = "vision"    // 이미지 분석 (computer-use agent의 high-level reasoning)
+	RoleGrounding = "grounding" // GUI element grounding (자연어 → 좌표). 별도 호스팅된 OS-Atlas / MAI-UI 등.
+	RoleG2        = "g2"        // G2 가드레일 (작은 모델, 빠른 응답)
+	RoleG3        = "g3"        // G3 wiki 가드레일
+)
+
 type LLMObject struct {
 	Name              string            `json:"name"`
 	Endpoint          string            `json:"endpoint"`
@@ -31,9 +41,27 @@ type LLMObject struct {
 	ImageCurlTemplate string            `json:"image_curl_template,omitempty"`
 	Healthy           bool              `json:"healthy"`
 	LastChecked       time.Time         `json:"last_checked"`
-	IsSecurityLLM     bool              `json:"is_security_llm"`
-	IsSecurityLMM     bool              `json:"is_security_lmm"`
+	Roles             []string          `json:"roles,omitempty"` // ["chat","vision","g2","g3"]
+	// 하위 호환 (deprecated)
+	IsSecurityLLM     bool              `json:"is_security_llm,omitempty"`
+	IsSecurityLMM     bool              `json:"is_security_lmm,omitempty"`
 	RegisteredAt      time.Time         `json:"registered_at,omitempty"`
+}
+
+func (l *LLMObject) HasRole(role string) bool {
+	for _, r := range l.Roles {
+		if r == role {
+			return true
+		}
+	}
+	// 하위 호환: IsSecurityLLM → chat+g2, IsSecurityLMM → vision
+	if l.IsSecurityLLM && (role == RoleChat || role == RoleG2) {
+		return true
+	}
+	if l.IsSecurityLMM && role == RoleVision {
+		return true
+	}
+	return false
 }
 
 type RegistrationHistory struct {
@@ -203,6 +231,77 @@ func (r *Registry) GetSecurityLMM() (*LLMObject, error) {
 	return nil, fmt.Errorf("no security LMM registered")
 }
 
+// BindRole — 특정 LLM에 역할 추가 (다른 LLM의 같은 역할은 제거)
+func (r *Registry) BindRole(name, role string) error {
+	if role != RoleChat && role != RoleVision && role != RoleGrounding && role != RoleG2 && role != RoleG3 {
+		return fmt.Errorf("invalid role: %s", role)
+	}
+	r.mu.Lock()
+	target, ok := r.llms[name]
+	if !ok {
+		r.mu.Unlock()
+		return fmt.Errorf("LLM %q not found", name)
+	}
+	for _, l := range r.llms {
+		if l.Name == name {
+			continue
+		}
+		newRoles := make([]string, 0, len(l.Roles))
+		for _, rr := range l.Roles {
+			if rr != role {
+				newRoles = append(newRoles, rr)
+			}
+		}
+		l.Roles = newRoles
+	}
+	// 실제 Roles 슬라이스 기준으로 중복 확인 (HasRole의 하위호환 로직 우회)
+	already := false
+	for _, rr := range target.Roles {
+		if rr == role {
+			already = true
+			break
+		}
+	}
+	if !already {
+		target.Roles = append(target.Roles, role)
+	}
+	r.mu.Unlock()
+	_ = r.save()
+	return nil
+}
+
+// UnbindRole — 특정 LLM에서 역할 제거
+func (r *Registry) UnbindRole(name, role string) error {
+	r.mu.Lock()
+	target, ok := r.llms[name]
+	if !ok {
+		r.mu.Unlock()
+		return fmt.Errorf("LLM %q not found", name)
+	}
+	newRoles := make([]string, 0, len(target.Roles))
+	for _, rr := range target.Roles {
+		if rr != role {
+			newRoles = append(newRoles, rr)
+		}
+	}
+	target.Roles = newRoles
+	r.mu.Unlock()
+	_ = r.save()
+	return nil
+}
+
+// GetByRole — 특정 역할의 LLM 반환
+func (r *Registry) GetByRole(role string) (*LLMObject, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, l := range r.llms {
+		if l.HasRole(role) {
+			return l, nil
+		}
+	}
+	return nil, fmt.Errorf("no LLM bound to role %q", role)
+}
+
 func (r *Registry) List() []*LLMObject {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -210,6 +309,13 @@ func (r *Registry) List() []*LLMObject {
 	for _, l := range r.llms {
 		out = append(out, l)
 	}
+	// 안정 정렬 — 매 조회마다 같은 순서 (RegisteredAt → Name tiebreaker)
+	sort.SliceStable(out, func(i, j int) bool {
+		if !out[i].RegisteredAt.Equal(out[j].RegisteredAt) {
+			return out[i].RegisteredAt.Before(out[j].RegisteredAt)
+		}
+		return out[i].Name < out[j].Name
+	})
 	return out
 }
 

@@ -7,36 +7,44 @@ function formatApprovalCommand(command: string): string {
     case "guardrail:review":
       return "Critical Guardrail Review";
     case "constitution-amendment:review":
-      return "Constitution Amendment";
+      return "G2 Amendment";
+    case "g1-amendment:review":
+      return "G1 Amendment";
     default:
       return command;
   }
 }
 
+function renderDiffArgs(req: ApprovalRequest): JSX.Element {
+  const diff = req.args.find((a) => a.startsWith("diff="))?.slice(5) ?? "";
+  const reasoning = req.args.find((a) => a.startsWith("reasoning="))?.slice(10) ?? "";
+  return (
+    <div className="max-w-lg">
+      {reasoning && <p className="text-xs text-gray-600 mb-2">{reasoning}</p>}
+      <pre className="text-xs bg-gray-900 text-gray-100 p-3 rounded-lg overflow-x-auto whitespace-pre-wrap">
+        {diff.split("\n").map((line, i) => (
+          <span key={i} className={line.startsWith("+") ? "text-green-400" : line.startsWith("-") ? "text-red-400" : ""}>
+            {line}{"\n"}
+          </span>
+        ))}
+      </pre>
+    </div>
+  );
+}
+
 function renderArgs(req: ApprovalRequest): JSX.Element {
-  if (req.command === "constitution-amendment:review") {
-    const diff = req.args.find((a) => a.startsWith("diff="))?.slice(5) ?? "";
-    const reasoning = req.args.find((a) => a.startsWith("reasoning="))?.slice(10) ?? "";
-    return (
-      <div className="max-w-lg">
-        {reasoning && <p className="text-xs text-gray-600 mb-2">{reasoning}</p>}
-        <pre className="text-xs bg-gray-900 text-gray-100 p-3 rounded-lg overflow-x-auto whitespace-pre-wrap">
-          {diff.split("\n").map((line, i) => (
-            <span key={i} className={line.startsWith("+") ? "text-green-400" : line.startsWith("-") ? "text-red-400" : ""}>
-              {line}{"\n"}
-            </span>
-          ))}
-        </pre>
-      </div>
-    );
+  if (req.command === "constitution-amendment:review" || req.command === "g1-amendment:review") {
+    return renderDiffArgs(req);
   }
   return <span className="font-mono text-gray-600 max-w-xs truncate">{req.args.join(" ")}</span>;
 }
 
-type ApprovalTab = "actions" | "amendments";
+type ApprovalTab = "actions" | "guardrail";
+type GuardrailDiffSub = "G1" | "G2";
 
 export default function Approvals() {
   const [tab, setTab] = useState<ApprovalTab>("actions");
+  const [guardrailSub, setGuardrailSub] = useState<GuardrailDiffSub>("G1");
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -72,10 +80,21 @@ export default function Approvals() {
     }
   };
 
-  const isAmendment = (a: ApprovalRequest) => a.command === "constitution-amendment:review";
-  const filtered = approvals.filter((a) => tab === "amendments" ? isAmendment(a) : !isAmendment(a));
+  const isG1Amendment = (a: ApprovalRequest) => a.command === "g1-amendment:review";
+  const isG2Amendment = (a: ApprovalRequest) => a.command === "constitution-amendment:review";
+  const isGuardrailDiff = (a: ApprovalRequest) => isG1Amendment(a) || isG2Amendment(a);
+
+  const filtered = approvals.filter((a) => {
+    if (tab === "guardrail") {
+      if (!isGuardrailDiff(a)) return false;
+      return guardrailSub === "G1" ? isG1Amendment(a) : isG2Amendment(a);
+    }
+    return !isGuardrailDiff(a);
+  });
   const pending = filtered.filter((a) => a.status === "pending");
   const decided = filtered.filter((a) => a.status !== "pending");
+  const guardrailG1Count = approvals.filter((a) => isG1Amendment(a) && a.status === "pending").length;
+  const guardrailG2Count = approvals.filter((a) => isG2Amendment(a) && a.status === "pending").length;
 
   return (
     <div>
@@ -87,10 +106,45 @@ export default function Approvals() {
       </div>
 
       <div className="flex border-b border-gray-200 mb-4">
-        {([["actions", "User Actions"], ["amendments", "Constitution Diff"]] as const).map(([k, label]) => (
-          <button key={k} onClick={() => setTab(k)} className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${tab === k ? "border-boan-600 text-boan-700" : "border-transparent text-gray-500 hover:text-gray-700"}`}>{label}</button>
+        {([["actions", "User Actions"], ["guardrail", "Guardrail Diff"]] as const).map(([k, label]) => (
+          <button key={k} onClick={() => setTab(k)} className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${tab === k ? "border-boan-600 text-boan-700" : "border-transparent text-gray-500 hover:text-gray-700"}`}>
+            {label}
+            {k === "guardrail" && (guardrailG1Count + guardrailG2Count) > 0 && (
+              <span className="ml-1.5 px-1.5 py-0.5 text-[10px] rounded-full bg-orange-100 text-orange-700 font-semibold">
+                {guardrailG1Count + guardrailG2Count}
+              </span>
+            )}
+          </button>
         ))}
       </div>
+
+      {tab === "guardrail" && (
+        <div className="mb-4">
+          <p className="text-xs text-gray-500 mb-2">
+            LLM(G3 wiki) 이 제안하는 G1 정규식 / G2 헌법 변경안 승인 큐. diff 확인 후 approve 하면 정책에 즉시 반영.
+          </p>
+          <div className="flex gap-1 bg-gray-100 rounded-lg p-1 w-fit">
+            {(["G1", "G2"] as const).map((g) => {
+              const count = g === "G1" ? guardrailG1Count : guardrailG2Count;
+              const active = guardrailSub === g;
+              return (
+                <button
+                  key={g}
+                  onClick={() => setGuardrailSub(g)}
+                  className={`px-3 py-1 rounded-md text-xs font-mono font-medium transition-colors ${
+                    active ? "bg-white shadow text-gray-900" : "text-gray-500 hover:text-gray-700"
+                  }`}
+                >
+                  {g}
+                  {count > 0 && (
+                    <span className="ml-1 px-1 rounded bg-orange-100 text-orange-700 text-[10px]">{count}</span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {error && (
         <div className="mb-4 p-3 rounded-lg bg-red-50 text-red-700 text-sm">

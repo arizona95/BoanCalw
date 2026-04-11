@@ -18,7 +18,23 @@ services:
 
   boan-guacd:
     image: guacamole/guacd:latest
+    # boan-sandbox 의 boan-proxy 와 동일한 UID/GID 로 실행해서 같은 named
+    # volume(boan-rdp-transfer) 의 파일을 양쪽 다 owner 자격으로 read/write
+    # 할 수 있게 한다. guacd 가 RDP drive 채널로 받은 파일을 기본 mode 0600
+    # 으로 쓰기 때문에 owner 가 다르면 S1→S2 전송이 EACCES 로 실패한다.
+    # 같은 BOAN_UID/BOAN_GID 변수로 sandbox 의 build arg 와 동기화.
+    # guacd 는 비특권 포트(4822) 만 바인드하므로 임의 UID 로 동작 가능.
+    user: "${BOAN_UID:-1000}:${BOAN_GID:-1000}"
+    # 임의 UID 는 guacd 이미지 /etc/passwd 에 없어서 HOME 이 "/" 로 fallback 되고,
+    # 그 결과 FreeRDP 가 ~/.config/freerdp/ 에 TLS 인증서/상태를 못 써서 RDP NLA
+    # 보안협상이 "Security negotiation failed (wrong security type?)" 로 실패한다.
+    # /tmp 는 world-writable 이므로 HOME 을 옮기면 FreeRDP 가 /tmp/.config/freerdp/
+    # 에 상태를 저장하고 TLS 핸드셰이크가 정상 동작한다.
+    environment:
+      - HOME=/tmp
     networks: [boanclaw]
+    volumes:
+      - boan-rdp-transfer:/data/rdp-transfer
 
   boan-guacamole:
     image: guacamole/guacamole:latest
@@ -44,8 +60,9 @@ services:
       - BOAN_LISTEN=:8081
       - BOAN_DATA_DIR=/data/policies
       - BOAN_KEY_DIR=/etc/boan-policy
-      - BOAN_GUARDRAIL_LLM_URL=http://boan-sandbox:8083/v1/messages
-      - BOAN_GUARDRAIL_LLM_MODEL=claude-haiku-4-5-20251001
+      - BOAN_MOUNT_ROOT=/home/boan/Desktop/boanclaw
+      # 가드레일 LLM은 LLM Registry의 Security binding 모델을 동적으로 사용
+      # (proxy가 evaluate 요청 시 LLM URL/Model 전달)
     volumes:
       - boan-policy-data:/data/policies
       - boan-policy-keys:/etc/boan-policy
@@ -59,7 +76,6 @@ services:
       retries: 3
 
   boan-credential-filter:
-    profiles: ["legacy-host"]
     build:
       context: src/packages/boan-credential-filter
     environment:
@@ -138,6 +154,8 @@ services:
       - BOAN_LLM_REGISTRY_URL=http://boan-llm-registry:8086
       - BOAN_OTEL_ENDPOINT=http://boan-audit-agent:8084
       - BOAN_USER_DATA_DIR=/data/users
+      - BOAN_MOUNT_ROOT=/home/boan/Desktop/boanclaw
+      - BOAN_S1_STAGE_ROOT=/home/boan/Desktop/boanclaw-gcp
       - BOAN_GUACAMOLE_URL=http://boan-guacamole:8080
       - BOAN_GUACAMOLE_USERNAME=guacadmin
       - BOAN_GUACAMOLE_PASSWORD=guacadmin
@@ -183,10 +201,65 @@ services:
       timeout: 5s
       retries: 5
 
+  # ── boan-grounding ────────────────────────────────────────────────────────
+  # GUI element grounding 전용 vLLM 서버. 자연어 ("the X close button on Notepad")
+  # → 픽셀 좌표 (x, y) 변환만 담당. boan-proxy 의 computer-use agent 가 click 결정 시
+  # http://boan-grounding:8000/v1/chat/completions 호출.
+  #
+  # 모델은 LLM Registry 에서 "grounding" 역할로 바인딩되어야 활성화됨.
+  #
+  # 사용 모델: osunlp/UGround-V1-2B (Qwen2-VL 베이스, BF16 ~4GB VRAM)
+  #   • ScreenSpot-Pro 26.6% / ScreenSpot-v2 77.1% (Mobile-Text 94%, Desktop-Text 92%)
+  #   • 현재 OS-Atlas-Base-7B (18.9%) 대비 40% 향상
+  # 모델 교체: command 의 --model 만 바꾸고 컨테이너 재시작.
+  # 호스트 nvidia driver 가 CUDA 12.9+ 지원하면 vllm/vllm-openai:latest + Tongyi-MAI/MAI-UI-2B
+  #   (ScreenSpot-Pro 57.4%) 로 업그레이드 가능. 현재는 driver CUDA 12.4 라 v0.8.5.
+  #
+  # 요구사항: host 에 nvidia-container-toolkit (이미 됨).
+  boan-grounding:
+    image: vllm/vllm-openai:v0.8.5
+    command:
+      - "--model=osunlp/UGround-V1-2B"
+      - "--served-model-name=grounding"
+      - "--host=0.0.0.0"
+      - "--port=8000"
+      - "--dtype=bfloat16"
+      - "--max-model-len=4096"
+      - "--gpu-memory-utilization=0.85"
+      - "--trust-remote-code"
+      - "--enforce-eager"
+    environment:
+      - HF_HUB_ENABLE_HF_TRANSFER=1
+    volumes:
+      - boan-hf-cache:/root/.cache/huggingface
+    networks: [boanclaw]
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/v1/models', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 30   # 첫 모델 다운로드 시간 고려: 30 * 30s = 15분
+      start_period: 60s
+    restart: unless-stopped
+
   boan-sandbox:
     build:
       context: src/packages
       dockerfile: boan-sandbox/Dockerfile
+      # boan UID/GID 를 host 사용자와 일치시켜서, sandbox 가 host bind mount
+      # (~/Desktop/boanclaw 등) 에 만든 파일이 host 에서 본인 소유로 보이게 한다.
+      # 기본 1000 은 일반 Linux 데스크탑 첫 사용자 UID. 다른 UID 를 쓰는 환경은
+      # `BOAN_UID=$(id -u) BOAN_GID=$(id -g) docker compose build` 로 override.
+      args:
+        - BOAN_UID=${BOAN_UID:-1000}
+        - BOAN_GID=${BOAN_GID:-1000}
     env_file:
       - deploy/config/gcp.env
     environment:
@@ -197,41 +270,46 @@ services:
       - no_proxy=localhost,127.0.0.1,boan-proxy,boan-policy-server,boan-guacamole,boan-audit-agent,boan-credential-filter,boan-llm-registry,boan-whitelist-proxy,boan-computer-use
       - BOAN_PROXY_ADMIN=http://localhost:18081
       - BOAN_SESSION_ID=dev-session-001
-      - BOAN_ONECLI_CRED_FILTER_URL=http://localhost:8082
+      - BOAN_ONECLI_CRED_FILTER_URL=http://boan-credential-filter:8082
       - BOAN_ONECLI_ORG_ID=sds-corp
       - BOAN_ONECLI_CREDENTIAL_NAME=anthropic-apikey-65a1f06a
       - BOAN_ONECLI_CREDENTIAL_TYPE=api_key
-      - BOAN_ONECLI_UPSTREAM_URL=https://api.anthropic.com
+      # BOAN_ONECLI_UPSTREAM_URL 제거 — LLM Registry에서 동적 사용
       - BOAN_ORG_ID=sds-corp
       - BOAN_LISTEN=:18080
       - BOAN_ADMIN_LISTEN=:18081
       - BOAN_POLICY_URL=http://boan-policy-server:8081
       - BOAN_AUDIT_ENDPOINT=http://boan-audit-agent:8084
-      - BOAN_CREDENTIAL_FILTER_URL=http://localhost:8082
+      - BOAN_CREDENTIAL_FILTER_URL=http://boan-credential-filter:8082
       - BOAN_LLM_REGISTRY_URL=http://localhost:8086
       - BOAN_USER_DATA_DIR=/data/users
-      - BOAN_CREDENTIAL_DATA_DIR=/data/credentials
+      - BOAN_CREDENTIAL_DATA_DIR=/tmp/boan/credentials
       - BOAN_GUACAMOLE_URL=http://boan-guacamole:8080
       - BOAN_GUACAMOLE_USERNAME=guacadmin
       - BOAN_GUACAMOLE_PASSWORD=guacadmin
       - BOAN_GUACAMOLE_BASE_PATH=/remote
-      - BOAN_KMS_KEY=/etc/boan-cred/aes.key
       - BOAN_DATA_DIR=/data/registry
+      # 모든 정보레벨 경로는 바탕화면/boanclaw 기반으로 통일
+      # S3(host PC): $HOME/Desktop/boanclaw (호스트마다 다름, compose resolve 해서 mount 소스로만 사용)
+      # S2(sandbox): /home/boan/Desktop/boanclaw (고정)
+      # S1(GCP Windows staging, sandbox-local): /home/boan/Desktop/boanclaw-gcp
+      - BOAN_MOUNT_ROOT=/home/boan/Desktop/boanclaw
+      - BOAN_S1_STAGE_ROOT=/home/boan/Desktop/boanclaw-gcp
       - BOAN_CA_CERT=/tmp/boan/ca.crt
       - BOAN_CA_KEY=/tmp/boan/ca.key
       - GOOGLE_APPLICATION_CREDENTIALS=/var/run/gcp/service-account.json
       - BOAN_OPENCLAW_GATEWAY_TOKEN=boan-openclaw-local
+      - BOAN_RDP_TRANSFER_ROOT=/data/rdp-transfer
     ports:
       - "18789:18789"
     volumes:
-      - ${BOAN_HOST_MOUNT_ROOT:-${HOME}/boanclaw}:/workspace/boanclaw
+      - ${BOAN_HOST_MOUNT_ROOT:-${HOME}/Desktop/boanclaw}:/home/boan/Desktop/boanclaw
       - ${BOAN_GCP_SERVICE_ACCOUNT_KEY_PATH:-${HOME}/.config/gcp/boanclaw-terraform-sa.json}:/var/run/gcp/service-account.json:ro
       - boan-user-data:/data/users
       - boan-registry-data:/data/registry
-      - boan-cred-data:/data/credentials
-      - boan-cred-keys:/etc/boan-cred
+      - boan-rdp-transfer:/data/rdp-transfer
     networks: [boanclaw]
-    depends_on: [boan-policy-server, boan-audit-agent, boan-guacamole, boan-computer-use]
+    depends_on: [boan-policy-server, boan-audit-agent, boan-guacamole, boan-computer-use, boan-credential-filter]
 
 volumes:
   boan-guac-db:
@@ -241,3 +319,5 @@ volumes:
   boan-cred-data:
   boan-registry-data:
   boan-user-data:
+  boan-rdp-transfer:
+  boan-hf-cache:    # vLLM 의 HuggingFace 모델 캐시 (재시작 시 재다운로드 회피)

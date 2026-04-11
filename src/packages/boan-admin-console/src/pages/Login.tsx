@@ -144,7 +144,7 @@ export default function Login() {
             <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-left">
               <p className="text-xs font-semibold text-amber-800">TEST MODE</p>
               <p className="mt-1 text-xs text-amber-700">
-                테스트 환경입니다. 소유자 계정은 OTP 없이 바로 로그인됩니다.
+                테스트 환경입니다. 모든 등록된 사용자가 OTP 없이 바로 로그인됩니다.
               </p>
               {ownerEmail ? (
                 <p className="mt-1 text-[11px] text-amber-700">소유자 계정: {ownerEmail}</p>
@@ -176,7 +176,7 @@ export default function Login() {
                 >
                   {loading
                     ? "전송 중..."
-                    : testMode && ownerEmail && email.trim().toLowerCase() === ownerEmail.trim().toLowerCase()
+                    : testMode
                       ? "테스트 로그인"
                       : "코드 받기"}
                 </button>

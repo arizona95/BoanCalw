@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -142,7 +143,7 @@ type CredentialMeta struct {
 func (s *Store) List(orgID string) []CredentialMeta {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	var out []CredentialMeta
+	out := make([]CredentialMeta, 0)
 	for _, c := range s.creds {
 		if c.OrgID != orgID {
 			continue
@@ -158,6 +159,8 @@ func (s *Store) List(orgID string) []CredentialMeta {
 			ExpiresAt: c.ExpiresAt.Format(time.RFC3339),
 		})
 	}
+	// 안정 정렬 — Role 기준 (매 조회마다 같은 순서)
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Role < out[j].Role })
 	return out
 }
 

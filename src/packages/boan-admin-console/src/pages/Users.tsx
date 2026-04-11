@@ -104,9 +104,6 @@ export default function Users() {
                     </span>
                   </td>
                   <td className="px-4 py-3">
-                    {u.role === "owner" ? (
-                      <span className="text-xs text-gray-300">-</span>
-                    ) : (
                       <select
                         value={u.access_level || "ask"}
                         onChange={(e) => patch(u.email, { access_level: e.target.value })}
@@ -116,7 +113,6 @@ export default function Users() {
                         <option value="ask">Ask</option>
                         <option value="deny">Deny</option>
                       </select>
-                    )}
                   </td>
                   <td className="px-4 py-3 text-xs text-gray-500 font-mono">{u.org_id || "-"}</td>
                   <td className="px-4 py-3">

@@ -65,6 +65,7 @@ type Config struct {
 	GuacamoleBasePath         string        `json:"guacamole_base_path"`
 	OpenClawGatewayToken      string        `json:"openclaw_gateway_token"`
 	ComputerUseURL            string        `json:"computer_use_url"`
+	RDPTransferRoot           string        `json:"rdp_transfer_root"`
 }
 
 func Load() (*Config, error) {
@@ -125,6 +126,7 @@ func Load() (*Config, error) {
 		GuacamoleBasePath:         env("BOAN_GUACAMOLE_BASE_PATH", "/remote/"),
 		OpenClawGatewayToken:      env("BOAN_OPENCLAW_GATEWAY_TOKEN", "boan-openclaw-local"),
 		ComputerUseURL:            env("BOAN_COMPUTER_USE_URL", "http://boan-computer-use:8090"),
+		RDPTransferRoot:           env("BOAN_RDP_TRANSFER_ROOT", "/data/rdp-transfer"),
 	}
 
 	if f := os.Getenv("BOAN_CONFIG"); f != "" {

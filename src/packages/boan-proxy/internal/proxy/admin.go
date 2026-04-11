@@ -9,8 +9,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"image"
+	"image/color"
 	"image/jpeg"
-	_ "image/png"
+	"image/png"
 	"io"
 	"log"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -37,16 +39,159 @@ type cuQueuedCmd struct {
 	done   chan []byte
 }
 
+// userRDPTransferDir — RDP virtual drive 가 마운트되는 사용자별 staging 디렉토리.
+// boan-sandbox 와 boan-guacd 가 동일 볼륨(boan-rdp-transfer) 을 공유하므로
+// 여기 쓴 파일은 사용자의 활성 Guacamole RDP 세션에서 BoanClaw 드라이브로 보임.
+// 반대로 사용자가 RDP 안에서 BoanClaw 드라이브에 둔 파일도 여기서 읽힌다.
+func userRDPTransferDir(root, email string) string {
+	safe := strings.ToLower(strings.TrimSpace(email))
+	if safe == "" {
+		safe = "_anon"
+	}
+	// 경로 이스케이프 방어 — slash, backslash, dotdot 차단.
+	safe = strings.NewReplacer("/", "_", "\\", "_", "..", "_").Replace(safe)
+	return filepath.Join(root, safe)
+}
+
+// ensureRDPTransferDir — RDP staging 디렉토리를 생성하면서 guacd 가 쓸 수 있게
+// 권한을 보장한다. boan-sandbox(uid 2000/boan)가 만든 디렉토리를
+// boan-guacd(uid 1000/guacd)가 같은 named volume 으로 마운트해서 접근하기 때문에
+// other 비트에 write 권한이 없으면 RDP 드라이브 업로드(Win → sandbox)가
+// EACCES 로 실패한다. MkdirAll 은 process umask 의 영향을 받으므로
+// 명시적으로 Chmod 를 한 번 더 호출해서 0o777 을 강제한다.
+// (named volume 은 compose stack 내부 전용이고, 사용자별 email 디렉토리로
+// 이미 격리되어 있어서 추가 노출 위험은 없음.)
+func ensureRDPTransferDir(path string) error {
+	if err := os.MkdirAll(path, 0o777); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o777)
+}
+
 var (
 	cuQueueMu     sync.Mutex
 	cuPendingQueue []*cuQueuedCmd // waiting to be picked up by browser poll
 	cuInFlight     []*cuQueuedCmd // picked up, waiting for result
 )
 
+// ── computer-use 최종 screenshot 보관 (chat 인젝트용) ──────────────────────
+// inline base64 를 chat 메시지에 박으면 OpenClaw markdown 렌더러가 새로고침
+// 후 긴 string 을 못 파싱해서 이미지가 깨진다. 대신 in-memory map 에 저장하고
+// /api/computer-use/screenshot/{id}.jpg 로 서빙. inject 메시지엔 short URL 만.
+//
+// TTL: 6시간 (~24시간 사용자 세션 + 안전 마진).
+// max entries: 200 (oldest evicted).
+type cuScreenshot struct {
+	jpegBytes []byte
+	createdAt time.Time
+}
+
+var (
+	cuScreenshotMu    sync.Mutex
+	cuScreenshotStore = map[string]cuScreenshot{}
+)
+
+const cuScreenshotTTL = 6 * time.Hour
+const cuScreenshotMaxEntries = 200
+
+// storeChatScreenshot — JPEG bytes 를 저장하고 ID 반환. 호출측은 ID 로 URL 생성.
+func storeChatScreenshot(jpeg []byte) string {
+	idBytes := make([]byte, 8)
+	crand.Read(idBytes)
+	id := hex.EncodeToString(idBytes)
+	now := time.Now()
+	cuScreenshotMu.Lock()
+	defer cuScreenshotMu.Unlock()
+	cuScreenshotStore[id] = cuScreenshot{jpegBytes: jpeg, createdAt: now}
+	// 간단한 GC: 만료 + 최대 개수 초과 시 오래된 것부터 제거
+	if len(cuScreenshotStore) > cuScreenshotMaxEntries {
+		oldest := ""
+		oldestT := now
+		for k, v := range cuScreenshotStore {
+			if v.createdAt.Before(oldestT) {
+				oldest = k
+				oldestT = v.createdAt
+			}
+		}
+		if oldest != "" {
+			delete(cuScreenshotStore, oldest)
+		}
+	}
+	for k, v := range cuScreenshotStore {
+		if now.Sub(v.createdAt) > cuScreenshotTTL {
+			delete(cuScreenshotStore, k)
+		}
+	}
+	return id
+}
+
+func loadChatScreenshot(id string) ([]byte, bool) {
+	cuScreenshotMu.Lock()
+	defer cuScreenshotMu.Unlock()
+	s, ok := cuScreenshotStore[id]
+	if !ok {
+		return nil, false
+	}
+	if time.Since(s.createdAt) > cuScreenshotTTL {
+		delete(cuScreenshotStore, id)
+		return nil, false
+	}
+	return s.jpegBytes, true
+}
+
+// ── Observability: 로깅/트레이싱 수집 ──────────────────────────────────────
+type traceEntry struct {
+	ID        string `json:"id"`
+	Timestamp string `json:"timestamp"`
+	Type      string `json:"type"`      // chat, guardrail, network, credential, file, system
+	Direction string `json:"direction"` // inbound, outbound, internal
+	Source    string `json:"source"`    // user email or service name
+	Target    string `json:"target"`    // llm, gcp, policy-server, etc
+	Summary   string `json:"summary"`   // 요약 (메시지 앞 200자)
+	Decision  string `json:"decision"`  // allow, block, ask, n/a
+	Gate      string `json:"gate"`      // G1, G2, G3, network, credential, none
+	Duration  int64  `json:"duration_ms"`
+	Meta      map[string]any `json:"meta,omitempty"`
+}
+
+var (
+	traceMu    sync.Mutex
+	traceStore []traceEntry
+	traceMaxEntries = 500
+)
+
+func addTrace(t traceEntry) {
+	if t.ID == "" {
+		b := make([]byte, 8)
+		crand.Read(b)
+		t.ID = hex.EncodeToString(b)
+	}
+	if t.Timestamp == "" {
+		t.Timestamp = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	traceMu.Lock()
+	traceStore = append(traceStore, t)
+	if len(traceStore) > traceMaxEntries {
+		traceStore = traceStore[len(traceStore)-traceMaxEntries:]
+	}
+	traceMu.Unlock()
+}
+
+// credential 등록 추천 (소유자가 org-wide 로 등록; 전체 사용자가 자기 개인 키 등록 권고)
+// fulfill 은 per-user (세션 email 기준 personal 키 생성) — recommendation 자체는 유지됨
+type credentialRequest struct {
+	ID          string `json:"id"`
+	RoleName    string `json:"role_name"`   // credential role 이름 (예: openai-key)
+	Description string `json:"description"` // 설명
+	CreatedAt   string `json:"created_at"`
+}
+
 var (
 	approvalsMu    sync.Mutex
 	approvalsStore []map[string]any
 	pendingCredentialApprovals = map[string][]credentialApprovalCandidate{}
+	credReqMu      sync.Mutex
+	credReqStore   []credentialRequest
 	registryCredentialPatterns = []*regexp.Regexp{
 		regexp.MustCompile(`-H\s+["']?(Authorization|authorization):\s*Bearer\s+([A-Za-z0-9\-_\.=]{16,})["']?`),
 		regexp.MustCompile(`-H\s+["']?(x-api-key|X-Api-Key|x-goog-api-key):\s*([A-Za-z0-9\-_\.=]{16,})["']?`),
@@ -226,38 +371,19 @@ func (s *Server) StartAdmin() {
 		return id
 	}
 
-	type mountPolicyResponse struct {
-		OrgSettings struct {
-			MountRoot string `json:"mount_root"`
-		} `json:"org_settings"`
+	mountRootForOrg := func(_ string) string {
+		root := strings.TrimSpace(os.Getenv("BOAN_MOUNT_ROOT"))
+		if root == "" {
+			home, _ := os.UserHomeDir()
+			if home == "" {
+				home = "/root"
+			}
+			root = filepath.Join(home, "Desktop", "boanclaw")
+		}
+		return filepath.Clean(root)
 	}
 
-	mountRootForOrg := func(orgID string) string {
-		defaultRoot := "/workspace/boanclaw"
-		if strings.TrimSpace(s.cfg.PolicyURL) == "" {
-			return defaultRoot
-		}
-		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, s.cfg.PolicyURL+"/org/"+orgID+"/policy.json", nil)
-		if err != nil {
-			return defaultRoot
-		}
-		resp, err := client.Do(req)
-		if err != nil {
-			return defaultRoot
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return defaultRoot
-		}
-		var policy mountPolicyResponse
-		if err := json.NewDecoder(resp.Body).Decode(&policy); err != nil {
-			return defaultRoot
-		}
-		if strings.TrimSpace(policy.OrgSettings.MountRoot) == "" {
-			return defaultRoot
-		}
-		return filepath.Clean(policy.OrgSettings.MountRoot)
-	}
+	// (S1 staging dir 은 더 이상 사용 안 함 — SCP 로 GCP Windows 에 직접 전송)
 
 	isWithinMountRoot := func(root, target string) bool {
 		cleanRoot := filepath.Clean(root)
@@ -837,31 +963,77 @@ func (s *Server) StartAdmin() {
 		}
 	}
 
+	// registry에서 security LLM 정보를 캐싱 (guardrail 요청에 포함)
+	securityLLMURL, securityLLMModel := "", ""
+	if entry, err := s.loadSelectedRegistryLLM(context.Background()); err == nil && entry != nil {
+		securityLLMURL = entry.Endpoint
+		securityLLMModel = entry.Name
+		if entry.CurlTemplate != "" {
+			_, ep, _, _ := parseCurlTemplate(entry.CurlTemplate)
+			if ep != "" {
+				securityLLMURL = ep
+			}
+		}
+	}
+
 	runGCPSend := func(ctx context.Context, requester, orgID, text string) (string, error) {
-		resp := evaluateInputGate(ctx, s.dlpEng, s.guardrail, orgID,
-			InputGateRequest{Mode: "text", Text: text, SrcLevel: 3, DestLevel: 1, Flow: "openclaw-chat-to-remote-workstation"},
-			func(reason string, req InputGateRequest) string {
-				approvalID := createInputGateApproval(requester, orgID, reason, req)
-				if s.cfg.PolicyURL != "" {
-					go s.runAutoJudgeForApproval(approvalID, orgID, req.Text, req.Mode, reason)
-				}
-				return approvalID
+		// 사용자 access_level 조회 (default "ask")
+		userAccessLevel := "ask"
+		if requester != "" && !strings.Contains(requester, "openclaw-control-ui") {
+			if u, err := s.users.Get(requester); err == nil && u != nil && u.AccessLevel != "" {
+				userAccessLevel = string(u.AccessLevel)
+			}
+		}
+		// Fetch G1 patterns from policy
+		var g1Patterns []G1PatternRule
+		if rules, _ := s.guardrail.GetGuardrailRules(ctx, orgID); rules != nil {
+			for _, r := range rules.G1Patterns {
+				g1Patterns = append(g1Patterns, G1PatternRule{Pattern: r.Pattern, Mode: r.Mode})
+			}
+		}
+		req := InputGateRequest{
+			Mode: "text", Text: text, SrcLevel: 3, DestLevel: 1,
+			Flow:       "openclaw-chat-to-remote-workstation",
+			UserEmail:  requester, AccessLevel: userAccessLevel,
+			LLMURL:     securityLLMURL, LLMModel: securityLLMModel,
+			G1Patterns: g1Patterns,
+		}
+		resp := evaluateInputGateWithLocal(ctx, s.dlpEng, s.guardrail, s.evaluateGuardrailLocal, orgID, req,
+			func(reason string, r InputGateRequest) string {
+				return createInputGateApproval(requester, orgID, reason, r)
 			},
 		)
 		if resp.Action == "credential_required" && text != "" {
 			gateResult := s.applyCredentialGate(ctx, orgID, text, func(keys []string, previews []string, fps []string) string {
 				return createCredentialGateApproval(orgID, keys, previews, fps)
 			})
-			resp = InputGateResponse{Allowed: true, Action: "allow", NormalizedText: gateResult.Prompt, Reason: "credential substituted", ApprovalID: gateResult.ApprovalID}
+			resp = InputGateResponse{Allowed: true, Action: "allow", Tier: "G1+credential", NormalizedText: gateResult.Prompt, Reason: "credential substituted", ApprovalID: gateResult.ApprovalID}
 			if gateResult.HITLRequired {
 				resp.Reason = "credential detected; unknown values redacted, HITL created"
 			}
 		}
+		// Observability trace — tier 와 reason 포함
+		trSummary := text
+		if len(trSummary) > 200 {
+			trSummary = trSummary[:200] + "..."
+		}
+		addTrace(traceEntry{
+			Type: "guardrail", Direction: "outbound", Source: requester, Target: "gcp",
+			Summary: trSummary, Decision: resp.Action, Gate: resp.Tier,
+			Meta: map[string]any{
+				"flow":         req.Flow,
+				"src_level":    req.SrcLevel,
+				"dest_level":   req.DestLevel,
+				"tier":         resp.Tier,
+				"reason":       resp.Reason,
+				"access_level": userAccessLevel,
+			},
+		})
 		if !resp.Allowed {
 			if resp.Action == "hitl_required" && resp.ApprovalID != "" {
 				return fmt.Sprintf("입력이 보류되었습니다. 관리자 승인 대기 중입니다. approval=%s", resp.ApprovalID), nil
 			}
-			return "", fmt.Errorf("가드레일에 통과되지 못하였습니다: 사유 - %s", firstNonEmptyString(resp.Reason, "input blocked"))
+			return "", fmt.Errorf("가드레일에 통과되지 못하였습니다 — [%s] %s", resp.Tier, firstNonEmptyString(resp.Reason, "input blocked"))
 		}
 		// 실제 타이핑은 클라이언트(브라우저)가 직접 injectTextToRemote로 처리.
 		// 여기서는 가드레일 통과 결과만 반환.
@@ -1032,9 +1204,59 @@ func (s *Server) StartAdmin() {
 			return
 		}
 		orgID := resolveOrg(r)
+		sess, _ := auth.SessionFromRequest(r, s.authProv)
+		sender := orgID
+		if sess != nil { sender = sess.Email }
 		prompt := extractPromptFromMessages(body["messages"])
 		mode, payload := parseOperatorMode(prompt, "chat")
-		log.Printf("[openclaw/v1] mode=%s payload=%.80q org=%s", mode, payload, orgID)
+		log.Printf("[openclaw/v1] mode=%s payload=%.80q org=%s user=%s", mode, payload, orgID, sender)
+
+		// G1/G2/G3 가드레일: OpenClaw 채팅도 가드레일 적용
+		// registry에서 security LLM 정보 가져오기
+		var secLLMURL, secLLMModel string
+		if entry, err := s.loadSelectedRegistryLLM(r.Context()); err == nil && entry != nil {
+			secLLMModel = entry.Name
+			if entry.CurlTemplate != "" {
+				if _, ep, _, _ := parseCurlTemplate(entry.CurlTemplate); ep != "" {
+					secLLMURL = ep
+				}
+			}
+			if secLLMURL == "" { secLLMURL = entry.Endpoint }
+		}
+		// 사용자 access_level 조회
+		userAccessLevel := "ask"
+		if sess != nil {
+			if u, err := s.users.Get(sess.Email); err == nil && u != nil {
+				if u.AccessLevel != "" { userAccessLevel = string(u.AccessLevel) }
+			}
+		}
+
+		if mode == "chat" && payload != "" {
+			gateResp := evaluateInputGateWithLocal(r.Context(), s.dlpEng, s.guardrail, s.evaluateGuardrailLocal, orgID, InputGateRequest{
+				Mode: "text", Text: payload, SrcLevel: 3, DestLevel: 1,
+				Flow: "openclaw-chat-direct",
+				UserEmail: sender, AccessLevel: userAccessLevel,
+				LLMURL: secLLMURL, LLMModel: secLLMModel,
+			}, func(reason string, req InputGateRequest) string {
+				return createInputGateApproval(sender, orgID, reason, req)
+			})
+			if !gateResp.Allowed {
+				log.Printf("[openclaw/v1] guardrail blocked: %s", gateResp.Reason)
+				addTrace(traceEntry{
+					Type: "guardrail", Direction: "inbound", Source: sender, Target: "llm",
+					Summary: payload, Decision: gateResp.Action, Gate: "G2",
+				})
+				writeOpenAITextResponse(w, "[가드레일 차단] "+gateResp.Reason)
+				return
+			}
+		}
+
+		summary := payload
+		if len(summary) > 200 { summary = summary[:200] + "..." }
+		addTrace(traceEntry{
+			Type: "chat", Direction: "inbound", Source: sender, Target: "llm",
+			Summary: summary, Decision: "allow", Gate: "G1",
+		})
 
 		if mode != "chat" {
 			isStream, _ := body["stream"].(bool)
@@ -1126,6 +1348,45 @@ func (s *Server) StartAdmin() {
 		json.NewEncoder(w).Encode(resp)
 	})
 
+	// POST /api/workstation/repair — 현재 세션 사용자의 워크스테이션 RDP 비밀번호를 강제 갱신.
+	// VM startup script 로 새 비밀번호 push → 재부팅 → boanclaw 에 새 자격 저장.
+	// Guacamole 가 RDP "invalid credentials" 로 실패할 때 사용자가 수동 호출.
+	mux.HandleFunc("/api/workstation/repair", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		sess, err := auth.SessionFromRequest(r, s.authProv)
+		if err != nil {
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]any{"error": "unauthenticated"})
+			return
+		}
+		current, _ := s.users.Workstation(sess.Email)
+		if current == nil {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]any{"error": "no workstation provisioned"})
+			return
+		}
+		repaired, repErr := s.workstations.RepairCredentials(r.Context(), sess.Email, sess.OrgID, current)
+		if repErr != nil {
+			log.Printf("workstation manual repair failed for %s: %v", sess.Email, repErr)
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]any{"error": repErr.Error()})
+			return
+		}
+		if repaired != nil {
+			_ = s.users.AssignWorkstation(sess.Email, repaired)
+		}
+		log.Printf("workstation repaired for %s — VM restart in progress", sess.Email)
+		json.NewEncoder(w).Encode(map[string]any{
+			"status": "ok",
+			"hint":   "VM 비밀번호 재설정 + 재부팅 중입니다. 1-2분 후 Personal Computer 페이지를 새로고침하세요.",
+			"email":  sess.Email,
+		})
+	})
+
 	mux.HandleFunc("/api/workstation/me", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		sess, err := auth.SessionFromRequest(r, s.authProv)
@@ -1165,7 +1426,9 @@ func (s *Server) StartAdmin() {
 			return
 		}
 		if s.guac != nil {
-			if remoteURL, remoteErr := s.guac.EnsureSessionURL(r.Context(), ws); remoteErr == nil && remoteURL != "" {
+			drivePath := userRDPTransferDir(s.cfg.RDPTransferRoot, sess.Email)
+			_ = ensureRDPTransferDir(drivePath)
+			if remoteURL, remoteErr := s.guac.EnsureSessionURL(r.Context(), ws, drivePath); remoteErr == nil && remoteURL != "" {
 				ws.WebDesktopURL = remoteURL
 				_ = s.users.AssignWorkstation(sess.Email, ws)
 			} else if remoteErr != nil {
@@ -1219,19 +1482,29 @@ func (s *Server) StartAdmin() {
 			return
 		}
 
-		resp := evaluateInputGate(
+		// 세션 기준으로 user_email/access_level 주입 (클라이언트가 이미 값 보냈어도 덮어씀 — 신뢰할 수 없음)
+		body.UserEmail = sess.Email
+		body.AccessLevel = "ask"
+		if u, err := s.users.Get(sess.Email); err == nil && u != nil && u.AccessLevel != "" {
+			body.AccessLevel = string(u.AccessLevel)
+		}
+		// G1 patterns 는 서버가 권위 있음 (클라이언트 body 덮어씀)
+		if rules, _ := s.guardrail.GetGuardrailRules(r.Context(), sess.OrgID); rules != nil {
+			body.G1Patterns = make([]G1PatternRule, 0, len(rules.G1Patterns))
+			for _, r := range rules.G1Patterns {
+				body.G1Patterns = append(body.G1Patterns, G1PatternRule{Pattern: r.Pattern, Mode: r.Mode})
+			}
+		}
+
+		resp := evaluateInputGateWithLocal(
 			r.Context(),
 			s.dlpEng,
 			s.guardrail,
+			s.evaluateGuardrailLocal,
 			sess.OrgID,
 			body,
 			func(reason string, req InputGateRequest) string {
-				approvalID := createInputGateApproval(sess.Email, sess.OrgID, reason, req)
-				// Auto-judge: check if org has auto_approve_mode on.
-				if s.cfg.PolicyURL != "" {
-					go s.runAutoJudgeForApproval(approvalID, sess.OrgID, req.Text, req.Mode, reason)
-				}
-				return approvalID
+				return createInputGateApproval(sess.Email, sess.OrgID, reason, req)
 			},
 		)
 		// Credential-like input: substitute registered credentials with
@@ -1265,6 +1538,23 @@ func (s *Server) StartAdmin() {
 				Tool:    "input-gate",
 				Method:  "POST",
 				BodyHash: audit.HashBody([]byte(body.Text + "|" + body.Key)),
+			})
+			// observability trace — tier 와 reason 포함
+			trSummary := body.Text
+			if trSummary == "" { trSummary = body.Key }
+			if len(trSummary) > 200 { trSummary = trSummary[:200] + "..." }
+			addTrace(traceEntry{
+				Type: "guardrail", Direction: "outbound", Source: sess.Email, Target: "gcp",
+				Summary: trSummary, Decision: resp.Action, Gate: resp.Tier,
+				Meta: map[string]any{
+					"flow":         body.Flow,
+					"mode":         body.Mode,
+					"src_level":    body.SrcLevel,
+					"dest_level":   body.DestLevel,
+					"tier":         resp.Tier,
+					"reason":       resp.Reason,
+					"access_level": body.AccessLevel,
+				},
 			})
 		}
 		if !resp.Allowed {
@@ -1373,8 +1663,17 @@ func (s *Server) StartAdmin() {
 			json.NewEncoder(w).Encode(map[string]string{"error": "허용된 회사 이메일만 사용할 수 있습니다."})
 			return
 		}
-		if s.cfg.TestMode && ownerMatch(body.Email) {
-			roleVal, orgID, allowed, pendingMsg, err := resolveLoginAccess(body.Email, body.Email, "test_owner")
+		// TEST 모드 — 모든 사용자가 OTP 없이 바로 로그인됨.
+		// 이전에는 owner 만 우회했지만, 다중 사용자 시나리오 (예: dowoo.baik 으로 로그인해서
+		// 가드레일/whitelist 검증) 를 빠르게 돌리기 위해 모든 등록된 사용자도 같이 우회.
+		// production 환경(s.cfg.TestMode == false)에서는 이 분기 자체가 실행 안 됨.
+		if s.cfg.TestMode {
+			isOwner := ownerMatch(body.Email)
+			loginType := "test_user"
+			if isOwner {
+				loginType = "test_owner"
+			}
+			roleVal, orgID, allowed, pendingMsg, err := resolveLoginAccess(body.Email, body.Email, loginType)
 			if err != nil {
 				w.WriteHeader(http.StatusBadGateway)
 				json.NewEncoder(w).Encode(map[string]string{"error": "조직 서버 저장 실패: " + err.Error()})
@@ -1391,6 +1690,10 @@ func (s *Server) StartAdmin() {
 				return
 			}
 			warmWorkstation(body.Email, orgID)
+			hintMsg := "TEST 모드: OTP 없이 바로 로그인됩니다."
+			if isOwner {
+				hintMsg = "TEST 모드 소유자 계정은 OTP 없이 바로 로그인됩니다."
+			}
 			json.NewEncoder(w).Encode(map[string]any{
 				"status":      "ok",
 				"test_mode":   true,
@@ -1398,7 +1701,7 @@ func (s *Server) StartAdmin() {
 				"role":        string(roleVal),
 				"role_label":  roles.Labels[roleVal],
 				"org_id":      orgID,
-				"hint":        "TEST 모드 소유자 계정은 OTP 없이 바로 로그인됩니다.",
+				"hint":        hintMsg,
 			})
 			return
 		}
@@ -1623,9 +1926,10 @@ func (s *Server) StartAdmin() {
 				AccessLevel string `json:"access_level"`
 			}
 			json.NewDecoder(r.Body).Decode(&body)
-			if ownerMatch(body.Email) {
+			// 소유자: access_level 변경은 허용, role/action 변경은 차단
+			if ownerMatch(body.Email) && (body.Role != "" || body.Action != "") {
 				w.WriteHeader(http.StatusForbidden)
-				json.NewEncoder(w).Encode(map[string]string{"error": "고정 소유자는 변경할 수 없습니다."})
+				json.NewEncoder(w).Encode(map[string]string{"error": "고정 소유자의 역할/상태는 변경할 수 없습니다."})
 				return
 			}
 			if strings.TrimSpace(body.Role) == string(roles.Owner) {
@@ -1798,17 +2102,44 @@ func (s *Server) StartAdmin() {
 		http.NotFound(w, r)
 	})
 
+	mux.HandleFunc("/api/guardrail/g1-defaults", func(w http.ResponseWriter, r *http.Request) {
+		if cors(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"patterns": DefaultG1Patterns,
+		})
+	})
+
 	mux.HandleFunc("/api/mount/config", func(w http.ResponseWriter, r *http.Request) {
 		if cors(w, r) {
 			return
 		}
 		orgID := resolveOrg(r)
-		root := mountRootForOrg(orgID)
+		sandboxRoot := mountRootForOrg(orgID)
+		// 경로는 심볼릭 형태로 표시. 사용자마다 다른 환경.
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"org_id":      orgID,
-			"mount_root":  root,
-			"allowedDirs": []string{root},
+			"mount_root":  sandboxRoot, // 하위 호환
+			"allowedDirs": []string{sandboxRoot},
+			// 새 구조: S3/S2/S1 경로 각각 + 어떤 env var 에서 왔는지
+			"paths": map[string]any{
+				"host_s3": map[string]string{
+					"env_var": "BOAN_HOST_MOUNT_ROOT",
+					"value":   "$HOME/Desktop/boanclaw",
+				},
+				"sandbox_s2": map[string]string{
+					"env_var": "BOAN_MOUNT_ROOT",
+					"value":   sandboxRoot,
+				},
+				"s1_stage": map[string]string{
+					"env_var": "GCP Windows VM",
+					// SCP 로 직접 GCP Windows VM 의 사용자 Desktop\boanclaw 에 전송.
+					"value": `C:\Users\<user>\Desktop\boanclaw`,
+				},
+			},
 		})
 	})
 
@@ -1848,9 +2179,15 @@ func (s *Server) StartAdmin() {
 		})
 	})
 
-	// ── 파일 매니저 API: S2(sandbox) ↔ S1(GCP) 파일 전송 ────────────────────
+	// ── 파일 매니저 API: S2(sandbox) ↔ S1(RDP staging) 파일 전송 ────────────────────
+	// S1 = boan-rdp-transfer 볼륨의 사용자별 staging 디렉토리.
+	// boan-sandbox 와 boan-guacd 가 동일 볼륨을 공유하므로, 여기 둔 파일은
+	// 사용자의 활성 Guacamole RDP 세션 안에서 BoanClaw 드라이브로 보인다 (RDP virtual channel).
+	// SCP/SSH 경유 없음 — 같은 RDP 포트(3389) 내 채널로만 흐름.
 
 	// GET /api/files/list?path=&side=s2|s1 — 디렉토리 내용 조회
+	// S2: 로컬 sandbox mount (/home/boan/Desktop/boanclaw)
+	// S1: RDP staging dir (/data/rdp-transfer/<email>)
 	mux.HandleFunc("/api/files/list", func(w http.ResponseWriter, r *http.Request) {
 		if cors(w, r) { return }
 		w.Header().Set("Content-Type", "application/json")
@@ -1859,53 +2196,97 @@ func (s *Server) StartAdmin() {
 		orgID := resolveOrg(r)
 		root := mountRootForOrg(orgID)
 
-		var baseDir string
+		type fileEntry struct {
+			Name     string `json:"name"`
+			IsDir    bool   `json:"is_dir"`
+			Size     int64  `json:"size"`
+			Modified int64  `json:"modified"` // unix seconds, 0 if stat 실패
+		}
+
 		switch side {
 		case "s2":
-			baseDir = root // sandbox mount directory
+			baseDir := root
+			target := filepath.Clean(filepath.Join(baseDir, reqPath))
+			if !strings.HasPrefix(target, baseDir) {
+				http.Error(w, `{"error":"path escapes base directory"}`, http.StatusForbidden)
+				return
+			}
+			if target == baseDir {
+				if _, err := os.Stat(baseDir); os.IsNotExist(err) {
+					_ = os.MkdirAll(baseDir, 0755)
+				}
+			}
+			entries, err := os.ReadDir(target)
+			if err != nil {
+				if os.IsNotExist(err) {
+					http.Error(w, `{"error":"path not found"}`, http.StatusNotFound)
+					return
+				}
+				http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
+				return
+			}
+			files := make([]fileEntry, 0, len(entries))
+			for _, e := range entries {
+				info, _ := e.Info()
+				size := int64(0)
+				modified := int64(0)
+				if info != nil {
+					size = info.Size()
+					modified = info.ModTime().Unix()
+				}
+				files = append(files, fileEntry{Name: e.Name(), IsDir: e.IsDir(), Size: size, Modified: modified})
+			}
+			json.NewEncoder(w).Encode(map[string]any{"path": reqPath, "side": side, "files": files})
+
 		case "s1":
-			baseDir = "/workspace/gcp" // GCP workstation directory
+			// S1 = RDP staging dir. 인증만 필요 (workstation provision 여부는 무관 — staging 은 항상 존재).
+			sess, err := auth.SessionFromRequest(r, s.authProv)
+			if err != nil || sess.Email == "" {
+				w.WriteHeader(http.StatusUnauthorized)
+				json.NewEncoder(w).Encode(map[string]any{"error": "authenticated session required"})
+				return
+			}
+			baseDir := userRDPTransferDir(s.cfg.RDPTransferRoot, sess.Email)
+			if _, statErr := os.Stat(baseDir); os.IsNotExist(statErr) {
+				_ = ensureRDPTransferDir(baseDir)
+			}
+			target := filepath.Clean(filepath.Join(baseDir, reqPath))
+			if !strings.HasPrefix(target, baseDir) {
+				http.Error(w, `{"error":"path escapes base directory"}`, http.StatusForbidden)
+				return
+			}
+			entries, err := os.ReadDir(target)
+			if err != nil {
+				if os.IsNotExist(err) {
+					http.Error(w, `{"error":"path not found"}`, http.StatusNotFound)
+					return
+				}
+				log.Printf("[files/list s1] readdir failed user=%s path=%s err=%v", sess.Email, target, err)
+				http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
+				return
+			}
+			files := make([]fileEntry, 0, len(entries))
+			for _, e := range entries {
+				info, _ := e.Info()
+				size := int64(0)
+				modified := int64(0)
+				if info != nil {
+					size = info.Size()
+					modified = info.ModTime().Unix()
+				}
+				files = append(files, fileEntry{Name: e.Name(), IsDir: e.IsDir(), Size: size, Modified: modified})
+			}
+			json.NewEncoder(w).Encode(map[string]any{"path": reqPath, "side": side, "files": files})
+
 		default:
 			http.Error(w, `{"error":"side must be s2 or s1"}`, http.StatusBadRequest)
 			return
 		}
-
-		target := filepath.Clean(filepath.Join(baseDir, reqPath))
-		if !strings.HasPrefix(target, baseDir) {
-			http.Error(w, `{"error":"path escapes base directory"}`, http.StatusForbidden)
-			return
-		}
-
-		entries, err := os.ReadDir(target)
-		if err != nil {
-			// 디렉토리 없으면 빈 목록 반환
-			if os.IsNotExist(err) {
-				os.MkdirAll(target, 0755)
-				json.NewEncoder(w).Encode(map[string]any{"path": reqPath, "side": side, "files": []any{}})
-				return
-			}
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		type fileEntry struct {
-			Name  string `json:"name"`
-			IsDir bool   `json:"is_dir"`
-			Size  int64  `json:"size"`
-		}
-		files := make([]fileEntry, 0, len(entries))
-		for _, e := range entries {
-			info, _ := e.Info()
-			size := int64(0)
-			if info != nil {
-				size = info.Size()
-			}
-			files = append(files, fileEntry{Name: e.Name(), IsDir: e.IsDir(), Size: size})
-		}
-		json.NewEncoder(w).Encode(map[string]any{"path": reqPath, "side": side, "files": files})
 	})
 
-	// POST /api/files/transfer — 파일 전송 (S2→S1: 가드레일 검사, S1→S2: 통과)
+	// POST /api/files/transfer — 파일 전송 (S2 ↔ S1 RDP staging)
+	// S2→S1: G1 가드레일 검사 후 sandbox 파일을 RDP staging dir 으로 복사. 사용자의 Guacamole 세션에서 BoanClaw 드라이브로 보임.
+	// S1→S2: 사용자가 BoanClaw 드라이브에 둔 파일을 sandbox 로 복사. SSH/SCP 사용 안 함.
 	mux.HandleFunc("/api/files/transfer", func(w http.ResponseWriter, r *http.Request) {
 		if cors(w, r) { return }
 		if r.Method != http.MethodPost {
@@ -1922,63 +2303,74 @@ func (s *Server) StartAdmin() {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		orgID := resolveOrg(r)
-		root := mountRootForOrg(orgID)
-		s2Base := root
-		s1Base := "/workspace/gcp"
+		w.Header().Set("Content-Type", "application/json")
 
-		var srcFull, dstFull string
+		sess, sessErr := auth.SessionFromRequest(r, s.authProv)
+		if sessErr != nil || sess.Email == "" {
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]any{"error": "authenticated session required"})
+			return
+		}
+
+		orgID := resolveOrg(r)
+		s2Base := mountRootForOrg(orgID)
+		s1Base := userRDPTransferDir(s.cfg.RDPTransferRoot, sess.Email)
+		_ = ensureRDPTransferDir(s1Base)
+
+		copyFile := func(src, dst string) (int64, error) {
+			in, err := os.Open(src)
+			if err != nil {
+				return 0, err
+			}
+			defer in.Close()
+			// dst 가 RDP staging dir 안의 중첩 경로일 수 있어서, 새로 만드는
+			// 중간 디렉토리도 guacd 가 쓸 수 있게 ensureRDPTransferDir 사용.
+			if err := ensureRDPTransferDir(filepath.Dir(dst)); err != nil {
+				return 0, err
+			}
+			out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+			if err != nil {
+				return 0, err
+			}
+			defer out.Close()
+			return io.Copy(out, in)
+		}
+
 		switch body.SrcSide {
 		case "s2":
-			srcFull = filepath.Clean(filepath.Join(s2Base, body.SrcPath, body.FileName))
-			dstFull = filepath.Clean(filepath.Join(s1Base, body.DstPath, body.FileName))
-		case "s1":
-			srcFull = filepath.Clean(filepath.Join(s1Base, body.SrcPath, body.FileName))
-			dstFull = filepath.Clean(filepath.Join(s2Base, body.DstPath, body.FileName))
-		default:
-			http.Error(w, `{"error":"src_side must be s2 or s1"}`, http.StatusBadRequest)
-			return
-		}
-
-		// 경로 탈출 방지
-		if (body.SrcSide == "s2" && !strings.HasPrefix(srcFull, s2Base)) ||
-			(body.SrcSide == "s1" && !strings.HasPrefix(srcFull, s1Base)) {
-			http.Error(w, `{"error":"source path escapes base"}`, http.StatusForbidden)
-			return
-		}
-		if (body.SrcSide == "s2" && !strings.HasPrefix(dstFull, s1Base)) ||
-			(body.SrcSide == "s1" && !strings.HasPrefix(dstFull, s2Base)) {
-			http.Error(w, `{"error":"dest path escapes base"}`, http.StatusForbidden)
-			return
-		}
-
-		// 소스 파일 읽기
-		info, err := os.Stat(srcFull)
-		if err != nil {
-			http.Error(w, `{"error":"source file not found"}`, http.StatusNotFound)
-			return
-		}
-		if info.IsDir() {
-			http.Error(w, `{"error":"directory transfer not allowed, files only"}`, http.StatusBadRequest)
-			return
-		}
-
-		// S2 → S1: 가드레일 검사 (파일 내용)
-		if body.SrcSide == "s2" {
-			content, readErr := os.ReadFile(srcFull)
-			if readErr != nil {
-				http.Error(w, `{"error":"cannot read source file"}`, http.StatusInternalServerError)
+			// sandbox → RDP staging
+			srcFull := filepath.Clean(filepath.Join(s2Base, body.SrcPath, body.FileName))
+			if !strings.HasPrefix(srcFull, s2Base) {
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(map[string]any{"error": "source path escapes S2 base"})
 				return
 			}
-			// 텍스트 파일만 가드레일 검사 (바이너리는 DLP)
+			info, err := os.Stat(srcFull)
+			if err != nil {
+				w.WriteHeader(http.StatusNotFound)
+				json.NewEncoder(w).Encode(map[string]any{"error": "source file not found"})
+				return
+			}
+			if info.IsDir() {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]any{"error": "directory transfer not allowed, files only"})
+				return
+			}
+
+			// 가드레일 — 텍스트 파일 G1 검사
+			content, readErr := os.ReadFile(srcFull)
+			if readErr != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]any{"error": "cannot read source file"})
+				return
+			}
 			textContent := string(content)
 			if len(textContent) > 0 {
-				gateResp := evaluateInputGate(r.Context(), s.dlpEng, s.guardrail, defaultOrgID, InputGateRequest{
+				gateResp := evaluateInputGateWithLocal(r.Context(), s.dlpEng, s.guardrail, s.evaluateGuardrailLocal, orgID, InputGateRequest{
 					Mode: "text", Text: textContent, SrcLevel: 2, DestLevel: 1,
-					Flow: "file-transfer-s2-to-s1",
+					Flow: "file-transfer-s2-to-s1", AccessLevel: "allow",
 				}, nil)
 				if !gateResp.Allowed {
-					w.Header().Set("Content-Type", "application/json")
 					json.NewEncoder(w).Encode(map[string]any{
 						"ok": false, "error": "guardrail blocked file transfer",
 						"action": gateResp.Action, "reason": gateResp.Reason,
@@ -1986,21 +2378,130 @@ func (s *Server) StartAdmin() {
 					return
 				}
 			}
-		}
-		// S1 → S2: 무조건 통과
 
-		// 파일 복사
-		os.MkdirAll(filepath.Dir(dstFull), 0755)
-		srcData, _ := os.ReadFile(srcFull)
-		if err := os.WriteFile(dstFull, srcData, 0644); err != nil {
-			http.Error(w, `{"error":"failed to write destination file: `+err.Error()+`"}`, http.StatusInternalServerError)
+			dstFull := filepath.Clean(filepath.Join(s1Base, body.DstPath, body.FileName))
+			if !strings.HasPrefix(dstFull, s1Base) {
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(map[string]any{"error": "dest path escapes S1 staging"})
+				return
+			}
+			n, err := copyFile(srcFull, dstFull)
+			if err != nil {
+				log.Printf("[files/transfer s2→s1] copy failed user=%s err=%v", sess.Email, err)
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "copy failed: " + err.Error()})
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]any{
+				"ok": true, "src": srcFull, "dst": dstFull,
+				"size": n, "guardrail": true,
+			})
+
+		case "s1":
+			// RDP staging → sandbox
+			srcFull := filepath.Clean(filepath.Join(s1Base, body.SrcPath, body.FileName))
+			if !strings.HasPrefix(srcFull, s1Base) {
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(map[string]any{"error": "source path escapes S1 staging"})
+				return
+			}
+			info, err := os.Stat(srcFull)
+			if err != nil {
+				w.WriteHeader(http.StatusNotFound)
+				json.NewEncoder(w).Encode(map[string]any{"error": "source file not found in S1 staging"})
+				return
+			}
+			if info.IsDir() {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]any{"error": "directory transfer not allowed, files only"})
+				return
+			}
+			dstFull := filepath.Clean(filepath.Join(s2Base, body.DstPath, body.FileName))
+			if !strings.HasPrefix(dstFull, s2Base) {
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(map[string]any{"error": "dest path escapes S2 base"})
+				return
+			}
+			n, err := copyFile(srcFull, dstFull)
+			if err != nil {
+				log.Printf("[files/transfer s1→s2] copy failed user=%s err=%v", sess.Email, err)
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "copy failed: " + err.Error()})
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]any{
+				"ok": true, "src": srcFull, "dst": dstFull,
+				"size": n, "guardrail": false,
+			})
+
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]any{"error": "src_side must be s2 or s1"})
+		}
+	})
+
+	// ── Observability API ────────────────────────────────────────────────────
+	// GET: 검색+페이지네이션 ?limit=50&offset=0&type=chat&q=검색어
+	// DELETE: 로그 비우기
+	mux.HandleFunc("/api/observability/traces", func(w http.ResponseWriter, r *http.Request) {
+		if cors(w, r) { return }
+		w.Header().Set("Content-Type", "application/json")
+
+		// DELETE: 로그 비우기
+		if r.Method == http.MethodDelete {
+			traceMu.Lock()
+			traceStore = nil
+			traceMu.Unlock()
+			json.NewEncoder(w).Encode(map[string]string{"status": "cleared"})
 			return
 		}
 
-		w.Header().Set("Content-Type", "application/json")
+		limit := 50
+		if v := r.URL.Query().Get("limit"); v != "" { fmt.Sscanf(v, "%d", &limit) }
+		if limit <= 0 { limit = 50 }
+		if limit > 500 { limit = 500 }
+		offset := 0
+		if v := r.URL.Query().Get("offset"); v != "" { fmt.Sscanf(v, "%d", &offset) }
+
+		typeFilter := r.URL.Query().Get("type")
+		query := strings.ToLower(r.URL.Query().Get("q"))
+
+		// 1년 이상 된 항목 자동 삭제
+		cutoff := time.Now().UTC().AddDate(-1, 0, 0).Format(time.RFC3339)
+		traceMu.Lock()
+		cleaned := traceStore[:0]
+		for _, t := range traceStore {
+			if t.Timestamp >= cutoff { cleaned = append(cleaned, t) }
+		}
+		traceStore = cleaned
+
+		// 필터링
+		var filtered []traceEntry
+		for i := len(traceStore) - 1; i >= 0; i-- {
+			t := traceStore[i]
+			if typeFilter != "" && t.Type != typeFilter { continue }
+			if query != "" && !strings.Contains(strings.ToLower(t.Summary), query) &&
+				!strings.Contains(strings.ToLower(t.Source), query) &&
+				!strings.Contains(strings.ToLower(t.Decision), query) { continue }
+			filtered = append(filtered, t)
+		}
+		total := len(filtered)
+		traceMu.Unlock()
+
+		// 페이지네이션
+		if offset >= len(filtered) { filtered = nil }
+		if offset < len(filtered) {
+			end := offset + limit
+			if end > len(filtered) { end = len(filtered) }
+			filtered = filtered[offset:end]
+		}
+		if filtered == nil { filtered = []traceEntry{} }
+
 		json.NewEncoder(w).Encode(map[string]any{
-			"ok": true, "src": srcFull, "dst": dstFull,
-			"size": info.Size(), "guardrail": body.SrcSide == "s2",
+			"total":  total,
+			"offset": offset,
+			"limit":  limit,
+			"traces": filtered,
 		})
 	})
 
@@ -2058,8 +2559,6 @@ func (s *Server) StartAdmin() {
 					"network_whitelist": []any{},
 					"dlp_rules":         []any{},
 					"rbac":              map[string]any{},
-					"allow_models":      []any{},
-					"features":          map[string]bool{},
 				})
 				return
 			}
@@ -2173,6 +2672,26 @@ func (s *Server) StartAdmin() {
 				}
 			}
 			delete(body, "store_detected_credentials")
+
+			// 등록 전에 실제 호출 테스트 (credential 치환 후 ping)
+			testCurl, _ := body["curl_template"].(string)
+			if testCurl == "" {
+				testCurl, _ = body["image_curl_template"].(string)
+			}
+			if testCurl != "" {
+				if err := s.testRegistryLLMCurl(r.Context(), orgID, testCurl); err != nil {
+					log.Printf("[register-test] FAILED: %v", err)
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusBadRequest)
+					json.NewEncoder(w).Encode(map[string]string{
+						"error":  "LLM 등록 테스트 실패",
+						"detail": err.Error(),
+					})
+					return
+				}
+				log.Printf("[register-test] OK: name=%s", strings.TrimSpace(name))
+			}
+
 			raw, _ := json.Marshal(body)
 			r.Body = io.NopCloser(bytes.NewReader(raw))
 			proxy(w, r, registryBase+"/llm/register")
@@ -2185,6 +2704,12 @@ func (s *Server) StartAdmin() {
 			if strings.HasSuffix(rest, "/bind-security") {
 				name := strings.TrimSuffix(strings.TrimPrefix(rest, "/v1/llms/"), "/bind-security")
 				proxy(w, r, registryBase+"/llm/"+name+"/bind-security")
+				return
+			}
+			// /v1/llms/{name}/bind-role/{role} 또는 /v1/llms/{name}/unbind-role/{role}
+			pathOnly := strings.TrimPrefix(rest, "/v1/llms/")
+			if strings.Contains(pathOnly, "/bind-role/") || strings.Contains(pathOnly, "/unbind-role/") {
+				proxy(w, r, registryBase+"/llm/"+pathOnly)
 				return
 			}
 			name := strings.TrimPrefix(rest, "/v1/llms/")
@@ -2262,6 +2787,138 @@ func (s *Server) StartAdmin() {
 		json.NewEncoder(w).Encode(map[string]any{"status": "stored", "role": body.Role})
 	})
 
+	// ── Credential 등록 추천 (org-wide) ─────────────────────────────────
+	// 소유자가 role_name + description 으로 추천 등록 → 전체 사용자 개인 탭에 표시
+	// 각 사용자가 fulfill 하면 자기 이메일 기준 personal-{emailPrefix}-{role} 키 생성
+	// 추천 자체는 사라지지 않음 (다른 사용자도 계속 보임)
+	mux.HandleFunc("/api/credential-requests", func(w http.ResponseWriter, r *http.Request) {
+		if cors(w, r) { return }
+		w.Header().Set("Content-Type", "application/json")
+
+		if r.Method == http.MethodGet {
+			credReqMu.Lock()
+			out := make([]credentialRequest, 0, len(credReqStore))
+			out = append(out, credReqStore...)
+			credReqMu.Unlock()
+			json.NewEncoder(w).Encode(out)
+			return
+		}
+
+		if r.Method == http.MethodPost {
+			var body struct {
+				RoleName    string `json:"role_name"`
+				Description string `json:"description"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			body.RoleName = strings.TrimSpace(body.RoleName)
+			if body.RoleName == "" {
+				http.Error(w, `{"error":"role_name required"}`, http.StatusBadRequest)
+				return
+			}
+			// 중복 role_name 방지
+			credReqMu.Lock()
+			for _, existing := range credReqStore {
+				if existing.RoleName == body.RoleName {
+					credReqMu.Unlock()
+					http.Error(w, `{"error":"role_name already recommended"}`, http.StatusConflict)
+					return
+				}
+			}
+			id := fmt.Sprintf("creq-%s", randomMachineID()[:12])
+			cr := credentialRequest{
+				ID: id, RoleName: body.RoleName,
+				Description: strings.TrimSpace(body.Description),
+				CreatedAt:   time.Now().UTC().Format(time.RFC3339),
+			}
+			credReqStore = append(credReqStore, cr)
+			credReqMu.Unlock()
+			json.NewEncoder(w).Encode(cr)
+			return
+		}
+		http.NotFound(w, r)
+	})
+
+	// POST /api/credential-requests/{id}/fulfill — 사용자가 본인 personal 키 등록
+	// DELETE /api/credential-requests/{id} — 소유자가 추천 삭제
+	mux.HandleFunc("/api/credential-requests/", func(w http.ResponseWriter, r *http.Request) {
+		if cors(w, r) { return }
+		w.Header().Set("Content-Type", "application/json")
+		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/credential-requests/"), "/")
+		reqID := parts[0]
+
+		// DELETE: 소유자가 추천 삭제
+		if r.Method == http.MethodDelete && len(parts) == 1 {
+			credReqMu.Lock()
+			for i, cr := range credReqStore {
+				if cr.ID == reqID {
+					credReqStore = append(credReqStore[:i], credReqStore[i+1:]...)
+					break
+				}
+			}
+			credReqMu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		if len(parts) < 2 || parts[1] != "fulfill" || r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+
+		// 세션에서 사용자 이메일 추출
+		sess, err := auth.SessionFromRequest(r, s.authProv)
+		if err != nil || sess.Email == "" {
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]any{"error": "authenticated session required"})
+			return
+		}
+
+		var body struct {
+			Key      string `json:"key"`
+			TTLHours int    `json:"ttl_hours"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Key == "" {
+			http.Error(w, `{"error":"key required"}`, http.StatusBadRequest)
+			return
+		}
+		if body.TTLHours <= 0 { body.TTLHours = 8760 }
+
+		// 추천 찾기 (status 로 필터링 X — 계속 유지)
+		credReqMu.Lock()
+		var roleName string
+		for i := range credReqStore {
+			if credReqStore[i].ID == reqID {
+				roleName = credReqStore[i].RoleName
+				break
+			}
+		}
+		credReqMu.Unlock()
+		if roleName == "" {
+			http.Error(w, `{"error":"recommendation not found"}`, http.StatusNotFound)
+			return
+		}
+
+		// credential-filter에 등록: personal-{emailPrefix}-{role}
+		orgID := sess.OrgID
+		if orgID == "" {
+			orgID = resolveOrg(r)
+		}
+		personalRole := fmt.Sprintf("personal-%s-%s", strings.Split(sess.Email, "@")[0], roleName)
+		raw, _ := json.Marshal(map[string]any{"role": personalRole, "key": body.Key, "ttl_hours": body.TTLHours})
+		req, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, credBase+"/credential/"+orgID, bytes.NewReader(raw))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		resp.Body.Close()
+		json.NewEncoder(w).Encode(map[string]string{"status": "fulfilled", "role": personalRole})
+	})
+
 	mux.HandleFunc("/api/credential/", func(w http.ResponseWriter, r *http.Request) {
 		if cors(w, r) {
 			return
@@ -2333,7 +2990,13 @@ func (s *Server) StartAdmin() {
 			json.NewEncoder(w).Encode(map[string]any{"status": "stored", "name": strings.TrimSpace(body.Name)})
 
 		default:
-			if name := strings.TrimPrefix(rest, "/v1/passthrough/"); name != "" && r.Method == http.MethodDelete {
+			// passthrough DELETE: /v1/passthrough/{name}
+			if strings.HasPrefix(rest, "/v1/passthrough/") && r.Method == http.MethodDelete {
+				name := strings.TrimPrefix(rest, "/v1/passthrough/")
+				if name == "" {
+					http.NotFound(w, r)
+					return
+				}
 				if err := s.deleteCredentialPassthrough(orgID, name); err != nil {
 					http.Error(w, err.Error(), http.StatusInternalServerError)
 					return
@@ -2342,8 +3005,13 @@ func (s *Server) StartAdmin() {
 				w.WriteHeader(http.StatusNoContent)
 				return
 			}
-			id := strings.TrimPrefix(rest, "/v1/credentials/")
-			if id != "" && r.Method == http.MethodDelete {
+			// credentials DELETE: /v1/credentials/{role}
+			if strings.HasPrefix(rest, "/v1/credentials/") && r.Method == http.MethodDelete {
+				id := strings.TrimPrefix(rest, "/v1/credentials/")
+				if id == "" {
+					http.NotFound(w, r)
+					return
+				}
 				req, _ := http.NewRequestWithContext(r.Context(), http.MethodDelete,
 					credBase+"/credential/"+orgID+"/"+id, nil)
 				resp, err := client.Do(req)
@@ -2647,7 +3315,7 @@ func (s *Server) StartAdmin() {
 		if action == "type" {
 			text, _ := params["text"].(string)
 			if text != "" {
-				gateResp := evaluateInputGate(r.Context(), s.dlpEng, s.guardrail, defaultOrgID, InputGateRequest{
+				gateResp := evaluateInputGateWithLocal(r.Context(), s.dlpEng, s.guardrail, s.evaluateGuardrailLocal, defaultOrgID, InputGateRequest{
 					Mode: "text", Text: text, SrcLevel: 3, DestLevel: 1,
 					Flow: "computer-use-type-to-remote-workstation",
 				}, nil)
@@ -2694,12 +3362,22 @@ func (s *Server) StartAdmin() {
 	})
 
 	// GET /api/computer-use/poll  — called by the admin-console frontend
+	//
+	// Stale-client guard:
+	//   클라이언트는 ?ready=1 query 를 반드시 붙여야 함. 이게 없는 polling 은 옛 cached
+	//   bundle 이거나 iframe ref 가 없는 stale client 로 간주 → 빈 응답으로 무시.
+	//   active client 만 액션을 claim 해서 silent fail 방지.
 	mux.HandleFunc("/api/computer-use/poll", func(w http.ResponseWriter, r *http.Request) {
 		if cors(w, r) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
+		// Stale client 차단 — ready=1 없으면 빈 응답 즉시 (long-poll 도 안 함)
+		if r.URL.Query().Get("ready") != "1" {
+			json.NewEncoder(w).Encode(map[string]any{"id": nil, "stale": true})
+			return
+		}
 		deadline := time.Now().Add(5 * time.Second)
 		for time.Now().Before(deadline) {
 			cuQueueMu.Lock()
@@ -2762,6 +3440,36 @@ func (s *Server) StartAdmin() {
 		http.Error(w, "command not found: "+id, http.StatusNotFound)
 	})
 
+	// GET /api/computer-use/screenshot/{id}.jpg — chat 인젝트용 screenshot 서빙
+	// inline base64 가 OpenClaw markdown 렌더러에서 깨지는 문제 회피용.
+	// boan-proxy 메모리에 저장된 JPEG 를 그대로 서빙. CORS 허용.
+	mux.HandleFunc("/api/computer-use/screenshot/", func(w http.ResponseWriter, r *http.Request) {
+		if cors(w, r) {
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			http.NotFound(w, r)
+			return
+		}
+		id := strings.TrimPrefix(r.URL.Path, "/api/computer-use/screenshot/")
+		id = strings.TrimSuffix(id, ".jpg")
+		id = strings.TrimSuffix(id, ".jpeg")
+		id = strings.Trim(id, "/")
+		if id == "" {
+			http.NotFound(w, r)
+			return
+		}
+		jpegBytes, ok := loadChatScreenshot(id)
+		if !ok {
+			http.Error(w, "screenshot not found or expired", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "image/jpeg")
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Write(jpegBytes)
+	})
+
 	// POST /api/chat/forward — 메시지를 BoanClaw(OpenClaw) 채팅으로 전달
 	mux.HandleFunc("/api/chat/forward", func(w http.ResponseWriter, r *http.Request) {
 		if cors(w, r) {
@@ -2780,7 +3488,7 @@ func (s *Server) StartAdmin() {
 		}
 		msg := strings.TrimSpace(req.Message)
 		// 채팅 메시지도 S1으로 가므로 input-gate 검사
-		gateResp := evaluateInputGate(r.Context(), s.dlpEng, s.guardrail, defaultOrgID, InputGateRequest{
+		gateResp := evaluateInputGateWithLocal(r.Context(), s.dlpEng, s.guardrail, s.evaluateGuardrailLocal, defaultOrgID, InputGateRequest{
 			Mode: "text", Text: msg, SrcLevel: 3, DestLevel: 1,
 			Flow: "openclaw-chat-to-agent",
 		}, nil)
@@ -2885,7 +3593,13 @@ func (s *Server) StartAdmin() {
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "mode": mode, "result": result})
 	})
 
-	// POST /api/computer-use/agent — LLM이 직접 computer-use 명령 생성 및 실행
+	// POST /api/computer-use/agent — 사람처럼 동작하는 computer-use 에이전트 루프.
+	// 핵심 원칙 (human-like behavior):
+	//   1. 키보드 단축키를 먼저 고려 (ctrl+s, alt+F4, Return, Escape ...)
+	//   2. 화면 변화(base64 diff)로 '클릭이 실제로 먹혔는지' 판단
+	//   3. 같은 액션을 반복하지 않도록 서명 기반 중복 가드
+	//   4. 액션 타입별로 UI 반응 대기시간 차등 (type/dialog 유발 키는 더 길게)
+	//   5. Vision LMM 한 번 호출로 OBSERVATION / STATUS / NEXT_ACTION 모두 결정
 	// NDJSON 스트리밍으로 각 단계(스크린샷, AI 응답, 액션 실행 결과)를 실시간 전송
 	mux.HandleFunc("/api/computer-use/agent", func(w http.ResponseWriter, r *http.Request) {
 		if cors(w, r) {
@@ -2902,8 +3616,8 @@ func (s *Server) StartAdmin() {
 			http.Error(w, `{"error":"prompt required"}`, http.StatusBadRequest)
 			return
 		}
-		orgID := resolveOrg(r)
-		log.Printf("[computer-use/agent] received prompt=%q org=%s", agentReq.Prompt, orgID)
+		_ = resolveOrg(r) // orgID 는 향후 감사/로깅 확장용. 현재 루프는 시스템 LMM 하나만 사용.
+		log.Printf("[computer-use/agent] received prompt=%q", agentReq.Prompt)
 
 		// 스트리밍 NDJSON — nginx buffering 비활성화
 		w.Header().Set("Content-Type", "application/x-ndjson")
@@ -2918,8 +3632,8 @@ func (s *Server) StartAdmin() {
 			}
 		}
 
-		// computer-use 큐에 액션을 넣고 프론트엔드 실행 결과를 대기하는 헬퍼
-		// r.Context() 가 취소돼도 (프론트 연결 종료) 에이전트 루프는 계속 실행
+		// computer-use 큐에 액션을 넣고 프론트엔드 실행 결과를 대기.
+		// r.Context() 가 취소돼도 (프론트 연결 종료) 에이전트 루프는 계속 실행.
 		queueAndWait := func(action map[string]any) (map[string]any, error) {
 			resultCh := make(chan []byte, 1)
 			idBytes := make([]byte, 8)
@@ -2938,11 +3652,6 @@ func (s *Server) StartAdmin() {
 			}
 		}
 
-		// open-computer-use sandbox_agent.py 패턴 동일 구현:
-		// 1) vision_model(screenshot + prompt) → 화면 묘사 + next step (append_screenshot)
-		// 2) action_model(thought + tools) → tool call JSON (action_model.call)
-		// 3) 액션 실행 → stop 나올 때까지 반복 (최대 10 스텝)
-
 		visionEntry, visionErr := s.loadSecurityLMM(r.Context())
 		if visionErr != nil {
 			log.Printf("[computer-use/agent] no security LMM: %v", visionErr)
@@ -2951,239 +3660,737 @@ func (s *Server) StartAdmin() {
 		}
 		log.Printf("[computer-use/agent] vision LMM=%s", visionEntry.Name)
 
-		const maxSteps = 10
+		// 옵션: grounding LMM 바인딩 확인. 있으면 click 좌표를 자연어 → 픽셀로 변환.
+		// 없으면 vision LMM 이 직접 좌표를 출력하는 기존 동작으로 fallback.
+		groundingEntry := s.loadGroundingLMM(r.Context())
+		if groundingEntry != nil {
+			log.Printf("[computer-use/agent] grounding LMM=%s (click_element 활성)", groundingEntry.Name)
+			sendEvent(map[string]any{"type": "status", "text": "grounding LMM 사용: " + groundingEntry.Name})
+		} else {
+			log.Printf("[computer-use/agent] grounding LMM not bound (vision-direct coordinate fallback)")
+		}
+
+		const maxSteps = 15
 		executed := 0
 		lastScreenshotB64 := ""
+		lastActionSignature := "" // e.g. "click:282,231" — 정확 일치 중복 감지용
+		stagnationCount := 0      // 연속 '액션 실행했는데 화면 안 변함' 카운터
 
-		// ── 히스토리: 이전 스텝의 행동/결과를 누적하여 LLM에 전달 (Claude Computer Use 패턴)
-		// 매 스텝마다 vision/action 이 이전 시도를 참조할 수 있도록 함
+		// clickCluster — 최근 click 좌표 + 발생 step. Fuzzy dedup + 화면 마커 양쪽에 사용.
+		// 커서 위치 + 몇 픽셀 어긋난 LLM 좌표가 동일 의도인데 sig 가 달라져 dedup 을 통과하는
+		// 문제를 막기 위해, 최근 3개 클릭과 ±25px 이내면 같은 의도로 판정.
+		var clickCluster []clickMarker
+		const clickFuzzRadius = 25
+		const clickClusterLimit = 3
+		absInt := func(n int) int {
+			if n < 0 {
+				return -n
+			}
+			return n
+		}
+		isNearRecentClick := func(x, y int) (bool, int, int) {
+			for _, c := range clickCluster {
+				if absInt(c.X-x) < clickFuzzRadius && absInt(c.Y-y) < clickFuzzRadius {
+					return true, c.X, c.Y
+				}
+			}
+			return false, 0, 0
+		}
+		recordClick := func(x, y, step int) {
+			clickCluster = append(clickCluster, clickMarker{X: x, Y: y, Step: step})
+			if len(clickCluster) > clickClusterLimit {
+				clickCluster = clickCluster[len(clickCluster)-clickClusterLimit:]
+			}
+		}
+
 		type stepRecord struct {
-			Step    int    `json:"step"`
-			Thought string `json:"thought"`
-			Actions string `json:"actions"`
-			Result  string `json:"result"`
+			Step          int    `json:"step"`
+			Observation   string `json:"observation"`
+			Action        string `json:"action"`
+			ScreenChanged bool   `json:"screen_changed"`
 		}
 		var stepHistory []stepRecord
 
-		// visionPromptTemplate: %s=objective, %d=width, %d=height, %s=history
-		visionPromptTemplate := "This image IS the screenshot of the current display (resolution: %dx%d pixels).\n" +
-			"The objective is: %s\n" +
-			"%s" +
-			"Describe what is visible. For each UI element, estimate its center (x, y) in %dx%d pixels.\n" +
-			"If the objective is to capture/show a screenshot, it is ALREADY COMPLETE.\n" +
-			"End with exactly one line: OBJECTIVE: COMPLETE or OBJECTIVE: INCOMPLETE\n" +
-			"If INCOMPLETE, describe the single next action and target coordinates."
+		// 특정 라벨(OBSERVATION:, STATUS:, NEXT_ACTION:)의 값 라인만 추출.
+		extractLine := func(thought, label string) string {
+			upperLabel := strings.ToUpper(label)
+			for _, line := range strings.Split(thought, "\n") {
+				trimmed := strings.TrimSpace(line)
+				if strings.HasPrefix(strings.ToUpper(trimmed), upperLabel) {
+					idx := strings.Index(trimmed, ":")
+					if idx >= 0 {
+						return strings.TrimSpace(trimmed[idx+1:])
+					}
+				}
+			}
+			return ""
+		}
 
-		// actionSystemPromptFmt: %d=width, %d=height
-		actionSystemPromptFmt := "You control a remote Windows workstation. Screen: %dx%d pixels.\n" +
-			"Respond with ONLY a JSON array of actions. No explanation, no markdown.\n" +
-			"Available actions:\n" +
-			`{"action":"screenshot"}` + "\n" +
-			`{"action":"type","text":"..."}` + "\n" +
-			`{"action":"key","name":"..."}` + " – Return, Tab, Escape, BackSpace, ctrl+s, ctrl+c, ctrl+v, ctrl+z\n" +
-			`{"action":"click","x":N,"y":N}` + "\n" +
-			`{"action":"double_click","x":N,"y":N}` + "\n" +
-			`{"action":"right_click","x":N,"y":N}` + "\n" +
-			`{"action":"scroll","x":N,"y":N,"direction":"down","amount":3}` + "\n" +
-			`{"action":"stop"}` + " – task complete\n" +
-			`Example: [{"action":"click","x":100,"y":200}]`
+		// "click:282,231" 같은 서명 생성 — 동일 액션 반복 감지용.
+		signatureOf := func(action map[string]any) string {
+			t, _ := action["action"].(string)
+			switch t {
+			case "click", "double_click", "right_click":
+				x, _ := action["x"].(float64)
+				y, _ := action["y"].(float64)
+				return fmt.Sprintf("%s:%d,%d", t, int(x), int(y))
+			case "key":
+				n, _ := action["name"].(string)
+				return "key:" + strings.ToLower(n)
+			case "type":
+				txt, _ := action["text"].(string)
+				if len(txt) > 20 {
+					txt = txt[:20]
+				}
+				return "type:" + txt
+			default:
+				return t
+			}
+		}
+
+		// Vision 응답의 NEXT_ACTION 라인을 파싱하여 단일 action map 반환.
+		// 지원 포맷:
+		//   key:NAME                            — 키보드 단축키
+		//   type:TEXT                           — 텍스트 입력
+		//   click:X,Y / double_click:X,Y        — 픽셀 좌표 직접 (vision-only fallback)
+		//   click_element:DESCRIPTION           — 자연어 (grounding LMM 바인딩 시)
+		//   double_click_element:DESCRIPTION    — 자연어 더블클릭
+		//   wait / stop
+		parseNextAction := func(thought string) (map[string]any, bool) {
+			raw := extractLine(thought, "NEXT_ACTION:")
+			if raw == "" {
+				return nil, false
+			}
+			raw = strings.Trim(raw, "`\"' \t")
+			lower := strings.ToLower(raw)
+			switch {
+			case strings.HasPrefix(lower, "stop"):
+				return map[string]any{"action": "stop"}, true
+			case strings.HasPrefix(lower, "wait"):
+				return map[string]any{"action": "wait"}, true
+			case strings.HasPrefix(lower, "key:"):
+				name := strings.TrimSpace(raw[4:])
+				if name == "" {
+					return nil, false
+				}
+				return map[string]any{"action": "key", "name": name}, true
+			case strings.HasPrefix(lower, "type:"):
+				text := raw[5:]
+				text = strings.TrimLeft(text, " ")
+				if text == "" {
+					return nil, false
+				}
+				return map[string]any{"action": "type", "text": text}, true
+			case strings.HasPrefix(lower, "double_click_element:"):
+				desc := strings.TrimSpace(raw[len("double_click_element:"):])
+				if desc == "" {
+					return nil, false
+				}
+				return map[string]any{"action": "click_element", "description": desc, "double": true}, true
+			case strings.HasPrefix(lower, "click_element:"):
+				desc := strings.TrimSpace(raw[len("click_element:"):])
+				if desc == "" {
+					return nil, false
+				}
+				return map[string]any{"action": "click_element", "description": desc, "double": false}, true
+			case strings.HasPrefix(lower, "double_click:"), strings.HasPrefix(lower, "click:"):
+				actionType := "click"
+				coords := raw
+				if strings.HasPrefix(lower, "double_click:") {
+					actionType = "double_click"
+					coords = raw[len("double_click:"):]
+				} else {
+					coords = raw[len("click:"):]
+				}
+				coords = strings.TrimSpace(coords)
+				// 괄호 제거: (100, 200) → 100, 200
+				coords = strings.Trim(coords, "()[]")
+				parts := strings.Split(coords, ",")
+				if len(parts) != 2 {
+					return nil, false
+				}
+				x, errX := strconv.Atoi(strings.TrimSpace(parts[0]))
+				y, errY := strconv.Atoi(strings.TrimSpace(parts[1]))
+				if errX != nil || errY != nil {
+					return nil, false
+				}
+				return map[string]any{"action": actionType, "x": float64(x), "y": float64(y)}, true
+			}
+			return nil, false
+		}
+
+		// 액션 타입별 UI 반응 대기 (사람이 눈으로 결과 확인하는 시간과 유사).
+		waitFor := func(action map[string]any) time.Duration {
+			t, _ := action["action"].(string)
+			switch t {
+			case "type":
+				text, _ := action["text"].(string)
+				// boan-computer-use TYPING_GROUP_SIZE=50, DELAY_MS=12 기준으로 여유있게
+				return 800*time.Millisecond + time.Duration(len(text)*20)*time.Millisecond
+			case "key":
+				name, _ := action["name"].(string)
+				lower := strings.ToLower(name)
+				// dialog 유발 키 (저장/열기/확인) 는 넉넉히 대기
+				if strings.Contains(lower, "ctrl+s") || strings.Contains(lower, "ctrl+o") ||
+					strings.Contains(lower, "return") || strings.Contains(lower, "enter") {
+					return 1500 * time.Millisecond
+				}
+				return 700 * time.Millisecond
+			case "click", "double_click", "right_click":
+				return 700 * time.Millisecond
+			default:
+				return 400 * time.Millisecond
+			}
+		}
+
+		// ── 세션 파괴 위험 키 차단 (서버측 방어선) ─────────────────────────
+		// RDP/Guacamole 세션에서 alt+F4 는 포커스에 따라 세션 로그아웃을 유발하고,
+		// ctrl+alt+del / win+L / win+D 는 세션을 잠그거나 전환한다. 프롬프트가 금지하지만
+		// LLM이 실수로 emit 할 수 있으므로 실행 직전에 한 번 더 필터링.
+		isForbiddenKey := func(action map[string]any) (bool, string) {
+			if t, _ := action["action"].(string); t != "key" {
+				return false, ""
+			}
+			name, _ := action["name"].(string)
+			lower := strings.ToLower(strings.ReplaceAll(name, " ", ""))
+			forbiddenSubstrings := []string{
+				"alt+f4", "alt-f4", "altf4",
+				"ctrl+alt+delete", "ctrl+alt+del",
+				"win+l", "meta+l", "super+l",
+				"win+d", "meta+d", "super+d",
+				"win+r", "meta+r",
+			}
+			for _, f := range forbiddenSubstrings {
+				if strings.Contains(lower, f) {
+					return true, name
+				}
+			}
+			return false, ""
+		}
+
+		// ── 로그아웃/잠금 화면 감지 (관측값 기반) ───────────────────────────
+		// vision LMM 의 OBSERVATION 이 로그아웃/잠금/로그인 화면을 암시하면
+		// STATUS:COMPLETE 오판을 막고 즉시 중단. (스크린샷이 깨끗해 보인다고
+		// 완료로 오인하는 경우 방지)
+		looksBroken := func(observation string) bool {
+			lower := strings.ToLower(observation)
+			markers := []string{
+				"logged out", "log out", "logout",
+				"lock screen", "locked", "sign in", "sign-in", "signin",
+				"ctrl+alt+del", "ctrl-alt-del",
+				"press enter to log", "welcome screen",
+				"로그아웃", "잠금", "로그인 화면",
+			}
+			for _, m := range markers {
+				if strings.Contains(lower, m) {
+					return true
+				}
+			}
+			return false
+		}
+
+		// Vision 프롬프트 빌더 — 사람처럼 '브리핑 → 검증 → 결정' 흐름.
+		// markers 는 스크린샷에 그려진 클릭 마커들과 1:1 매칭되는 메타정보 (LMM이 색상과 위치를 매칭).
+		// groundingBound 가 true면 click_element:DESCRIPTION 형식을 권장 (좌표 부담 감소).
+		buildVisionPrompt := func(scrW, scrH int, history []stepRecord, markers []clickMarker, stuck bool, groundingBound bool) string {
+			var sb strings.Builder
+			fmt.Fprintf(&sb, "You are a HUMAN operator (not an OCR engine) sitting in front of a Windows workstation\n")
+			fmt.Fprintf(&sb, "(resolution: %dx%d pixels) connected over RDP/Guacamole. Think holistically: judge the\n", scrW, scrH)
+			fmt.Fprintf(&sb, "overall situation, not just text on screen.\n\n")
+			fmt.Fprintf(&sb, "USER'S OBJECTIVE (verbatim): %s\n\n", agentReq.Prompt)
+
+			// ── 시각적 마커 안내 ────────────────────────────────────────
+			if len(markers) > 0 {
+				sb.WriteString("📍 VISUAL MARKERS ON THIS SCREENSHOT:\n")
+				sb.WriteString("The screenshot you are viewing has been ANNOTATED with circles+crosses showing\n")
+				sb.WriteString("where you (the agent) clicked in recent steps. The colors mean:\n")
+				if len(markers) > 2 {
+					sb.WriteString("  • DARK RED   = oldest click in this batch\n")
+					sb.WriteString("  • RED        = middle click(s)\n")
+					sb.WriteString("  • ORANGE     = your most recent click\n")
+				} else if len(markers) == 2 {
+					sb.WriteString("  • RED        = older click\n")
+					sb.WriteString("  • ORANGE     = your most recent click\n")
+				} else {
+					sb.WriteString("  • ORANGE     = your most recent click\n")
+				}
+				sb.WriteString("Marker positions:\n")
+				for i, m := range markers {
+					tag := "older"
+					if i == len(markers)-1 {
+						tag = "MOST RECENT"
+					}
+					fmt.Fprintf(&sb, "  • step %d (%s): clicked at (%d, %d)\n", m.Step, tag, m.X, m.Y)
+				}
+				sb.WriteString("\nIf you see a marker but the target window is still open / nothing changed, that\n")
+				sb.WriteString("click DID NOT WORK. Pick a CLEARLY DIFFERENT location (≥40 pixels away) or use a\n")
+				sb.WriteString("completely different approach. Do NOT click within ~25 pixels of any existing marker.\n\n")
+			}
+
+			// ── 최근 액션 히스토리 ─────────────────────────────────────
+			if len(history) > 0 {
+				sb.WriteString("📜 Recent action log (most recent last):\n")
+				for _, rec := range history {
+					changed := "screen CHANGED"
+					if !rec.ScreenChanged {
+						changed = "no visible change"
+					}
+					obs := rec.Observation
+					if len(obs) > 80 {
+						obs = obs[:80] + "…"
+					}
+					fmt.Fprintf(&sb, "  step %d: %s → %s\n", rec.Step, rec.Action, changed)
+					if obs != "" {
+						fmt.Fprintf(&sb, "    └─ saw: %s\n", obs)
+					}
+				}
+				sb.WriteString("\n")
+			}
+
+			if stuck {
+				sb.WriteString("⚠ STUCK ALERT: recent click(s) produced no visible result. STOP repeating the\n")
+				sb.WriteString("same area. Re-examine the screenshot, find the target with FRESH EYES, and either\n")
+				sb.WriteString("(a) click somewhere clearly different, or (b) switch to a safe keyboard shortcut.\n\n")
+			}
+
+			// ── 결정 가이드 ───────────────────────────────────────────
+			sb.WriteString("DECISION GUIDE (read carefully — priority order):\n")
+			sb.WriteString("  1. ★★★ RESPECT THE USER'S EXACT METHOD. The user wrote the objective in their\n")
+			sb.WriteString("     own words and may have specified HOW to perform each step. You MUST follow\n")
+			sb.WriteString("     that method literally, even if another way would be faster or 'better'.\n")
+			sb.WriteString("     Examples of method-specific phrasings and how to honor them:\n")
+			sb.WriteString("       • '메모장 클릭해서 저장' / 'click notepad to save' →\n")
+			sb.WriteString("            FIRST click on the Notepad window (to focus it), THEN save.\n")
+			sb.WriteString("            Do NOT skip the click — even if Notepad already looks focused.\n")
+			sb.WriteString("       • 'X 버튼 눌러서 닫아줘' / 'click the X to close' →\n")
+			sb.WriteString("            MUST click the title-bar X button. NEVER use alt+F4 or ctrl+w.\n")
+			sb.WriteString("       • '단축키로 저장' / 'save with keyboard shortcut' →\n")
+			sb.WriteString("            Use ctrl+s. Don't open the File menu.\n")
+			sb.WriteString("       • '메뉴에서 저장' / 'save from the menu' →\n")
+			sb.WriteString("            Click the File menu, then click Save. Don't use ctrl+s.\n")
+			sb.WriteString("     Re-read the objective at every step and check: am I honoring the method?\n")
+			sb.WriteString("  2. Otherwise (when the user did NOT specify a method), prefer SAFE keyboard shortcuts:\n")
+			sb.WriteString("     • Save: ctrl+s       • Confirm/OK: Return     • Cancel: Escape\n")
+			sb.WriteString("     • Copy/Paste/Cut/Undo: ctrl+c / ctrl+v / ctrl+x / ctrl+z\n")
+			sb.WriteString("     • Select all: ctrl+a  • New: ctrl+n          • Open: ctrl+o\n")
+			sb.WriteString("     • Navigation: Tab, Return, BackSpace, arrows, F1..F12\n")
+			sb.WriteString("  3. Type text (action: type:TEXT) when a text field is focused.\n")
+			sb.WriteString("  4. Click a UI element (action: click:X,Y) at its CENTER pixel.\n\n")
+
+			// ── 정확한 관찰 강제 (환각 방지) ──────────────────────────
+			sb.WriteString("⚠ ANTI-HALLUCINATION CHECKLIST — do this BEFORE writing OBSERVATION:\n")
+			sb.WriteString("  • Look at the ENTIRE screenshot pixel-by-pixel. Don't assume — see.\n")
+			sb.WriteString("  • Are there any DIALOG WINDOWS visible? (Save dialog, error popup, file picker, etc.)\n")
+			sb.WriteString("    A dialog box looks like a smaller window centered on screen with OK/Cancel buttons.\n")
+			sb.WriteString("    If YES, the dialog is the FOCUSED element — interact with it first.\n")
+			sb.WriteString("  • Which window has focus? Look at title bar darkness/highlight.\n")
+			sb.WriteString("  • Is the document modified? (asterisk in title bar = unsaved)\n")
+			sb.WriteString("  • Where exactly is each interactive element? Use real coordinates from the image.\n")
+			sb.WriteString("  Then write OBSERVATION based on what you ACTUALLY SEE.\n\n")
+
+			sb.WriteString("⛔ FORBIDDEN — these will be blocked server-side anyway:\n")
+			sb.WriteString("  • alt+F4 (logs out the RDP session — use the title-bar X button click instead)\n")
+			sb.WriteString("  • ctrl+alt+del, win+L, win+D, win+R\n\n")
+
+			sb.WriteString("Closing a window safely (CRITICAL — read carefully):\n")
+			sb.WriteString("  STEP A. FIRST identify the TARGET WINDOW's bounds in the screenshot.\n")
+			sb.WriteString("          Find the window's title bar (the colored strip at the top with the title text).\n")
+			sb.WriteString("          Note: the window may be MAXIMIZED (fills the screen) or WINDOWED (smaller, somewhere on desktop).\n")
+			sb.WriteString("          Do NOT assume maximized — actually look at the pixels.\n")
+			sb.WriteString("  STEP B. Find the X button on the RIGHT end of THAT title bar.\n")
+			sb.WriteString("          The X button is the rightmost icon in the title bar, NOT the rightmost pixel of the screen.\n")
+			sb.WriteString("          For a windowed app, the X button is INSIDE the window, not at the desktop edge.\n")
+			sb.WriteString("  STEP C. Output click:X,Y at the CENTER of the X button you identified in STEP B.\n")
+			sb.WriteString("  WARNING: If your previous X-click failed, the window is likely smaller/positioned differently than\n")
+			sb.WriteString("           you assumed. Re-measure the title bar's actual right edge in the image. Don't guess.\n")
+			sb.WriteString("  • If a save dialog appears, press Return (save) or Escape (cancel).\n\n")
+
+			// ── 출력 포맷 ─────────────────────────────────────────────
+			sb.WriteString("Respond in EXACTLY this format (plain text, no markdown, no code fences):\n")
+			sb.WriteString("OBSERVATION: <2-3 sentences. Describe the WHOLE screen situation: which app is focused,\n")
+			sb.WriteString("              are there dialogs/popups, what state is the document in. Be specific.>\n")
+			sb.WriteString("VERIFICATION: <Looking at the markers (if any), did the previous click actually do what\n")
+			sb.WriteString("               you expected? yes/no — explain in 1 sentence.>\n")
+			sb.WriteString("STATUS: COMPLETE | INCOMPLETE\n")
+			sb.WriteString("REASONING: <1 sentence on why the next action is chosen and whether it honors the user's method.>\n")
+			if groundingBound {
+				sb.WriteString("NEXT_ACTION: <one of: key:NAME | type:TEXT | click_element:DESCRIPTION | double_click_element:DESCRIPTION | wait | stop>\n\n")
+				sb.WriteString("✨ A SPECIALIZED GROUNDING MODEL is available. For clicks, prefer click_element:DESCRIPTION\n")
+				sb.WriteString("   instead of click:X,Y. The grounding model will convert the description to coordinates.\n")
+				sb.WriteString("   DESCRIPTION should be a short, unambiguous noun phrase identifying the target element.\n")
+				sb.WriteString("   Good: 'the X close button on the Notepad title bar'\n")
+				sb.WriteString("   Good: 'the Save button in the file dialog'\n")
+				sb.WriteString("   Bad : 'something near the top'  (too vague)\n")
+				sb.WriteString("   Bad : 'click here' (no description of WHAT)\n")
+				sb.WriteString("   You may still output click:X,Y if you are CERTAIN of pixel coordinates, but prefer click_element.\n\n")
+			} else {
+				sb.WriteString("NEXT_ACTION: <one of: key:NAME | type:TEXT | click:X,Y | double_click:X,Y | wait | stop>\n\n")
+			}
+
+			sb.WriteString("Hard rules:\n")
+			sb.WriteString("  • STATUS = COMPLETE ONLY when the objective is VISIBLY achieved on screen.\n")
+			sb.WriteString("    Not when the session logged out, not when only a lock screen is visible, not when\n")
+			sb.WriteString("    the desktop merely 'looks clean'. Verify the target app actually closed/saved/etc.\n")
+			sb.WriteString("  • If the screen is a logout / lock / Ctrl+Alt+Del screen, STATUS = INCOMPLETE and\n")
+			sb.WriteString("    NEXT_ACTION = stop — the session is broken.\n")
+			sb.WriteString("  • NEXT_ACTION must be a SINGLE action. No JSON, no list, no trailing explanation.\n")
+			sb.WriteString("  • Coordinates are pixels, origin top-left. Use the CENTER of the target element.\n")
+			sb.WriteString("  • Never click within ~25 px of an existing marker — that area already failed.\n")
+			return sb.String()
+		}
 
 		for step := 0; step < maxSteps; step++ {
-			// Step A: 스크린샷 캡처
+			// ── Step A: 스크린샷 캡처 (1회 retry 포함)
 			sendEvent(map[string]any{"type": "status", "text": fmt.Sprintf("화면 캡처 중... (스텝 %d)", step+1)})
-			ssResult, ssErr := queueAndWait(map[string]any{"action": "screenshot"})
+			screenshotB64 := ""
+			var ssErr error
+			var ssFrontendError string // frontend 가 명시적으로 보낸 error 메시지
+			// 5번 retry — stale polling client 가 잡으면 짧은 backoff 후 active client 가 잡도록
+			for attempt := 0; attempt < 5; attempt++ {
+				var ssResult map[string]any
+				ssResult, ssErr = queueAndWait(map[string]any{"action": "screenshot"})
+				if ssErr != nil {
+					log.Printf("[computer-use/agent] step=%d screenshot error attempt=%d: %v", step, attempt, ssErr)
+					if attempt < 4 {
+						time.Sleep(300 * time.Millisecond)
+						continue
+					}
+					break
+				}
+				if v, _ := ssResult["image"].(string); v != "" {
+					screenshotB64 = v
+					ssFrontendError = ""
+					break
+				}
+				if v, _ := ssResult["data"].(string); v != "" {
+					screenshotB64 = v
+					ssFrontendError = ""
+					break
+				}
+				// frontend 가 error 키로 직접 메시지를 보낸 경우 캡쳐
+				if errStr, ok := ssResult["error"].(string); ok && errStr != "" {
+					ssFrontendError = errStr
+				}
+				keys := make([]string, 0, len(ssResult))
+				for k := range ssResult {
+					keys = append(keys, k)
+				}
+				// 진단 정보 전체 dump — 디버깅의 ground truth
+				ssResultJSON, _ := json.Marshal(ssResult)
+				log.Printf("[computer-use/agent] step=%d screenshot FAIL attempt=%d keys=%v frontendErr=%q FULL=%s", step, attempt, keys, ssFrontendError, string(ssResultJSON))
+				if attempt < 4 {
+					time.Sleep(300 * time.Millisecond)
+				}
+			}
 			if ssErr != nil {
-				log.Printf("[computer-use/agent] step=%d screenshot error: %v", step, ssErr)
+				log.Printf("[computer-use/agent] step=%d screenshot final error: %v — break loop", step, ssErr)
 				sendEvent(map[string]any{"type": "error", "text": "스크린샷 실패: " + ssErr.Error()})
 				break
 			}
-			// boan-computer-use 서비스는 "image" 키로 반환, 구형 호환을 위해 "data"도 확인
-			screenshotB64, _ := ssResult["image"].(string)
 			if screenshotB64 == "" {
-				screenshotB64, _ = ssResult["data"].(string)
-			}
-			if screenshotB64 == "" {
-				log.Printf("[computer-use/agent] step=%d screenshot data empty, ssResult keys=%v", step, func() []string {
-					keys := make([]string, 0, len(ssResult))
-					for k := range ssResult { keys = append(keys, k) }
-					return keys
-				}())
-				sendEvent(map[string]any{"type": "error", "text": "스크린샷 데이터 없음"})
+				log.Printf("[computer-use/agent] step=%d screenshot empty after retries (frontendErr=%q) — break loop", step, ssFrontendError)
+				// frontend 에러 메시지를 사람이 알아볼 수 있는 한국어로 변환
+				userMsg := "스크린샷 데이터 없음 (재시도 후)"
+				if strings.Contains(strings.ToLower(ssFrontendError), "canvas") {
+					userMsg = "❌ GCP 워크스테이션 화면을 캡처할 수 없습니다.\n" +
+						"   → MyGCP 페이지가 브라우저에서 열려 있는지 확인하세요.\n" +
+						"   → Guacamole iframe 이 Windows 바탕화면을 표시할 때까지 기다린 뒤 재시도하세요.\n" +
+						"   → 만약 로그아웃/잠금 화면이 보인다면 MyGCP 페이지를 새로고침 후 재접속하세요.\n" +
+						"   (frontend: " + ssFrontendError + ")"
+				} else if ssFrontendError != "" {
+					userMsg = "❌ 스크린샷 실패: " + ssFrontendError
+				}
+				sendEvent(map[string]any{"type": "error", "text": userMsg})
+				go injectOpenClawMessage(fmt.Sprintf("[gcp_exec] %s : %s", agentReq.Prompt, userMsg))
 				break
 			}
-			log.Printf("[computer-use/agent] step=%d screenshot ok, len=%d", step, len(screenshotB64))
-			sendEvent(map[string]any{"type": "screenshot", "data": screenshotB64, "label": fmt.Sprintf("스텝 %d 화면", step+1)})
-			lastScreenshotB64 = screenshotB64
 
-			// 스크린샷 해상도 추출 (좌표 정확도 향상)
-			scrW, scrH := getImageDimensions(screenshotB64)
-			log.Printf("[computer-use/agent] step=%d screen resolution=%dx%d", step, scrW, scrH)
-
-			// ── 히스토리 텍스트 구성: 이전 스텝 요약을 vision 프롬프트에 삽입
-			historyText := ""
+			// ── 화면 변화 감지: 직전 스크린샷과 완전히 동일이면 '아무 일도 없었던 스텝'
+			screenChanged := lastScreenshotB64 == "" || screenshotB64 != lastScreenshotB64
+			// 직전 스텝이 실제로 액션을 실행했는데 화면이 안 변한 경우만 stagnation 카운트
+			if !screenChanged && len(stepHistory) > 0 && stepHistory[len(stepHistory)-1].Action != "" {
+				stagnationCount++
+			} else if screenChanged {
+				stagnationCount = 0
+			}
+			// 이전 스텝 레코드에 '실제로 화면이 바뀌었는지' 를 소급 기록
 			if len(stepHistory) > 0 {
-				historyText = "\n--- PREVIOUS ACTIONS (do NOT repeat failed actions) ---\n"
-				for _, rec := range stepHistory {
-					historyText += fmt.Sprintf("Step %d: thought=%q → actions=%s → result=%s\n",
-						rec.Step, rec.Thought, rec.Actions, rec.Result)
-				}
-				historyText += "--- END PREVIOUS ACTIONS ---\n\n"
+				stepHistory[len(stepHistory)-1].ScreenChanged = screenChanged
 			}
 
-			// Step B: vision LMM 호출 (sandbox_agent.append_screenshot 에 해당)
+			sendEvent(map[string]any{"type": "screenshot", "data": screenshotB64, "label": fmt.Sprintf("스텝 %d 화면", step+1)})
+			lastScreenshotB64 = screenshotB64
+			scrW, scrH := getImageDimensions(screenshotB64)
+			log.Printf("[computer-use/agent] step=%d resolution=%dx%d changed=%v stagnation=%d", step, scrW, scrH, screenChanged, stagnationCount)
+
+			// stagnation 3회면 조기 종료 — 인간도 3번 시도하고 안 되면 다른 방법을 찾음
+			if stagnationCount >= 3 {
+				log.Printf("[computer-use/agent] stagnation break at step %d", step)
+				sendEvent(map[string]any{"type": "error", "text": "화면이 여러 스텝 동안 변하지 않아 중단합니다."})
+				break
+			}
+
+			// ── Step B: Vision LMM 호출 (단일 호출로 observation + decision + action)
 			sendEvent(map[string]any{"type": "status", "text": "Vision LMM이 화면을 분석 중..."})
-			visionPrompt := fmt.Sprintf(visionPromptTemplate, scrW, scrH, agentReq.Prompt, historyText, scrW, scrH)
-			thought, vErr := s.forwardVisionLLM(r.Context(), visionEntry, screenshotB64, visionPrompt)
+			// 최근 3스텝만 프롬프트에 포함 (비대화 방지)
+			recent := stepHistory
+			if len(recent) > 3 {
+				recent = recent[len(recent)-3:]
+			}
+			// stuck 조건: stagnation OR 클릭 클러스터에 누적이 있으면 (=같은 영역 반복)
+			stuck := stagnationCount >= 1 || len(clickCluster) >= 2
+			visionPrompt := buildVisionPrompt(scrW, scrH, recent, clickCluster, stuck, groundingEntry != nil)
+			// ── 사람처럼 '저번에 어디 찍었지' 를 시각적으로 보여주기:
+			// 원본 스크린샷에 클릭 마커를 그려서 vision LMM 에 전달.
+			// 원본(screenshotB64)은 화면 변화 감지/챗 표시용으로 그대로 둠.
+			annotatedB64 := annotateClicksOnScreenshot(screenshotB64, clickCluster)
+			if len(clickCluster) > 0 {
+				sendEvent(map[string]any{"type": "screenshot", "data": annotatedB64, "label": fmt.Sprintf("스텝 %d (클릭 마커 표시)", step+1)})
+			}
+			thought, vErr := s.forwardVisionLLM(r.Context(), visionEntry, annotatedB64, visionPrompt)
 			if vErr != nil {
 				log.Printf("[computer-use/agent] vision llm error: %v", vErr)
 				sendEvent(map[string]any{"type": "error", "text": "Vision LMM 오류: " + vErr.Error()})
 				break
 			}
-			log.Printf("[computer-use/agent] step=%d thought len=%d thought=%q", step, len(thought), thought)
+			log.Printf("[computer-use/agent] step=%d thought=%q", step, thought)
 			sendEvent(map[string]any{"type": "thinking", "text": thought})
 
-			// 완료 판단: vision 모델이 "OBJECTIVE: COMPLETE" 라고 하면 stop
-			lowerThought := strings.ToLower(thought)
-			isComplete := strings.Contains(lowerThought, "objective: complete") &&
-				!strings.Contains(lowerThought, "objective: incomplete") &&
-				!strings.Contains(lowerThought, "not complete")
-			if isComplete {
-				log.Printf("[computer-use/agent] vision says complete at step %d", step)
-				compressedB64 := compressScreenshotForChat(screenshotB64)
-				completedMsg := fmt.Sprintf("[gcp_exec] %s : 완료\n\n![](data:image/jpeg;base64,%s)", agentReq.Prompt, compressedB64)
+			observation := extractLine(thought, "OBSERVATION:")
+			status := strings.ToUpper(extractLine(thought, "STATUS:"))
+
+			// ── 세션 파괴 감지: 화면이 로그아웃/잠금 상태이면 즉시 중단.
+			// vision 이 COMPLETE 라고 해도 무시한다 (오판 방지).
+			if looksBroken(observation) {
+				log.Printf("[computer-use/agent] broken session detected at step %d: %q", step, observation)
+				sendEvent(map[string]any{"type": "error", "text": "세션이 로그아웃되었거나 잠금 상태입니다. (GCP 워크스테이션 재접속이 필요합니다)"})
+				imgURL := makeChatScreenshotURL(screenshotB64)
+				brokenMsg := fmt.Sprintf("[gcp_exec] %s : ❌ 세션 손상 — 로그아웃/잠금 화면 감지\n\n![](%s)", agentReq.Prompt, imgURL)
+				go injectOpenClawMessage(brokenMsg)
+				sendEvent(map[string]any{"type": "done", "actions_executed": executed})
+				return
+			}
+
+			// ── Step C: 완료 판단
+			if strings.Contains(status, "COMPLETE") && !strings.Contains(status, "INCOMPLETE") {
+				log.Printf("[computer-use/agent] vision says COMPLETE at step %d", step)
+				imgURL := makeChatScreenshotURL(screenshotB64)
+				completedMsg := fmt.Sprintf("[gcp_exec] %s : 완료\n\n![](%s)", agentReq.Prompt, imgURL)
 				go injectOpenClawMessage(completedMsg)
 				sendEvent(map[string]any{"type": "done", "actions_executed": executed})
 				return
 			}
 
-			// Step C: action LMM 호출 (sandbox_agent.action_model.call 에 해당)
-			// system/user 메시지를 분리하여 직접 전송 (forwardSelectedLLM의 고정 system 메시지 회피)
-			sendEvent(map[string]any{"type": "status", "text": "Action LLM이 액션을 결정 중..."})
-			actionSystemPrompt := fmt.Sprintf(actionSystemPromptFmt, scrW, scrH)
-			actionUserPrompt := ""
-			if len(stepHistory) > 0 {
-				actionUserPrompt += "Previous steps:\n"
-				for _, rec := range stepHistory {
-					actionUserPrompt += fmt.Sprintf("- Step %d: %s → %s\n", rec.Step, rec.Actions, rec.Result)
-				}
-				actionUserPrompt += "\n"
-			}
-			actionUserPrompt += "Vision analysis:\n" + thought
-			actionResp, aErr := s.forwardActionLLM(r.Context(), orgID, actionSystemPrompt, actionUserPrompt)
-			if aErr != nil {
-				log.Printf("[computer-use/agent] action llm error: %v", aErr)
-				sendEvent(map[string]any{"type": "error", "text": "Action LLM 오류: " + aErr.Error()})
-				break
-			}
-			actionText := ""
-			if rawChoices, err := json.Marshal(actionResp["choices"]); err == nil {
-				var choices []struct {
-					Message struct{ Content string `json:"content"` } `json:"message"`
-				}
-				if json.Unmarshal(rawChoices, &choices) == nil && len(choices) > 0 {
-					actionText = choices[0].Message.Content
-				}
-			}
-			if actionText == "" {
-				rawResp, _ := json.Marshal(actionResp)
-				log.Printf("[computer-use/agent] step=%d action text EMPTY, raw response keys=%v full=%s", step, func() []string {
-					keys := make([]string, 0)
-					for k := range actionResp { keys = append(keys, k) }
-					return keys
-				}(), string(rawResp))
-				sendEvent(map[string]any{"type": "error", "text": "Action LLM 빈 응답"})
-				break
-			}
-			log.Printf("[computer-use/agent] step=%d action text=%s", step, actionText)
-
-			// JSON 배열 파싱 (LLM이 잘못된 JSON을 줄 수 있으므로 정규화 시도)
-			start := strings.Index(actionText, "[")
-			end := strings.LastIndex(actionText, "]")
-			if start < 0 || end <= start {
-				log.Printf("[computer-use/agent] no action array in response, continuing")
+			// ── Step D: NEXT_ACTION 파싱
+			action, ok := parseNextAction(thought)
+			if !ok {
+				log.Printf("[computer-use/agent] step=%d could not parse NEXT_ACTION", step)
+				sendEvent(map[string]any{"type": "error", "text": "NEXT_ACTION 파싱 실패 — 다음 스텝에서 재시도"})
+				stepHistory = append(stepHistory, stepRecord{
+					Step: step + 1, Observation: observation, Action: "parse_failed", ScreenChanged: false,
+				})
 				continue
 			}
-			jsonSlice := actionText[start : end+1]
-			var actions []map[string]any
-			if err := json.Unmarshal([]byte(jsonSlice), &actions); err != nil {
-				// LLM이 숫자에 따옴표를 넣는 등의 오류 복구 시도: "285" → 285
-				cleaned := strings.NewReplacer(`"action"`, `"action"`).Replace(jsonSlice)
-				// 숫자값에 잘못 붙은 따옴표 제거: "x":"123" → "x":123
-				numFixRe := regexp.MustCompile(`"(x|y|amount)"\s*:\s*"(\d+)"`)
-				cleaned = numFixRe.ReplaceAllString(cleaned, `"$1":$2`)
-				if err2 := json.Unmarshal([]byte(cleaned), &actions); err2 != nil {
-					log.Printf("[computer-use/agent] action parse failed (original=%s, cleaned=%s): %v", jsonSlice, cleaned, err2)
-					sendEvent(map[string]any{"type": "error", "text": "액션 파싱 실패: " + actionText})
-					// 파싱 실패해도 다음 스텝으로 계속 진행 (break 대신 continue)
-					continue
-				}
-				log.Printf("[computer-use/agent] step=%d action JSON fixed: %s → %s", step, jsonSlice, cleaned)
-			}
 
-			// Step D: 액션 실행
-			stopped := false
-			var stepActionDescs []string
-			var stepResults []string
-			for i, action := range actions {
-				if action["action"] == "stop" {
-					stopped = true
-					break
-				}
-				actionJSON, _ := json.Marshal(action)
-				log.Printf("[computer-use/agent] step=%d action[%d]: %s", step, i, actionJSON)
-				sendEvent(map[string]any{"type": "action", "index": executed, "action": action})
-				stepActionDescs = append(stepActionDescs, string(actionJSON))
-
-				result, err := queueAndWait(action)
-				if err != nil {
-					log.Printf("[computer-use/agent] action error: %v", err)
-					sendEvent(map[string]any{"type": "action_result", "index": executed, "error": err.Error()})
-					stepResults = append(stepResults, "error:"+err.Error())
-					if err.Error() == "cancelled" {
-						return
-					}
-					stopped = true
-					break
-				}
-				resultJSON, _ := json.Marshal(result)
-				stepResults = append(stepResults, string(resultJSON))
-				sendEvent(map[string]any{"type": "action_result", "index": executed, "result": result})
-				executed++
-				// 액션 실행 즉시 봇 채팅에 주입
-				actionDesc := formatActionDesc(action)
-				go injectOpenClawMessage(fmt.Sprintf("[gcp_exec] %s : [%d] %s", agentReq.Prompt, executed, actionDesc))
-			}
-
-			// ── 액션 실행 후 원격 데스크탑 반응 대기 (플립북 패턴: 결과 검증 전 대기)
-			// Guacamole → RDP 전달 + 화면 렌더링에 시간이 필요
-			if executed > 0 && !stopped {
-				time.Sleep(800 * time.Millisecond)
-			}
-
-			// ── 히스토리 기록: 이번 스텝의 thought + actions + result 를 누적
-			// thought 는 너무 길 수 있으므로 200자로 자름
-			shortThought := thought
-			if len(shortThought) > 200 {
-				shortThought = shortThought[:200] + "..."
-			}
-			stepHistory = append(stepHistory, stepRecord{
-				Step:    step + 1,
-				Thought: shortThought,
-				Actions: strings.Join(stepActionDescs, ","),
-				Result:  strings.Join(stepResults, ","),
-			})
-
-			if stopped {
+			actionType, _ := action["action"].(string)
+			if actionType == "stop" {
+				log.Printf("[computer-use/agent] NEXT_ACTION=stop at step %d", step)
 				break
 			}
+			if actionType == "wait" {
+				sendEvent(map[string]any{"type": "status", "text": "UI 반응 대기 중..."})
+				time.Sleep(1200 * time.Millisecond)
+				stepHistory = append(stepHistory, stepRecord{
+					Step: step + 1, Observation: observation, Action: "wait", ScreenChanged: false,
+				})
+				lastActionSignature = "wait"
+				continue
+			}
+
+			// ── click_element → 좌표 변환 (grounding LMM 호출)
+			// vision LMM 이 자연어 description 으로 답한 경우, grounding LMM 에 위임해서
+			// (x, y) 를 받아낸다. grounding LMM 이 없으면 이 분기는 없음 (parseNextAction 단계에서
+			// vision 프롬프트가 click_element 를 안 권장하므로 보통 click:X,Y 로 옴).
+			if actionType == "click_element" {
+				desc, _ := action["description"].(string)
+				doubleClick, _ := action["double"].(bool)
+				if groundingEntry == nil {
+					log.Printf("[computer-use/agent] step=%d click_element received but no grounding LMM bound — dropping", step)
+					sendEvent(map[string]any{"type": "error", "text": "click_element 사용 불가: grounding LMM 미바인딩"})
+					stepHistory = append(stepHistory, stepRecord{
+						Step: step + 1, Observation: observation, Action: "ERROR_no_grounding:" + desc, ScreenChanged: false,
+					})
+					continue
+				}
+				sendEvent(map[string]any{"type": "status", "text": fmt.Sprintf("🎯 grounding LMM 에 좌표 요청: %q", desc)})
+				gx, gy, gErr := s.forwardGroundingLLM(r.Context(), groundingEntry, screenshotB64, desc, scrW, scrH)
+				if gErr != nil {
+					log.Printf("[computer-use/agent] step=%d grounding error desc=%q: %v", step, desc, gErr)
+					sendEvent(map[string]any{"type": "error", "text": "grounding 실패: " + gErr.Error()})
+					stepHistory = append(stepHistory, stepRecord{
+						Step: step + 1, Observation: observation, Action: "GROUND_FAIL:" + desc, ScreenChanged: false,
+					})
+					continue
+				}
+				if gx < 0 || gy < 0 {
+					log.Printf("[computer-use/agent] step=%d grounding returned not-found for %q", step, desc)
+					sendEvent(map[string]any{"type": "status", "text": fmt.Sprintf("grounding: '%s' 를 화면에서 못 찾음", desc)})
+					stepHistory = append(stepHistory, stepRecord{
+						Step: step + 1, Observation: observation, Action: "GROUND_NOTFOUND:" + desc, ScreenChanged: false,
+					})
+					continue
+				}
+				log.Printf("[computer-use/agent] step=%d grounding %q → (%d, %d)", step, desc, gx, gy)
+				sendEvent(map[string]any{"type": "status", "text": fmt.Sprintf("✓ grounding 결과: %s → (%d, %d)", desc, gx, gy)})
+				// click_element 를 click / double_click 액션으로 변환 (이후 dedup/실행 경로 그대로 사용)
+				if doubleClick {
+					action = map[string]any{"action": "double_click", "x": float64(gx), "y": float64(gy)}
+					actionType = "double_click"
+				} else {
+					action = map[string]any{"action": "click", "x": float64(gx), "y": float64(gy)}
+					actionType = "click"
+				}
+			}
+
+			// ── 세션 파괴 위험 키 필터: LLM이 실수로 alt+F4 등을 보내면 실행 전에 차단
+			if blocked, keyName := isForbiddenKey(action); blocked {
+				log.Printf("[computer-use/agent] step=%d FORBIDDEN key blocked: %s", step, keyName)
+				sendEvent(map[string]any{"type": "status", "text": fmt.Sprintf("⛔ 금지 키 차단: %s — 창을 닫으려면 X 버튼 클릭을 사용하세요", keyName)})
+				stepHistory = append(stepHistory, stepRecord{
+					Step: step + 1, Observation: observation, Action: "BLOCKED_forbidden_key:" + keyName, ScreenChanged: false,
+				})
+				lastActionSignature = "key:" + strings.ToLower(keyName)
+				continue
+			}
+
+			// ── Fuzzy click dedup: 새 click 이 최근 3개 클릭의 ±25px 안이면 동일 의도로 간주
+			//    sig 단순 일치는 (282,231) 과 (280,229) 를 다른 액션으로 보지만,
+			//    실제 LLM 의도는 동일하므로 좌표 거리로 판정한다.
+			if actionType == "click" || actionType == "double_click" || actionType == "right_click" {
+				xRaw, _ := action["x"].(float64)
+				yRaw, _ := action["y"].(float64)
+				cx, cy := int(xRaw), int(yRaw)
+				if hit, prevX, prevY := isNearRecentClick(cx, cy); hit {
+					log.Printf("[computer-use/agent] step=%d FUZZY click dedup blocked: (%d,%d) near (%d,%d)", step, cx, cy, prevX, prevY)
+					sendEvent(map[string]any{"type": "status", "text": fmt.Sprintf("⛔ 같은 영역 클릭 반복 차단: (%d,%d) ~ 이전 (%d,%d)", cx, cy, prevX, prevY)})
+					stepHistory = append(stepHistory, stepRecord{
+						Step: step + 1, Observation: observation,
+						Action:        fmt.Sprintf("BLOCKED_fuzzy_click:(%d,%d)~(%d,%d)", cx, cy, prevX, prevY),
+						ScreenChanged: false,
+					})
+					stagnationCount++ // fuzzy 차단도 stagnation 으로 친다
+					continue
+				}
+			}
+
+			// ── 중복 액션 가드: 직전 서명과 같고 화면이 안 바뀌었다면 실행하지 않고 다음 스텝
+			sig := signatureOf(action)
+			if sig == lastActionSignature && !screenChanged && executed > 0 {
+				log.Printf("[computer-use/agent] step=%d duplicate blocked sig=%s", step, sig)
+				sendEvent(map[string]any{"type": "status", "text": "동일 액션 반복 감지 — 전략 변경 필요"})
+				stepHistory = append(stepHistory, stepRecord{
+					Step: step + 1, Observation: observation, Action: "BLOCKED_dup:" + sig, ScreenChanged: false,
+				})
+				continue
+			}
+
+			// ── Step E: 액션 실행 (stale client retry 지원)
+			// 같은 액션을 최대 3번까지 큐에 다시 넣어서 active client 가 잡도록 한다.
+			// 이유: stale polling client (iframe 없는 옛 탭) 가 액션을 빼가서 client null
+			// 인 채로 {error: "stale polling client"} 반환할 수 있는데, 이때 active client
+			// 가 다음 poll 에서 같은 액션을 받게 해야 함.
+			actionJSON, _ := json.Marshal(action)
+			log.Printf("[computer-use/agent] step=%d execute action=%s", step, actionJSON)
+			sendEvent(map[string]any{"type": "action", "index": executed, "action": action})
+
+			var result map[string]any
+			var execErr error
+			const maxActionRetries = 3
+			for retry := 0; retry < maxActionRetries; retry++ {
+				result, execErr = queueAndWait(action)
+				if execErr != nil {
+					break
+				}
+				// 결과 본문에 error 키가 있으면 stale client 가 잡은 것 — 재시도
+				if errMsg, ok := result["error"].(string); ok && errMsg != "" {
+					log.Printf("[computer-use/agent] step=%d action retry=%d frontend error: %s", step, retry, errMsg)
+					sendEvent(map[string]any{"type": "status", "text": fmt.Sprintf("⚠ stale client 감지 (retry %d/%d)", retry+1, maxActionRetries)})
+					time.Sleep(200 * time.Millisecond) // 짧은 backoff — 다음 poll 사이클 기다림
+					continue
+				}
+				// success
+				break
+			}
+
+			if execErr != nil {
+				log.Printf("[computer-use/agent] step=%d action error: %v", step, execErr)
+				sendEvent(map[string]any{"type": "action_result", "index": executed, "error": execErr.Error()})
+				if execErr.Error() == "cancelled" {
+					return
+				}
+				stepHistory = append(stepHistory, stepRecord{
+					Step: step + 1, Observation: observation, Action: "error:" + execErr.Error(), ScreenChanged: false,
+				})
+				break
+			}
+			// 모든 retry 후에도 frontend error 면 fail-treat
+			if errMsg, ok := result["error"].(string); ok && errMsg != "" {
+				log.Printf("[computer-use/agent] step=%d action exhausted retries: %s", step, errMsg)
+				sendEvent(map[string]any{"type": "action_result", "index": executed, "error": "stale client retries exhausted: " + errMsg})
+				stepHistory = append(stepHistory, stepRecord{
+					Step: step + 1, Observation: observation, Action: "STALE_RETRIES_EXHAUSTED", ScreenChanged: false,
+				})
+				break
+			}
+
+			sendEvent(map[string]any{"type": "action_result", "index": executed, "result": result})
+			executed++
+			actionDesc := formatActionDesc(action)
+			go injectOpenClawMessage(fmt.Sprintf("[gcp_exec] %s : [%d] %s", agentReq.Prompt, executed, actionDesc))
+
+			// 클릭이었다면 클러스터에 기록 (다음 스텝의 마커 + dedup 에 사용)
+			if actionType == "click" || actionType == "double_click" || actionType == "right_click" {
+				if xRaw, ok := action["x"].(float64); ok {
+					if yRaw, ok := action["y"].(float64); ok {
+						recordClick(int(xRaw), int(yRaw), step+1)
+					}
+				}
+			}
+			// 키/타이핑은 다른 의도이므로 클러스터 리셋 (이전 클릭 영역과 무관해진 판단)
+			if actionType == "key" || actionType == "type" {
+				clickCluster = nil
+			}
+
+			// ── Step F: 액션 타입에 맞춰 UI 반응 대기
+			time.Sleep(waitFor(action))
+
+			// ── Step G: 히스토리 기록 (screen_changed 는 다음 스텝 시작 시 소급)
+			stepHistory = append(stepHistory, stepRecord{
+				Step:          step + 1,
+				Observation:   observation,
+				Action:        string(actionJSON),
+				ScreenChanged: false, // 다음 스텝이 업데이트
+			})
+			lastActionSignature = sig
 		}
 
-		// 액션 없이 종료된 경우 — 에러가 아닌 경우에만 스크린샷 주입
+		// 종료 처리
 		if executed == 0 && lastScreenshotB64 != "" {
 			go injectOpenClawMessage(fmt.Sprintf("[gcp_exec] %s : 실행 실패 (액션 없음)", agentReq.Prompt))
+		} else if executed > 0 && lastScreenshotB64 != "" {
+			// STATUS:COMPLETE 없이 루프를 마친 경우 — 최종 화면을 챗에 전달
+			imgURL := makeChatScreenshotURL(lastScreenshotB64)
+			finalMsg := fmt.Sprintf("[gcp_exec] %s : 종료 (실행 %d회)\n\n![](%s)", agentReq.Prompt, executed, imgURL)
+			go injectOpenClawMessage(finalMsg)
 		}
 		sendEvent(map[string]any{"type": "done", "actions_executed": executed})
 	})
+
+	// TEST 모드 전용 endpoint — cfg.TestMode 가 true 일 때만 등록.
+	// (test_endpoints.go) — prod 에서는 TEST 환경변수 미설정 → 등록 자체 안 됨.
+	if s.cfg.TestMode {
+		s.registerTestEndpoints(mux)
+	}
 
 	srv := &http.Server{
 		Addr:              s.cfg.AdminListen,
@@ -3193,6 +4400,97 @@ func (s *Server) StartAdmin() {
 	go func() {
 		_ = srv.ListenAndServe()
 	}()
+}
+
+// clickMarker — annotateClicksOnScreenshot 에 넘기는 클릭 이력 항목.
+// Label 은 마커 옆에 표시할 수는 없지만 (폰트 렌더링 생략) 색상으로 구분.
+type clickMarker struct {
+	X, Y int
+	Step int  // 1-indexed step number (로그용)
+	Note string // 현재 미사용 (향후 pass/fail 구분용)
+}
+
+// annotateClicksOnScreenshot — 스크린샷 위에 이전 클릭 위치를 시각화해서 반환.
+// 사람이 '어디 찍었는지' 기억하듯 vision LMM 이 자기 클릭 이력을 한눈에 보게 함.
+//   • 가장 오래된 클릭 → 어두운 빨강
+//   • 중간 클릭 → 밝은 빨강
+//   • 가장 최근 클릭 → 주황 (가장 눈에 띄게)
+// PNG 디코딩/인코딩 실패 시 원본 base64 그대로 반환.
+func annotateClicksOnScreenshot(b64 string, clicks []clickMarker) string {
+	if len(clicks) == 0 {
+		return b64
+	}
+	raw, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return b64
+	}
+	src, _, err := image.Decode(bytes.NewReader(raw))
+	if err != nil {
+		return b64
+	}
+	bounds := src.Bounds()
+	rgba := image.NewRGBA(bounds)
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			rgba.Set(x, y, src.At(x, y))
+		}
+	}
+	white := color.RGBA{R: 255, G: 255, B: 255, A: 255}
+	darkRed := color.RGBA{R: 180, G: 0, B: 0, A: 255}
+	red := color.RGBA{R: 255, G: 40, B: 40, A: 255}
+	orange := color.RGBA{R: 255, G: 160, B: 0, A: 255}
+	n := len(clicks)
+	for i, c := range clicks {
+		fg := red
+		if i == n-1 {
+			fg = orange // 가장 최근
+		} else if i == 0 && n > 2 {
+			fg = darkRed // 가장 오래된 (3개 이상일 때만)
+		}
+		drawClickMarker(rgba, c.X, c.Y, fg, white)
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, rgba); err != nil {
+		return b64
+	}
+	return base64.StdEncoding.EncodeToString(buf.Bytes())
+}
+
+// drawClickMarker — 이중 링 + 크로스(+) 를 그린다.
+// 안쪽 흰색 링으로 어느 배경에서도 보이도록 대비 확보.
+func drawClickMarker(img *image.RGBA, cx, cy int, fg, bg color.Color) {
+	bounds := img.Bounds()
+	setPx := func(x, y int, c color.Color) {
+		if x < bounds.Min.X || x >= bounds.Max.X || y < bounds.Min.Y || y >= bounds.Max.Y {
+			return
+		}
+		img.Set(x, y, c)
+	}
+	// 바깥 링 (radius 13~17, 색상)
+	for dy := -17; dy <= 17; dy++ {
+		for dx := -17; dx <= 17; dx++ {
+			d := dx*dx + dy*dy
+			if d >= 13*13 && d <= 17*17 {
+				setPx(cx+dx, cy+dy, fg)
+			}
+		}
+	}
+	// 안쪽 흰색 링 (radius 10~12, 대비용)
+	for dy := -12; dy <= 12; dy++ {
+		for dx := -12; dx <= 12; dx++ {
+			d := dx*dx + dy*dy
+			if d >= 10*10 && d <= 12*12 {
+				setPx(cx+dx, cy+dy, bg)
+			}
+		}
+	}
+	// 십자선 (+) — 길이 22, 두께 3
+	for i := -11; i <= 11; i++ {
+		for j := -1; j <= 1; j++ {
+			setPx(cx+i, cy+j, fg)
+			setPx(cx+j, cy+i, fg)
+		}
+	}
 }
 
 // getImageDimensions — base64 인코딩된 이미지의 너비/높이 반환 (실패 시 0, 0)
@@ -3208,19 +4506,27 @@ func getImageDimensions(b64 string) (int, int) {
 	return cfg.Width, cfg.Height
 }
 
-// compressScreenshotForChat — PNG base64를 JPEG 소형으로 압축 (OpenClaw MARKDOWN_PARSE_LIMIT 40000자 이내)
-// 최대 너비 400px로 축소 후 JPEG quality 40으로 재인코딩 → ~20-30KB base64
+// compressScreenshotForChat — PNG base64를 JPEG 소형 base64 로 압축 (legacy).
+// 새 코드는 makeChatScreenshotURL 사용. fallback / 호환성 위해 유지.
 func compressScreenshotForChat(b64 string) string {
+	jpegBytes := compressScreenshotToJPEG(b64)
+	if jpegBytes == nil {
+		return b64
+	}
+	return base64.StdEncoding.EncodeToString(jpegBytes)
+}
+
+// compressScreenshotToJPEG — base64 PNG/JPEG 입력 → 작은 JPEG bytes 반환.
+// 최대 너비 400px, quality 40. 디코딩 실패 시 nil.
+func compressScreenshotToJPEG(b64 string) []byte {
 	raw, err := base64.StdEncoding.DecodeString(b64)
 	if err != nil {
-		return b64
+		return nil
 	}
 	src, _, err := image.Decode(bytes.NewReader(raw))
 	if err != nil {
-		return b64
+		return nil
 	}
-
-	// 최대 너비 400px 비율 축소
 	bounds := src.Bounds()
 	srcW, srcH := bounds.Dx(), bounds.Dy()
 	maxW := 400
@@ -3229,8 +4535,6 @@ func compressScreenshotForChat(b64 string) string {
 		dstW = maxW
 		dstH = srcH * maxW / srcW
 	}
-
-	// nearest-neighbor 리사이즈
 	dst := image.NewRGBA(image.Rect(0, 0, dstW, dstH))
 	for y := 0; y < dstH; y++ {
 		for x := 0; x < dstW; x++ {
@@ -3241,9 +4545,29 @@ func compressScreenshotForChat(b64 string) string {
 	}
 	var buf bytes.Buffer
 	if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: 40}); err != nil {
-		return b64
+		return nil
 	}
-	return base64.StdEncoding.EncodeToString(buf.Bytes())
+	return buf.Bytes()
+}
+
+// makeChatScreenshotURL — base64 PNG → 압축된 JPEG 저장 → 짧은 markdown URL 반환.
+// 인라인 base64 가 OpenClaw markdown 렌더러에서 깨지는 문제 회피.
+//
+// 사용:
+//   url := makeChatScreenshotURL(screenshotB64)
+//   if url != "" {
+//     msg := fmt.Sprintf("[gcp_exec] %s : 완료\n\n![](%s)", prompt, url)
+//   }
+//
+// URL 형식: http://localhost:19080/api/computer-use/screenshot/{id}.jpg
+// (admin-console nginx → boan-proxy 로 reverse-proxy. 외부 노출 0.)
+func makeChatScreenshotURL(b64 string) string {
+	jpegBytes := compressScreenshotToJPEG(b64)
+	if jpegBytes == nil {
+		return ""
+	}
+	id := storeChatScreenshot(jpegBytes)
+	return fmt.Sprintf("http://localhost:19080/api/computer-use/screenshot/%s.jpg", id)
 }
 
 // formatActionDesc — computer-use 액션을 사람이 읽기 쉬운 문자열로 변환
@@ -3683,75 +5007,3 @@ func (s *Server) dlpRulesLoaded() int {
 	return s.dlpEng.RulesCount()
 }
 
-// runAutoJudgeForApproval fetches the org policy to check auto_approve_mode,
-// then calls policy-server auto-judge and immediately resolves the approval.
-func (s *Server) runAutoJudgeForApproval(approvalID, orgID, text, mode, reason string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	// Fetch policy to check auto_approve_mode flag.
-	policyURL := strings.TrimRight(s.cfg.PolicyURL, "/") + "/org/" + orgID + "/policy.json"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, policyURL, nil)
-	if err != nil {
-		return
-	}
-	pResp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
-	if err != nil {
-		return
-	}
-	defer pResp.Body.Close()
-	var pol struct {
-		Guardrail struct {
-			AutoApproveMode bool `json:"auto_approve_mode"`
-		} `json:"guardrail"`
-	}
-	if err := json.NewDecoder(pResp.Body).Decode(&pol); err != nil {
-		return
-	}
-	if !pol.Guardrail.AutoApproveMode {
-		return // 수동 모드: 그냥 운영자 대기
-	}
-
-	// Call policy-server auto-judge endpoint.
-	judgeURL := strings.TrimRight(s.cfg.PolicyURL, "/") + "/org/" + orgID + "/v1/guardrail/auto-judge"
-	payload := map[string]string{"text": text, "mode": mode, "reason": reason}
-	raw, _ := json.Marshal(payload)
-	jReq, err := http.NewRequestWithContext(ctx, http.MethodPost, judgeURL, bytes.NewReader(raw))
-	if err != nil {
-		return
-	}
-	jReq.Header.Set("Content-Type", "application/json")
-	jResp, err := (&http.Client{Timeout: 12 * time.Second}).Do(jReq)
-	if err != nil {
-		return
-	}
-	defer jResp.Body.Close()
-	var judgeResult struct {
-		Decision   string  `json:"decision"`
-		Reasoning  string  `json:"reasoning"`
-		Confidence float64 `json:"confidence"`
-	}
-	if err := json.NewDecoder(jResp.Body).Decode(&judgeResult); err != nil {
-		return
-	}
-
-	newStatus := "rejected"
-	if judgeResult.Decision == "approve" {
-		newStatus = "approved"
-	}
-
-	// Update approval record in-memory.
-	approvalsMu.Lock()
-	for _, a := range approvalsStore {
-		if a["id"] == approvalID {
-			a["status"] = newStatus
-			a["decidedBy"] = "auto-judge"
-			a["decidedAt"] = time.Now().UTC().Format(time.RFC3339)
-			a["auto_reasoning"] = judgeResult.Reasoning
-			a["auto_confidence"] = judgeResult.Confidence
-			break
-		}
-	}
-	approvalsMu.Unlock()
-	log.Printf("auto-judge approval=%s decision=%s confidence=%.2f reason=%q", approvalID, newStatus, judgeResult.Confidence, judgeResult.Reasoning)
-}

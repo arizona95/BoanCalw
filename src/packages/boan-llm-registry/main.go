@@ -121,6 +121,22 @@ func main() {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]string{"status": "bound-lmm", "name": name})
+		case len(parts) == 3 && parts[1] == "bind-role" && r.Method == http.MethodPost:
+			role := parts[2]
+			if err := reg.BindRole(name, role); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{"status": "bound", "name": name, "role": role})
+		case len(parts) == 3 && parts[1] == "unbind-role" && r.Method == http.MethodPost:
+			role := parts[2]
+			if err := reg.UnbindRole(name, role); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{"status": "unbound", "name": name, "role": role})
 		default:
 			http.NotFound(w, r)
 		}
