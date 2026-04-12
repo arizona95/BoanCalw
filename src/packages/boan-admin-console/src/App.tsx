@@ -109,6 +109,9 @@ function Shell() {
           <span className="text-xl font-bold tracking-tight">
             {sidebarOpen ? "BoanClaw" : "B"}
           </span>
+          {sidebarOpen && version?.current && (
+            <span className="text-[10px] text-white/30 font-mono">{version.current}</span>
+          )}
           <button
             onClick={() => setSidebarOpen(!sidebarOpen)}
             className="ml-auto text-white/60 hover:text-white"
