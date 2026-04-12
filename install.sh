@@ -142,6 +142,23 @@ export BOAN_UID="${BOAN_UID:-$(id -u)}"
 export BOAN_GID="${BOAN_GID:-$(id -g)}"
 ok "sandbox 사용자 UID:GID = ${BOAN_UID}:${BOAN_GID} (호스트와 일치)"
 
+# ── 5.5. 버전 파일 생성 + 업데이트 워처 ──
+if command -v git &>/dev/null && [ -d "$INSTALL_DIR/.git" ]; then
+  git -C "$INSTALL_DIR" rev-parse --short HEAD > "$INSTALL_DIR/.boanclaw-version" 2>/dev/null || true
+  ok "버전: $(cat "$INSTALL_DIR/.boanclaw-version" 2>/dev/null || echo 'unknown')"
+fi
+
+# 업데이트 트리거 파일 경로 (container 에서 접근 가능해야 함)
+TRIGGER_FILE="/tmp/boanclaw-update-trigger"
+rm -f "$TRIGGER_FILE"
+
+# 업데이트 워처 (기존 인스턴스 종료 후 재시작)
+pkill -f "update-watcher.sh" 2>/dev/null || true
+if [ -x "$INSTALL_DIR/scripts/update-watcher.sh" ]; then
+  nohup bash "$INSTALL_DIR/scripts/update-watcher.sh" "$INSTALL_DIR" > /dev/null 2>&1 &
+  ok "업데이트 워처 시작 (PID: $!)"
+fi
+
 # ── 6. Docker 이미지 빌드 + 컨테이너 시작 ──
 info "Docker 이미지 빌드 중... (최초 실행 시 5-10분 소요)"
 info "  └ OpenClaw 는 빌드 시점에 핀된 버전 + sha256 으로 무결성 검증됩니다"

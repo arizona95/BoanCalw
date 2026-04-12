@@ -567,6 +567,86 @@ func (s *Server) StartAdmin() {
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
 
+	// ── auto-update: version check + trigger ──
+	versionFile := os.Getenv("BOAN_VERSION_FILE")
+	triggerFile := os.Getenv("BOAN_UPDATE_TRIGGER_FILE")
+	updateRepoURL := os.Getenv("BOAN_UPDATE_REPO_URL")
+
+	mux.HandleFunc("/api/admin/version", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+
+		current := "unknown"
+		if versionFile != "" {
+			if b, err := os.ReadFile(versionFile); err == nil {
+				current = strings.TrimSpace(string(b))
+			}
+		}
+
+		latest := ""
+		updateAvailable := false
+		if updateRepoURL != "" {
+			req, _ := http.NewRequestWithContext(r.Context(), "GET", updateRepoURL, nil)
+			req.Header.Set("Accept", "application/vnd.github.v3+json")
+			if resp, err := http.DefaultClient.Do(req); err == nil {
+				defer resp.Body.Close()
+				var commit struct {
+					SHA string `json:"sha"`
+				}
+				if json.NewDecoder(resp.Body).Decode(&commit) == nil && commit.SHA != "" {
+					latest = commit.SHA[:7]
+					if current != "unknown" && latest != current {
+						updateAvailable = true
+					}
+				}
+			}
+		}
+
+		json.NewEncoder(w).Encode(map[string]any{
+			"current":          current,
+			"latest":           latest,
+			"update_available": updateAvailable,
+		})
+	})
+
+	mux.HandleFunc("/api/admin/update", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Cookie")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		// owner only
+		if s.authProv.Enabled() {
+			sess, err := auth.SessionFromRequest(r, s.authProv)
+			if err != nil || !roles.CanEdit(sess.Role) {
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(map[string]string{"error": "owner only"})
+				return
+			}
+		}
+
+		if triggerFile == "" {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{"error": "update trigger not configured"})
+			return
+		}
+		if err := os.WriteFile(triggerFile, []byte("update"), 0644); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "trigger write failed: " + err.Error()})
+			return
+		}
+		log.Printf("[update] update triggered via admin API")
+		json.NewEncoder(w).Encode(map[string]any{"status": "updating"})
+	})
+
 	mux.HandleFunc("/api/auth/config", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Access-Control-Allow-Origin", "*")

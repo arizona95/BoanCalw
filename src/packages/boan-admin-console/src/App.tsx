@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { Routes, Route, NavLink, Navigate, useLocation } from "react-router-dom";
 import { AuthProvider, useAuth } from "./auth";
 import Login from "./pages/Login";
@@ -21,10 +21,42 @@ const ROLE_COLOR: Record<string, string> = {
   user: "bg-gray-100 text-gray-600",
 };
 
+function useVersion(enabled: boolean) {
+  const [version, setVersion] = useState<{
+    current: string; latest: string; update_available: boolean;
+  } | null>(null);
+  const [updating, setUpdating] = useState(false);
+
+  const check = useCallback(() => {
+    if (!enabled) return;
+    fetch("/api/admin/version", { credentials: "include" })
+      .then((r) => r.json())
+      .then(setVersion)
+      .catch(() => {});
+  }, [enabled]);
+
+  useEffect(() => {
+    check();
+    const id = setInterval(check, 5 * 60 * 1000);
+    return () => clearInterval(id);
+  }, [check]);
+
+  const triggerUpdate = async () => {
+    setUpdating(true);
+    try {
+      await fetch("/api/admin/update", { method: "POST", credentials: "include" });
+      setTimeout(() => window.location.reload(), 90_000);
+    } catch { /* noop */ }
+  };
+
+  return { version, updating, triggerUpdate };
+}
+
 function Shell() {
   const { user, loading, logout } = useAuth();
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const location = useLocation();
+  const { version, updating, triggerUpdate } = useVersion(!!user?.can_edit);
 
   if (loading) {
     return (
@@ -126,6 +158,22 @@ function Shell() {
                 </span>
               </div>
             </div>
+            {version?.update_available && !updating && (
+              <button
+                onClick={triggerUpdate}
+                className="w-full px-2 py-1.5 bg-emerald-500/20 border border-emerald-400/30 rounded-lg text-xs text-emerald-300 hover:bg-emerald-500/30 transition-colors text-left"
+              >
+                <span className="font-medium">NEW {version.latest}</span>
+                <span className="block text-emerald-400/60 text-[10px] mt-0.5">
+                  업데이트 하시겠습니까?
+                </span>
+              </button>
+            )}
+            {updating && (
+              <div className="px-2 py-1.5 bg-yellow-500/20 border border-yellow-400/30 rounded-lg text-xs text-yellow-300 animate-pulse">
+                업데이트 중... 잠시 후 새로고침됩니다
+              </div>
+            )}
             {user.enabled && (
               <button
                 onClick={logout}

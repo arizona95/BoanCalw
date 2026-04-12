@@ -300,6 +300,9 @@ services:
       - GOOGLE_APPLICATION_CREDENTIALS=/var/run/gcp/service-account.json
       - BOAN_OPENCLAW_GATEWAY_TOKEN=boan-openclaw-local
       - BOAN_RDP_TRANSFER_ROOT=/data/rdp-transfer
+      - BOAN_VERSION_FILE=/app/.boanclaw-version
+      - BOAN_UPDATE_TRIGGER_FILE=/app/update-trigger
+      - BOAN_UPDATE_REPO_URL=https://api.github.com/repos/arizona95/BoanCalw/commits/main
     ports:
       - "18789:18789"
     volumes:
@@ -308,6 +311,9 @@ services:
       - boan-user-data:/data/users
       - boan-registry-data:/data/registry
       - boan-rdp-transfer:/data/rdp-transfer
+      # auto-update: version file (ro) + trigger file (rw)
+      - ${BOAN_INSTALL_DIR:-.}/.boanclaw-version:/app/.boanclaw-version:ro
+      - /tmp/boanclaw-update-trigger:/app/update-trigger
     networks: [boanclaw]
     depends_on: [boan-policy-server, boan-audit-agent, boan-guacamole, boan-computer-use, boan-credential-filter]
 
