@@ -638,12 +638,29 @@ func (s *Server) StartAdmin() {
 				rejectCount++
 			}
 		}
-		// Also fetch wiki pages
-		wikiPages, _ := s.orgServer.GetWikiPages(defaultOrgID)
+		// Fetch wiki pages — try local policy-server first (wiki compiled locally),
+		// fall back to GCP orgserver
+		localWikiURL := fmt.Sprintf("http://boan-policy-server:8081/org/%s/v1/wiki/pages", defaultOrgID)
+		var wikiPages []map[string]any
+		if resp, err := http.Get(localWikiURL); err == nil {
+			defer resp.Body.Close()
+			json.NewDecoder(resp.Body).Decode(&wikiPages)
+		}
+		if len(wikiPages) == 0 {
+			wikiPages, _ = s.orgServer.GetWikiPages(defaultOrgID)
+		}
 		if wikiPages == nil {
 			wikiPages = []map[string]any{}
 		}
-		wikiIndex, _ := s.orgServer.GetWikiIndex(defaultOrgID)
+		localIndexURL := fmt.Sprintf("http://boan-policy-server:8081/org/%s/v1/wiki", defaultOrgID)
+		var wikiIndex map[string]any
+		if resp, err := http.Get(localIndexURL); err == nil {
+			defer resp.Body.Close()
+			json.NewDecoder(resp.Body).Decode(&wikiIndex)
+		}
+		if wikiIndex == nil {
+			wikiIndex, _ = s.orgServer.GetWikiIndex(defaultOrgID)
+		}
 		json.NewEncoder(w).Encode(map[string]any{
 			"entries": entries,
 			"stats": map[string]int{
