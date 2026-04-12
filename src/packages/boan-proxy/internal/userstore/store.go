@@ -42,14 +42,15 @@ func ValidAccessLevel(s string) bool {
 }
 
 type User struct {
-	Email        string       `json:"email"`
-	PasswordHash string       `json:"password_hash"`
-	Role         string       `json:"role"`
-	OrgID        string       `json:"org_id"`
-	Status       Status       `json:"status"`
-	AccessLevel  AccessLevel  `json:"access_level"`
-	CreatedAt    time.Time    `json:"created_at"`
-	Workstation  *Workstation `json:"workstation,omitempty"`
+	Email         string       `json:"email"`
+	PasswordHash  string       `json:"password_hash"`
+	Role          string       `json:"role"`
+	OrgID         string       `json:"org_id"`
+	Status        Status       `json:"status"`
+	AccessLevel   AccessLevel  `json:"access_level"`
+	CreatedAt     time.Time    `json:"created_at"`
+	Workstation   *Workstation `json:"workstation,omitempty"`
+	RegisteredIP  string       `json:"registered_ip,omitempty"` // IP at registration — only this IP can login
 }
 
 type Workstation struct {
@@ -90,6 +91,10 @@ func New(dataDir string) (*Store, error) {
 }
 
 func (s *Store) Register(email, password, orgID, role string, status Status) (*User, error) {
+	return s.RegisterWithIP(email, password, orgID, role, status, "")
+}
+
+func (s *Store) RegisterWithIP(email, password, orgID, role string, status Status, registeredIP string) (*User, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -110,6 +115,7 @@ func (s *Store) Register(email, password, orgID, role string, status Status) (*U
 		Status:       status,
 		AccessLevel:  AccessAsk,
 		CreatedAt:    time.Now().UTC(),
+		RegisteredIP: registeredIP,
 	}
 	s.users[email] = u
 	_ = s.save()

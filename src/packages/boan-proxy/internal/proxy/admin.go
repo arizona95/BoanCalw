@@ -507,6 +507,41 @@ func (s *Server) StartAdmin() {
 	// 소유자 PC 에서만 명시적으로 BOAN_OWNER_ALLOWED_IPS=127.0.0.1 설정.
 	ownerAllowedIPs := splitCSV(os.Getenv("BOAN_OWNER_ALLOWED_IPS"))
 
+	extractClientIP := func(r *http.Request) string {
+		clientIP := r.Header.Get("X-Forwarded-For")
+		if clientIP == "" {
+			clientIP = r.Header.Get("X-Real-IP")
+		}
+		if clientIP == "" {
+			clientIP = r.RemoteAddr
+		}
+		if idx := strings.Index(clientIP, ","); idx > 0 {
+			clientIP = strings.TrimSpace(clientIP[:idx])
+		}
+		if idx := strings.LastIndex(clientIP, ":"); idx > 0 {
+			clientIP = clientIP[:idx]
+		}
+		return clientIP
+	}
+
+	// Check if the user's stored RegisteredIP matches the current request IP.
+	// Returns true if: IP matches, or user has no RegisteredIP (backward compat), or user not found locally.
+	isUserIPAllowed := func(email string, r *http.Request) bool {
+		u, err := s.users.Get(email)
+		if err != nil || u == nil {
+			return true // User not in local store — defer to login flow (remote check, etc.)
+		}
+		if u.RegisteredIP == "" {
+			return true // Legacy user without IP binding
+		}
+		clientIP := extractClientIP(r)
+		if clientIP != u.RegisteredIP {
+			log.Printf("[user-ip] blocked %s login from IP %s (registered: %s)", email, clientIP, u.RegisteredIP)
+			return false
+		}
+		return true
+	}
+
 	isOwnerIPAllowed := func(r *http.Request) bool {
 		if len(ownerAllowedIPs) == 0 {
 			log.Printf("[owner-ip] BOAN_OWNER_ALLOWED_IPS not set — blocking all owner logins (fail-closed)")
@@ -1929,6 +1964,12 @@ func (s *Server) StartAdmin() {
 		var orgID string
 
 		if u, err := s.users.Authenticate(body.Email, body.Password); err == nil {
+			// Per-user IP binding check
+			if !isUserIPAllowed(body.Email, r) {
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(map[string]string{"error": "등록된 IP에서만 로그인 가능합니다."})
+				return
+			}
 			roleVal = roles.Normalize(roles.Role(u.Role))
 			orgID = u.OrgID
 			if orgID == "" {
@@ -2003,6 +2044,12 @@ func (s *Server) StartAdmin() {
 		// 가드레일/whitelist 검증) 를 빠르게 돌리기 위해 모든 등록된 사용자도 같이 우회.
 		// production 환경(s.cfg.TestMode == false)에서는 이 분기 자체가 실행 안 됨.
 		if s.cfg.TestMode {
+			// Per-user IP binding check (TEST MODE login)
+			if !isUserIPAllowed(body.Email, r) {
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(map[string]string{"error": "등록된 IP에서만 로그인 가능합니다."})
+				return
+			}
 			isOwner := ownerMatch(body.Email)
 			loginType := "test_user"
 			if isOwner {
@@ -2089,6 +2136,13 @@ func (s *Server) StartAdmin() {
 			return
 		}
 
+		// Per-user IP binding check (OTP login)
+		if !isUserIPAllowed(body.Email, r) {
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]string{"error": "등록된 IP에서만 로그인 가능합니다."})
+			return
+		}
+
 		roleVal := roles.User
 		orgID := defaultOrgID
 
@@ -2166,7 +2220,21 @@ func (s *Server) StartAdmin() {
 			status = userstore.StatusApproved
 		}
 
-		u, err := s.users.Register(body.Email, body.Password, orgID, role, status)
+		// Capture registration IP — only this IP can login as this user later.
+		regIP := r.Header.Get("X-Forwarded-For")
+		if regIP == "" {
+			regIP = r.Header.Get("X-Real-IP")
+		}
+		if regIP == "" {
+			regIP = r.RemoteAddr
+		}
+		if idx := strings.Index(regIP, ","); idx > 0 {
+			regIP = strings.TrimSpace(regIP[:idx])
+		}
+		if idx := strings.LastIndex(regIP, ":"); idx > 0 {
+			regIP = regIP[:idx]
+		}
+		u, err := s.users.RegisterWithIP(body.Email, body.Password, orgID, role, status, regIP)
 		if err == userstore.ErrExists {
 			w.WriteHeader(http.StatusConflict)
 			json.NewEncoder(w).Encode(map[string]string{"error": "이미 등록된 이메일입니다."})
