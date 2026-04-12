@@ -107,7 +107,7 @@ function Shell() {
       >
         <div className="flex items-center gap-2 px-4 py-5 border-b border-white/10">
           <span className="text-xl font-bold tracking-tight">
-            {sidebarOpen ? "BoanClaw" : "B"}
+            {sidebarOpen ? "BoanClaw v0.4" : "B"}
           </span>
           {sidebarOpen && version?.current && (
             <span className="text-[10px] text-white/30 font-mono">{version.current}</span>
