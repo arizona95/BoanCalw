@@ -14,6 +14,9 @@ import (
 type Provisioner interface {
 	Ensure(ctx context.Context, email, orgID string, current *userstore.Workstation) (*userstore.Workstation, error)
 	RepairCredentials(ctx context.Context, email, orgID string, current *userstore.Workstation) (*userstore.Workstation, error)
+	// Delete — 사용자의 GCP VM 을 즉시 삭제. user 가 owner 에 의해 제거될 때 호출.
+	// noop provider 는 빈 구현. error 는 caller 가 best-effort 로 로그만 찍을 수 있음.
+	Delete(ctx context.Context, email, orgID string, current *userstore.Workstation) error
 }
 
 type noopProvisioner struct {
@@ -50,6 +53,11 @@ func (p *noopProvisioner) RepairCredentials(_ context.Context, email, _ string, 
 		return current, nil
 	}
 	return p.Ensure(context.Background(), email, "", current)
+}
+
+func (p *noopProvisioner) Delete(_ context.Context, _, _ string, _ *userstore.Workstation) error {
+	// noop provider — 실제 VM 이 없으므로 할 일 없음.
+	return nil
 }
 
 var slugRe = regexp.MustCompile(`[^a-z0-9]+`)

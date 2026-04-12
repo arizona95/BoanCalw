@@ -1241,12 +1241,12 @@ func (s *Server) StartAdmin() {
 				return createInputGateApproval(sender, orgID, reason, req)
 			})
 			if !gateResp.Allowed {
-				log.Printf("[openclaw/v1] guardrail blocked: %s", gateResp.Reason)
+				log.Printf("[openclaw/v1] guardrail blocked tier=%s action=%s reason=%q", gateResp.Tier, gateResp.Action, gateResp.Reason)
 				addTrace(traceEntry{
 					Type: "guardrail", Direction: "inbound", Source: sender, Target: "llm",
-					Summary: payload, Decision: gateResp.Action, Gate: "G2",
+					Summary: payload, Decision: gateResp.Action, Gate: gateResp.Tier,
 				})
-				writeOpenAITextResponse(w, "[가드레일 차단] "+gateResp.Reason)
+				writeOpenAITextResponse(w, formatGuardrailBlockMessage(gateResp, payload))
 				return
 			}
 		}
@@ -2008,11 +2008,22 @@ func (s *Server) StartAdmin() {
 				json.NewEncoder(w).Encode(map[string]string{"error": "고정 소유자는 삭제할 수 없습니다."})
 				return
 			}
+			// 1) GCP VM 먼저 삭제 시도 (best-effort) — 실패해도 user 삭제는 진행
+			if s.workstations != nil {
+				current, _ := s.users.Workstation(body.Email)
+				if err := s.workstations.Delete(r.Context(), body.Email, defaultOrgID, current); err != nil {
+					log.Printf("workstation delete failed for %s (proceeding with user delete): %v", body.Email, err)
+				} else {
+					log.Printf("workstation deleted for %s", body.Email)
+				}
+			}
+			// 2) local user store 에서 제거
 			if err := s.users.Delete(body.Email); err != nil {
 				w.WriteHeader(http.StatusNotFound)
 				json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 				return
 			}
+			// 3) org server 에서 제거
 			if err := s.orgServer.DeleteUser(defaultOrgID, body.Email); err != nil {
 				w.WriteHeader(http.StatusBadGateway)
 				json.NewEncoder(w).Encode(map[string]string{"error": "조직 서버 삭제 실패: " + err.Error()})
@@ -4571,6 +4582,75 @@ func makeChatScreenshotURL(b64 string) string {
 }
 
 // formatActionDesc — computer-use 액션을 사람이 읽기 쉬운 문자열로 변환
+// formatGuardrailBlockMessage — 사용자가 차단 원인을 즉시 이해할 수 있는 메시지.
+// 구성:
+//   • 어떤 가드레일 계층(tier) 이 차단했는지 (G1 정규식 / G2 헌법 / G3 wiki / DLP / access 등)
+//   • 구체 이유 (Reason 필드)
+//   • 권장 조치 (tier별 hint)
+//
+// payload 는 원본 사용자 입력. 로그에만 잘라서 사용하고 본 메시지엔 포함하지 않음.
+func formatGuardrailBlockMessage(resp InputGateResponse, _ string) string {
+	tier := strings.TrimSpace(resp.Tier)
+	reason := strings.TrimSpace(resp.Reason)
+	action := strings.TrimSpace(resp.Action)
+
+	tierLabel := tier
+	tierDesc := ""
+	hint := ""
+	switch strings.ToUpper(tier) {
+	case "G1":
+		tierLabel = "G1 (정규식 패턴)"
+		tierDesc = "입력 중 자격증명/토큰/비밀번호로 보이는 패턴이 감지되었습니다."
+		hint = "• API 키 / 비밀번호 / 토큰을 직접 넣지 말고 자격증명 이름 ({{CREDENTIAL:이름}}) 을 사용하거나 Credentials 탭에서 먼저 등록하세요."
+	case "G2":
+		tierLabel = "G2 (헌법 + 보안 LLM)"
+		tierDesc = "조직 헌법 기준 보안 LLM 이 입력 내용을 차단했습니다."
+		hint = "• 사내 비밀/개인정보/민감 운영 명령을 포함하고 있지 않은지 확인하세요.\n• 일반 표현으로 다시 작성하거나, 필요하면 관리자에게 헌법 검토를 요청하세요."
+	case "G3":
+		tierLabel = "G3 (Wiki 적응형)"
+		tierDesc = "조직 wiki 에 학습된 과거 사례 기준으로 차단했습니다."
+		hint = "• 과거 차단 사례와 유사한 표현일 수 있습니다. Approvals 탭에서 승인 요청하면 관리자가 확인할 수 있습니다."
+	case "DLP":
+		tierLabel = "DLP 엔진"
+		tierDesc = "데이터 유출 방지 엔진이 기밀 데이터 패턴을 감지했습니다."
+		hint = "• 개인정보/계좌/주민번호/카드번호 등 민감 데이터가 포함되어 있는지 확인하세요."
+	case "ACCESS":
+		tierLabel = "Access Level (계정 권한)"
+		tierDesc = "본 계정의 access_level 이 Deny 로 설정되어 낮은 보안레벨로의 정보 흐름이 차단됩니다."
+		hint = "• 관리자에게 access_level 변경을 요청하거나, 허용된 대상으로만 요청을 보내세요."
+	case "KEY", "CHORD", "CLIPBOARD":
+		tierLabel = "입력 필터 (" + tier + ")"
+		tierDesc = "해당 키/조합키/클립보드 작업이 허용 목록에 없어 차단되었습니다."
+		hint = "• 허용된 키(Tab, Enter, Escape, F1~F12, 화살표) 또는 안전한 조합(Ctrl+C/V/X/A/Z/Y) 만 사용 가능합니다."
+	default:
+		if tierLabel == "" {
+			tierLabel = "가드레일"
+		}
+		tierDesc = "입력이 현재 정책 기준으로 차단되었습니다."
+		hint = "• 원인을 정확히 모르면 Observability 탭의 감사 로그에서 확인하거나 관리자에게 문의하세요."
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "🛡️ [가드레일 차단 — %s]\n\n", tierLabel)
+	if tierDesc != "" {
+		sb.WriteString(tierDesc)
+		sb.WriteString("\n\n")
+	}
+	if reason != "" {
+		fmt.Fprintf(&sb, "• 상세 사유: %s\n", reason)
+	}
+	if action != "" && action != "block" {
+		fmt.Fprintf(&sb, "• 결정: %s\n", action)
+	}
+	if hint != "" {
+		sb.WriteString("\n")
+		sb.WriteString(hint)
+		sb.WriteString("\n")
+	}
+	sb.WriteString("\n(이 메시지는 외부 LLM 에 전달되지 않았습니다.)")
+	return sb.String()
+}
+
 func formatActionDesc(action map[string]any) string {
 	actionType, _ := action["action"].(string)
 	switch actionType {

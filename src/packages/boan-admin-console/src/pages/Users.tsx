@@ -119,9 +119,10 @@ export default function Users() {
                     {u.status === "pending" ? (
                       <button
                         onClick={() => patch(u.email, { action: "approve" })}
-                        className="text-xs bg-yellow-100 text-yellow-700 px-2 py-1 rounded-full hover:bg-yellow-200"
+                        className="text-xs bg-emerald-600 text-white px-3 py-1.5 rounded-full hover:bg-emerald-700 font-medium"
+                        title="수락하면 즉시 GCP 워크스테이션이 생성됩니다"
                       >
-                        승인하기
+                        ✓ 수락
                       </button>
                     ) : (
                       <span className="text-xs bg-green-100 text-green-700 px-2 py-1 rounded-full">

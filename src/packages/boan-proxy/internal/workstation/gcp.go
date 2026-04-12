@@ -377,6 +377,40 @@ func (p *gcpProvisioner) createInstance(ctx context.Context, email, orgID, remot
 	}, nil
 }
 
+// Delete — 사용자의 GCP VM 즉시 삭제. owner 가 user 를 제거할 때 호출.
+// instance 이름은 current.InstanceID 또는 email 기반으로 추측.
+// 이미 없으면 nil 반환 (404 = idempotent OK).
+func (p *gcpProvisioner) Delete(ctx context.Context, email, _ string, current *userstore.Workstation) error {
+	name := instanceNameFromCurrent(current)
+	if name == "" {
+		// fallback — 이메일에서 instance name 추측
+		name = "boan-win-" + userSlug(email)
+	}
+	u := fmt.Sprintf(
+		"https://compute.googleapis.com/compute/v1/projects/%s/zones/%s/instances/%s",
+		url.PathEscape(p.cfg.WorkstationProjectID),
+		url.PathEscape(p.cfg.WorkstationZone),
+		url.PathEscape(name),
+	)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u, http.NoBody)
+	if err != nil {
+		return err
+	}
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil // 이미 없음 — OK
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("gcp delete instance %q returned status %d: %s", name, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
 func (p *gcpProvisioner) startInstance(ctx context.Context, name string) error {
 	u := fmt.Sprintf(
 		"https://compute.googleapis.com/compute/v1/projects/%s/zones/%s/instances/%s/start",
