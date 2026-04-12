@@ -569,12 +569,13 @@ func (s *Server) StartAdmin() {
 
 	// ── auto-update: version check + trigger ──
 	versionFile := os.Getenv("BOAN_VERSION_FILE")
+	latestVersionFile := os.Getenv("BOAN_LATEST_VERSION_FILE")
 	triggerFile := os.Getenv("BOAN_UPDATE_TRIGGER_FILE")
-	updateRepoURL := os.Getenv("BOAN_UPDATE_REPO_URL")
 
 	mux.HandleFunc("/api/admin/version", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
+		_ = r
 
 		current := "unknown"
 		if versionFile != "" {
@@ -584,23 +585,13 @@ func (s *Server) StartAdmin() {
 		}
 
 		latest := ""
-		updateAvailable := false
-		if updateRepoURL != "" {
-			req, _ := http.NewRequestWithContext(r.Context(), "GET", updateRepoURL, nil)
-			req.Header.Set("Accept", "application/vnd.github.v3+json")
-			if resp, err := http.DefaultClient.Do(req); err == nil {
-				defer resp.Body.Close()
-				var commit struct {
-					SHA string `json:"sha"`
-				}
-				if json.NewDecoder(resp.Body).Decode(&commit) == nil && commit.SHA != "" {
-					latest = commit.SHA[:7]
-					if current != "unknown" && latest != current {
-						updateAvailable = true
-					}
-				}
+		if latestVersionFile != "" {
+			if b, err := os.ReadFile(latestVersionFile); err == nil {
+				latest = strings.TrimSpace(string(b))
 			}
 		}
+
+		updateAvailable := latest != "" && current != "unknown" && latest != current
 
 		json.NewEncoder(w).Encode(map[string]any{
 			"current":          current,
