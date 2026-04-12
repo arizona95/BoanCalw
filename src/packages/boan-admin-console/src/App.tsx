@@ -144,6 +144,22 @@ function Shell() {
 
         {sidebarOpen && user && (
           <div className="px-4 py-3 border-t border-white/10 space-y-2">
+            {version?.update_available && !updating && (
+              <button
+                onClick={triggerUpdate}
+                className="w-full px-2 py-1.5 bg-emerald-500/20 border border-emerald-400/30 rounded-lg text-xs text-emerald-300 hover:bg-emerald-500/30 transition-colors text-left"
+              >
+                <span className="font-medium">NEW {version.latest}</span>
+                <span className="block text-emerald-400/60 text-[10px] mt-0.5">
+                  업데이트 하시겠습니까?
+                </span>
+              </button>
+            )}
+            {updating && (
+              <div className="px-2 py-1.5 bg-yellow-500/20 border border-yellow-400/30 rounded-lg text-xs text-yellow-300 animate-pulse">
+                업데이트 중... 잠시 후 새로고침됩니다
+              </div>
+            )}
             {user.org_id && (
               <div className="flex items-center gap-1.5 px-2 py-1 bg-white/5 rounded-lg">
                 <span className="text-white/40 text-xs">🏢</span>
@@ -161,22 +177,6 @@ function Shell() {
                 </span>
               </div>
             </div>
-            {version?.update_available && !updating && (
-              <button
-                onClick={triggerUpdate}
-                className="w-full px-2 py-1.5 bg-emerald-500/20 border border-emerald-400/30 rounded-lg text-xs text-emerald-300 hover:bg-emerald-500/30 transition-colors text-left"
-              >
-                <span className="font-medium">NEW {version.latest}</span>
-                <span className="block text-emerald-400/60 text-[10px] mt-0.5">
-                  업데이트 하시겠습니까?
-                </span>
-              </button>
-            )}
-            {updating && (
-              <div className="px-2 py-1.5 bg-yellow-500/20 border border-yellow-400/30 rounded-lg text-xs text-yellow-300 animate-pulse">
-                업데이트 중... 잠시 후 새로고침됩니다
-              </div>
-            )}
             {user.enabled && (
               <button
                 onClick={logout}
