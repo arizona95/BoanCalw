@@ -640,7 +640,7 @@ func (s *Server) StartAdmin() {
 		}
 		// Fetch wiki pages — try local policy-server first (wiki compiled locally),
 		// fall back to GCP orgserver. Use no-proxy client to avoid HTTP_PROXY.
-		noProxyFetch := &http.Client{Transport: &http.Transport{Proxy: nil}}
+		noProxyFetch := &http.Client{Transport: &http.Transport{Proxy: func(*http.Request) (*url.URL, error) { return nil, nil }}}
 		localWikiURL := fmt.Sprintf("http://boan-policy-server:8081/org/%s/v1/wiki/pages", defaultOrgID)
 		var wikiPages []map[string]any
 		if resp, err := noProxyFetch.Get(localWikiURL); err == nil {
@@ -715,7 +715,7 @@ func (s *Server) StartAdmin() {
 		}
 		// Wiki compile needs local LLM access (ollama) → use local policy server, not GCP
 		// Use a no-proxy client to avoid HTTP_PROXY environment variable routing through boan-proxy
-		noProxyClient := &http.Client{Transport: &http.Transport{Proxy: nil}}
+		noProxyClient := &http.Client{Transport: &http.Transport{Proxy: func(*http.Request) (*url.URL, error) { return nil, nil }}}
 		localPolicyURL := "http://boan-policy-server:8081"
 		compileURL := fmt.Sprintf("%s/org/%s/v1/wiki/compile", localPolicyURL, defaultOrgID)
 		compileBody, _ := json.Marshal(map[string]string{"llm_url": g3LLMURL, "llm_model": g3LLMModel})
