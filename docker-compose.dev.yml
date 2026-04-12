@@ -149,7 +149,8 @@ services:
       - BOAN_OAUTH_CLIENT_SECRET=${BOAN_OAUTH_CLIENT_SECRET:-}
       - BOAN_OAUTH_REDIRECT_URL=http://localhost:19080/api/auth/callback
       - BOAN_GCP_ORG_ID=${BOAN_GCP_ORG_ID:-}
-      - BOAN_POLICY_URL=http://boan-policy-server:8081
+      # 중앙 GCP 정책서버 — 소유자가 정책 변경 시 모든 배포에 자동 동기화
+      - BOAN_POLICY_URL=https://boan-policy-server-sds-corp-3avhtf4kka-du.a.run.app
       - BOAN_CREDENTIAL_FILTER_URL=http://boan-credential-filter:8082
       - BOAN_LLM_REGISTRY_URL=http://boan-llm-registry:8086
       - BOAN_OTEL_ENDPOINT=http://boan-audit-agent:8084
@@ -278,7 +279,8 @@ services:
       - BOAN_ORG_ID=sds-corp
       - BOAN_LISTEN=:18080
       - BOAN_ADMIN_LISTEN=:18081
-      - BOAN_POLICY_URL=http://boan-policy-server:8081
+      # 중앙 GCP 정책서버 — 소유자가 정책 변경 시 모든 배포에 자동 동기화
+      - BOAN_POLICY_URL=https://boan-policy-server-sds-corp-3avhtf4kka-du.a.run.app
       - BOAN_AUDIT_ENDPOINT=http://boan-audit-agent:8084
       - BOAN_CREDENTIAL_FILTER_URL=http://boan-credential-filter:8082
       - BOAN_LLM_REGISTRY_URL=http://localhost:8086
