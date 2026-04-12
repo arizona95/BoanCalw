@@ -267,8 +267,8 @@ services:
       - TEST=true
       - HTTP_PROXY=http://localhost:18080
       - HTTPS_PROXY=http://localhost:18080
-      - NO_PROXY=localhost,127.0.0.1,boan-proxy,boan-policy-server,boan-guacamole,boan-audit-agent,boan-credential-filter,boan-llm-registry,boan-whitelist-proxy,boan-computer-use
-      - no_proxy=localhost,127.0.0.1,boan-proxy,boan-policy-server,boan-guacamole,boan-audit-agent,boan-credential-filter,boan-llm-registry,boan-whitelist-proxy,boan-computer-use
+      - NO_PROXY=localhost,127.0.0.1,boan-proxy,boan-policy-server,boan-guacamole,boan-audit-agent,boan-credential-filter,boan-llm-registry,boan-whitelist-proxy,boan-computer-use,boan-policy-server-sds-corp-3avhtf4kka-du.a.run.app
+      - no_proxy=localhost,127.0.0.1,boan-proxy,boan-policy-server,boan-guacamole,boan-audit-agent,boan-credential-filter,boan-llm-registry,boan-whitelist-proxy,boan-computer-use,boan-policy-server-sds-corp-3avhtf4kka-du.a.run.app
       - BOAN_PROXY_ADMIN=http://localhost:18081
       - BOAN_SESSION_ID=dev-session-001
       - BOAN_ONECLI_CRED_FILTER_URL=http://boan-credential-filter:8082
