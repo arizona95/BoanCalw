@@ -5,7 +5,7 @@
 set -euo pipefail
 
 INSTALL_DIR="${1:-$HOME/boanclaw}"
-TRIGGER_FILE="/tmp/boanclaw-update-trigger"
+TRIGGER_FILE="/tmp/boanclaw-triggers/update-requested"
 LATEST_FILE="$INSTALL_DIR/.boanclaw-latest"
 LOG_FILE="/tmp/boanclaw-update.log"
 REPO_API="https://api.github.com/repos/arizona95/BoanCalw/commits/main"

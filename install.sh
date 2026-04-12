@@ -148,9 +148,9 @@ if command -v git &>/dev/null && [ -d "$INSTALL_DIR/.git" ]; then
   ok "버전: $(cat "$INSTALL_DIR/.boanclaw-version" 2>/dev/null || echo 'unknown')"
 fi
 
-# 업데이트 트리거 파일 경로 (container 에서 접근 가능해야 함)
-TRIGGER_FILE="/tmp/boanclaw-update-trigger"
-rm -f "$TRIGGER_FILE"
+# 업데이트 트리거 디렉토리 (container 에서 접근 가능해야 함)
+mkdir -p /tmp/boanclaw-triggers
+rm -f /tmp/boanclaw-triggers/update-requested
 
 # 업데이트 워처 (기존 인스턴스 종료 후 재시작)
 pkill -f "update-watcher.sh" 2>/dev/null || true
