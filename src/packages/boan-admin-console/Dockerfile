@@ -37,6 +37,8 @@ server {
         # 긴 스트리밍 응답이 중간에 끊김.
         proxy_http_version 1.1;
         proxy_set_header Connection "";
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_buffering off;
         proxy_request_buffering off;
         chunked_transfer_encoding on;

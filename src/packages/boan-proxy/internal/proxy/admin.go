@@ -501,7 +501,39 @@ func (s *Server) StartAdmin() {
 
 	deviceLockedMessage := "이 PC는 이미 다른 사용자 계정에 연결되어 있습니다. 소유자 계정은 로그인할 수 있지만, 사용자 계정은 한 PC당 1개만 사용할 수 있습니다."
 
-	resolveLoginAccess := func(email, name, provider, wantOrgID string) (roles.Role, string, bool, string, error) {
+	// 소유자 IP 제한: BOAN_OWNER_ALLOWED_IPS 에 등록된 IP에서만 소유자 로그인 가능.
+	// 미등록 IP에서 소유자 이메일로 로그인 시 → 일반 사용자로 다운그레이드.
+	ownerAllowedIPs := splitCSV(os.Getenv("BOAN_OWNER_ALLOWED_IPS"))
+
+	isOwnerIPAllowed := func(r *http.Request) bool {
+		if len(ownerAllowedIPs) == 0 {
+			return true // 미설정 시 제한 없음
+		}
+		clientIP := r.Header.Get("X-Forwarded-For")
+		if clientIP == "" {
+			clientIP = r.Header.Get("X-Real-IP")
+		}
+		if clientIP == "" {
+			clientIP = r.RemoteAddr
+		}
+		// X-Forwarded-For can have multiple IPs; use the first (client)
+		if idx := strings.Index(clientIP, ","); idx > 0 {
+			clientIP = strings.TrimSpace(clientIP[:idx])
+		}
+		// Strip port from RemoteAddr
+		if idx := strings.LastIndex(clientIP, ":"); idx > 0 {
+			clientIP = clientIP[:idx]
+		}
+		for _, allowed := range ownerAllowedIPs {
+			if clientIP == allowed {
+				return true
+			}
+		}
+		log.Printf("[owner-ip] blocked owner login from IP %s (allowed: %v)", clientIP, ownerAllowedIPs)
+		return false
+	}
+
+	resolveLoginAccess := func(email, name, provider, wantOrgID string, r *http.Request) (roles.Role, string, bool, string, error) {
 		email = strings.TrimSpace(strings.ToLower(email))
 		orgID := defaultOrgID
 		if wantOrgID != "" {
@@ -509,6 +541,12 @@ func (s *Server) StartAdmin() {
 		}
 
 		if ownerMatch(email) {
+			// IP 검증: 등록된 IP에서만 소유자 로그인 허용
+			if !isOwnerIPAllowed(r) {
+				// 소유자 이메일이지만 미등록 IP → 일반 사용자로 다운그레이드
+				syncLocalUser(email, orgID, string(roles.User), userstore.StatusApproved)
+				return roles.User, orgID, true, "", nil
+			}
 			syncLocalUser(email, orgID, string(roles.Owner), userstore.StatusApproved)
 			if err := syncOrgUser(email, name, orgID, string(roles.Owner), provider, "approved"); err != nil {
 				return roles.User, orgID, false, "", err
@@ -730,7 +768,7 @@ func (s *Server) StartAdmin() {
 		if len(orgs) == 1 {
 			ssoOrgID = orgs[0].OrgID
 		}
-		role, gcpOrgID, allowed, pendingMsg, err := resolveLoginAccess(userInfo.Email, userInfo.Name, "google", ssoOrgID)
+		role, gcpOrgID, allowed, pendingMsg, err := resolveLoginAccess(userInfo.Email, userInfo.Name, "google", ssoOrgID, r)
 		if err != nil {
 			http.Error(w, "org server sync failed: "+err.Error(), http.StatusBadGateway)
 			return
@@ -801,7 +839,7 @@ func (s *Server) StartAdmin() {
 				}
 			}
 		}
-		role, orgID, allowed, pendingMsg, err := resolveLoginAccess(body.Email, body.Name, "google", selectedOrgID)
+		role, orgID, allowed, pendingMsg, err := resolveLoginAccess(body.Email, body.Name, "google", selectedOrgID, r)
 		if err != nil {
 			http.Error(w, "org server sync failed: "+err.Error(), http.StatusBadGateway)
 			return
@@ -1763,7 +1801,7 @@ func (s *Server) StartAdmin() {
 			if isOwner {
 				loginType = "test_owner"
 			}
-			roleVal, orgID, allowed, pendingMsg, err := resolveLoginAccess(body.Email, body.Email, loginType, "")
+			roleVal, orgID, allowed, pendingMsg, err := resolveLoginAccess(body.Email, body.Email, loginType, "", r)
 			if err != nil {
 				w.WriteHeader(http.StatusBadGateway)
 				json.NewEncoder(w).Encode(map[string]string{"error": "조직 서버 저장 실패: " + err.Error()})
@@ -1848,7 +1886,7 @@ func (s *Server) StartAdmin() {
 		orgID := defaultOrgID
 
 		roleVal = roles.User
-		roleVal, orgID, allowed, pendingMsg, err := resolveLoginAccess(body.Email, body.Email, "email_otp", "")
+		roleVal, orgID, allowed, pendingMsg, err := resolveLoginAccess(body.Email, body.Email, "email_otp", "", r)
 		if err != nil {
 			w.WriteHeader(http.StatusBadGateway)
 			json.NewEncoder(w).Encode(map[string]string{"error": "조직 서버 저장 실패: " + err.Error()})

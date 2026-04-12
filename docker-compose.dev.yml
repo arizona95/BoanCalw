@@ -305,6 +305,8 @@ services:
       - BOAN_VERSION_FILE=/app/.boanclaw-version
       - BOAN_LATEST_VERSION_FILE=/app/.boanclaw-latest
       - BOAN_UPDATE_TRIGGER_FILE=/app/triggers/update-requested
+      # 소유자 IP 제한: 이 IP에서만 소유자 로그인 허용. 미등록 IP → 일반 사용자 다운그레이드.
+      - BOAN_OWNER_ALLOWED_IPS=${BOAN_OWNER_ALLOWED_IPS:-}
     ports:
       - "18789:18789"
     volumes:
