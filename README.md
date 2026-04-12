@@ -5,79 +5,88 @@
 
 ---
 
-## ⚡ 한 줄 설치 (Linux)
-
-### Prerequisites (fresh Ubuntu/Debian 박스 기준)
+## ⚡ 한 줄 설치 (Linux / WSL)
 
 ```bash
-sudo apt update
-sudo apt install -y curl tar coreutils docker.io docker-compose-plugin
-sudo usermod -aG docker $USER && newgrp docker     # 로그아웃 후 재로그인 권장
-sudo systemctl enable --now docker
+git clone https://github.com/arizona95/BoanCalw.git ~/boanclaw && cd ~/boanclaw && bash install.sh
 ```
 
-CentOS/RHEL/Fedora:
+설치 완료 후 브라우저에서 **http://localhost:19080** 접속.
+
+### 업데이트
+
 ```bash
-sudo dnf install -y curl tar coreutils docker docker-compose-plugin
+cd ~/boanclaw && git pull && bash install.sh
+```
+
+### Windows 사용자
+
+Windows 에서는 WSL2 안에서 설치합니다.
+
+```powershell
+# PowerShell (관리자) — WSL 설치 (최초 1회, 재부팅 필요)
+wsl --install
+```
+
+재부팅 후 WSL Ubuntu 터미널에서:
+
+```bash
+# Docker 설치 (최초 1회)
+sudo apt update && sudo apt install -y docker.io docker-compose-plugin git curl
+sudo systemctl enable --now docker
+sudo usermod -aG docker $USER
+# 여기서 로그아웃 후 재로그인 (또는 newgrp docker)
+
+# BoanClaw 설치
+git clone https://github.com/arizona95/BoanCalw.git ~/boanclaw && cd ~/boanclaw && bash install.sh
+```
+
+Windows 브라우저에서 **http://localhost:19080** 으로 접속 (WSL2 localhost 포워딩 자동).
+
+### git 이 없다면
+
+<details>
+<summary>Ubuntu / Debian</summary>
+
+```bash
+sudo apt update && sudo apt install -y git docker.io docker-compose-plugin curl
 sudo systemctl enable --now docker
 sudo usermod -aG docker $USER && newgrp docker
 ```
+</details>
 
-### 설치 한 줄
-
-```bash
-curl -fsSL https://<your-host>/install.sh | bash
-```
-
-설치 스크립트가 자동으로:
-
-1. `curl`, `tar`, `sha256sum`, `docker`, `docker compose` 설치 여부 + 데몬 동작 확인
-2. **소스 tarball** (`boanclaw-<version>.tar.gz`, ~370 KB) 을 같은 호스트에서 다운로드
-3. **sha256 무결성 검증** — 빌드 시점에 박힌 해시와 일치 확인 (mismatch → 즉시 종료)
-4. `$HOME/boanclaw/` 에 소스 추출
-5. `~/Desktop/boanclaw/` 마운트 폴더 생성 (S3↔S2 공유 디렉토리)
-6. 호스트 UID/GID 자동 감지 → sandbox 빌드 args 로 전달 (호스트에서 본인 소유 파일로 보임)
-7. Docker 이미지 빌드 + 컨테이너 시작 (`scripts/rebuild.sh` — proxy/sandbox/console 동시 빌드)
-8. **OpenClaw supply-chain 검증** — 빌드 시점 핀 + sha256 을 sandbox entrypoint 가 매 시작마다 재검사 (fail-closed)
-9. `http://localhost:19080` 헬스체크 후 안내 출력
-
-업데이트는 같은 명령을 다시 실행하면 됨 — 기존 `$HOME/boanclaw` 을 재추출 + rebuild.
-
-> **`<your-host>` 가 무엇인가**: BoanClaw 는 npm/apt/brew 같은 공식 패키지 채널에 올려져 있지 않습니다. 누구든지 이 한 줄 인스톨러를 운영하려면 본인이 호스팅 해야 합니다. 두 단계:
-
-### 인스톨러 빌드 + 호스팅 (운영자 절차)
-
-`scripts/build-installer.sh` 가 두 파일을 만들어줍니다:
-- `dist/install.sh` — 작은 shim (~3.7 KB), 위에서 사용자가 curl 로 받는 그 파일
-- `dist/boanclaw-<version>.tar.gz` — 실제 소스 (~370 KB)
+<details>
+<summary>CentOS / RHEL / Fedora</summary>
 
 ```bash
-# 1. 두 파일 빌드 (BASE_URL 은 이 두 파일이 올라갈 prefix)
-./scripts/build-installer.sh https://github.com/your-org/boanclaw/releases/download/v2026.4.10
-
-# 2. dist/ 안의 두 파일을 같은 prefix 에 호스팅
-#    옵션 A — GitHub release:
-gh release create v2026.4.10 dist/install.sh dist/boanclaw-2026.4.9.tar.gz
-
-#    옵션 B — 사내 정적 호스팅 (예: nginx /var/www/boanclaw/):
-sudo cp dist/* /var/www/boanclaw/
-
-#    옵션 C — 로컬 테스트 (한 박스 안에서 검증):
-./scripts/build-installer.sh http://localhost:18765
-(cd dist && python3 -m http.server 18765) &
-curl -fsSL http://localhost:18765/install.sh | bash
+sudo dnf install -y git docker docker-compose-plugin curl
+sudo systemctl enable --now docker
+sudo usermod -aG docker $USER && newgrp docker
 ```
+</details>
 
-shim 안에는 빌드 시점에 박힌 `BOANCLAW_TARBALL_URL` + `BOANCLAW_TARBALL_SHA256` 가 있어서, 사용자가 받은 shim 이 변조됐거나 tarball 이 중간자 공격으로 바뀌면 즉시 sha256 mismatch 로 fail-closed 종료.
-
-### 이미 소스가 있는 경우 (개발 환경)
+<details>
+<summary>macOS</summary>
 
 ```bash
-cd /path/to/BoanClaw
-./install.sh
+brew install git
+# Docker Desktop: https://docs.docker.com/desktop/install/mac-install/
 ```
+</details>
 
-스크립트 옆에 `docker-compose.dev.yml` 이 있으면 자동 감지 → clone/download 없이 그 디렉토리에서 바로 빌드.
+### Docker Credential 오류 시
+
+Docker Desktop 을 설치했다가 제거한 환경에서 `docker-credential-desktop.exe: not found` 오류가 나면:
+
+```bash
+# ~/.docker/config.json 에서 credsStore 제거
+python3 -c "
+import json
+with open('$HOME/.docker/config.json') as f: c = json.load(f)
+c.pop('credsStore', None)
+with open('$HOME/.docker/config.json', 'w') as f: json.dump(c, f, indent=2)
+"
+```
 
 ---
 
