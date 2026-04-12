@@ -501,9 +501,12 @@ func (s *Server) StartAdmin() {
 
 	deviceLockedMessage := "이 PC는 이미 다른 사용자 계정에 연결되어 있습니다. 소유자 계정은 로그인할 수 있지만, 사용자 계정은 한 PC당 1개만 사용할 수 있습니다."
 
-	resolveLoginAccess := func(email, name, provider string) (roles.Role, string, bool, string, error) {
+	resolveLoginAccess := func(email, name, provider, wantOrgID string) (roles.Role, string, bool, string, error) {
 		email = strings.TrimSpace(strings.ToLower(email))
 		orgID := defaultOrgID
+		if wantOrgID != "" {
+			orgID = wantOrgID
+		}
 
 		if ownerMatch(email) {
 			syncLocalUser(email, orgID, string(roles.Owner), userstore.StatusApproved)
@@ -722,7 +725,12 @@ func (s *Server) StartAdmin() {
 			})
 			return
 		}
-		role, gcpOrgID, allowed, pendingMsg, err := resolveLoginAccess(userInfo.Email, userInfo.Name, "google")
+		// Single GCP org: use it directly if available
+		ssoOrgID := ""
+		if len(orgs) == 1 {
+			ssoOrgID = orgs[0].OrgID
+		}
+		role, gcpOrgID, allowed, pendingMsg, err := resolveLoginAccess(userInfo.Email, userInfo.Name, "google", ssoOrgID)
 		if err != nil {
 			http.Error(w, "org server sync failed: "+err.Error(), http.StatusBadGateway)
 			return
@@ -782,7 +790,18 @@ func (s *Server) StartAdmin() {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		role, orgID, allowed, pendingMsg, err := resolveLoginAccess(body.Email, body.Name, "google")
+		// Validate body.OrgID against user's actual GCP orgs (prevent spoofing)
+		selectedOrgID := ""
+		if body.AccessToken != "" && body.OrgID != "" {
+			userOrgs, _ := s.authProv.FindUserOrgs(body.AccessToken)
+			for _, o := range userOrgs {
+				if o.OrgID == body.OrgID {
+					selectedOrgID = body.OrgID
+					break
+				}
+			}
+		}
+		role, orgID, allowed, pendingMsg, err := resolveLoginAccess(body.Email, body.Name, "google", selectedOrgID)
 		if err != nil {
 			http.Error(w, "org server sync failed: "+err.Error(), http.StatusBadGateway)
 			return
@@ -1744,7 +1763,7 @@ func (s *Server) StartAdmin() {
 			if isOwner {
 				loginType = "test_owner"
 			}
-			roleVal, orgID, allowed, pendingMsg, err := resolveLoginAccess(body.Email, body.Email, loginType)
+			roleVal, orgID, allowed, pendingMsg, err := resolveLoginAccess(body.Email, body.Email, loginType, "")
 			if err != nil {
 				w.WriteHeader(http.StatusBadGateway)
 				json.NewEncoder(w).Encode(map[string]string{"error": "조직 서버 저장 실패: " + err.Error()})
@@ -1829,7 +1848,7 @@ func (s *Server) StartAdmin() {
 		orgID := defaultOrgID
 
 		roleVal = roles.User
-		roleVal, orgID, allowed, pendingMsg, err := resolveLoginAccess(body.Email, body.Email, "email_otp")
+		roleVal, orgID, allowed, pendingMsg, err := resolveLoginAccess(body.Email, body.Email, "email_otp", "")
 		if err != nil {
 			w.WriteHeader(http.StatusBadGateway)
 			json.NewEncoder(w).Encode(map[string]string{"error": "조직 서버 저장 실패: " + err.Error()})
@@ -1892,10 +1911,8 @@ func (s *Server) StartAdmin() {
 			return
 		}
 
-		orgID := body.OrgID
-		if orgID == "" {
-			orgID = defaultOrgID
-		}
+		// org_id is always server-determined. User input ignored for security.
+		orgID := defaultOrgID
 
 		role := string(roles.User)
 		status := userstore.StatusPending
@@ -1942,7 +1959,23 @@ func (s *Server) StartAdmin() {
 		}
 
 		if r.Method == http.MethodGet {
-			list := s.users.List()
+			allUsers := s.users.List()
+			// Filter by admin's org — each org sees only their own users
+			var adminOrgID string
+			if s.authProv.Enabled() {
+				if sess, err := auth.SessionFromRequest(r, s.authProv); err == nil {
+					adminOrgID = sess.OrgID
+				}
+			}
+			list := allUsers
+			if adminOrgID != "" {
+				list = nil
+				for _, u := range allUsers {
+					if u.OrgID == adminOrgID {
+						list = append(list, u)
+					}
+				}
+			}
 			type userView struct {
 				Email             string `json:"email"`
 				Role              string `json:"role"`

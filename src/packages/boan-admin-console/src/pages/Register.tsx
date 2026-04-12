@@ -6,7 +6,7 @@ export default function Register() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
-  const [orgId, setOrgId] = useState("");
+  // org_id is determined server-side (defaultOrgID). No user input needed.
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState(false);
@@ -30,7 +30,7 @@ export default function Register() {
       const res = await fetch("/api/auth/register", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, password, org_id: orgId }),
+        body: JSON.stringify({ email, password }),
       });
       const data = await res.json();
       if (!res.ok) {
@@ -114,16 +114,6 @@ export default function Register() {
                 className="w-full px-4 py-3 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-boan-500"
               />
             </div>
-            <div>
-              <input
-                type="text"
-                placeholder="조직 ID (선택, 미입력시 이메일 도메인)"
-                value={orgId}
-                onChange={(e) => setOrgId(e.target.value)}
-                className="w-full px-4 py-3 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-boan-500"
-              />
-            </div>
-
             {error && <p className="text-xs text-red-500 text-center">{error}</p>}
 
             <button
