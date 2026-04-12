@@ -2106,10 +2106,20 @@ func (s *Server) StartAdmin() {
 				return
 			}
 			if body.Action == "approve" {
+				// User might only exist on GCP org server (registered on another deployment).
+				// Sync to local store first if not found.
+				if _, err := s.users.Get(body.Email); err != nil {
+					orgID := defaultOrgID
+					s.users.Register(body.Email, "", orgID, string(roles.User), userstore.StatusPending)
+				}
 				if err := s.users.Approve(body.Email); err != nil {
 					w.WriteHeader(http.StatusNotFound)
 					json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 					return
+				}
+				// Sync approved status to GCP org server
+				if err := s.orgServer.RegisterUserWithState(defaultOrgID, body.Email, "", string(roles.User), "approved", "", ""); err != nil {
+					log.Printf("[approve] org server sync failed for %s: %v", body.Email, err)
 				}
 				if _, err := ensureWorkstation(r.Context(), body.Email, defaultOrgID); err != nil {
 					w.WriteHeader(http.StatusBadGateway)
