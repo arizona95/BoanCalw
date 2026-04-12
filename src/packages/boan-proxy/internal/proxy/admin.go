@@ -731,10 +731,59 @@ func (s *Server) StartAdmin() {
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}
-		json.NewEncoder(w).Encode(map[string]string{
-			"status":    "ok",
-			"llm_used":  g3LLMModel,
-			"llm_url":   g3LLMURL,
+		// After successful compile, read proposals and create approval requests
+		proposalCount := 0
+		localPagesURL := fmt.Sprintf("http://boan-policy-server:8081/org/%s/v1/wiki/pages", defaultOrgID)
+		if pResp, err := http.Get(localPagesURL); err == nil {
+			defer pResp.Body.Close()
+			var pages []struct {
+				Path    string `json:"path"`
+				Content string `json:"content"`
+			}
+			if json.NewDecoder(pResp.Body).Decode(&pages) == nil {
+				for _, pg := range pages {
+					if !strings.HasPrefix(pg.Path, "proposals/") || strings.TrimSpace(pg.Content) == "" {
+						continue
+					}
+					cmd := "g1-amendment:review"
+					if strings.Contains(pg.Path, "g2") {
+						cmd = "constitution-amendment:review"
+					}
+					id := fmt.Sprintf("apr-%s", randomMachineID()[:12])
+					approvalsMu.Lock()
+					// Avoid duplicate: check if same content already pending
+					duplicate := false
+					for _, a := range approvalsStore {
+						if ac, _ := a["command"].(string); ac == cmd {
+							if as, _ := a["status"].(string); as == "pending" {
+								duplicate = true
+								break
+							}
+						}
+					}
+					if !duplicate {
+						approvalsStore = append(approvalsStore, map[string]any{
+							"id":          id,
+							"sessionId":   "wiki-compile",
+							"command":     cmd,
+							"args":        []string{"diff=" + pg.Content, "reasoning=G3 wiki compilation analysis"},
+							"requester":   "wiki-guardrail",
+							"org_id":      defaultOrgID,
+							"requestedAt": time.Now().UTC().Format(time.RFC3339),
+							"status":      "pending",
+						})
+						proposalCount++
+					}
+					approvalsMu.Unlock()
+				}
+			}
+		}
+
+		json.NewEncoder(w).Encode(map[string]any{
+			"status":         "ok",
+			"llm_used":       g3LLMModel,
+			"llm_url":        g3LLMURL,
+			"proposals_queued": proposalCount,
 		})
 	})
 
