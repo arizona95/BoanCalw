@@ -1962,10 +1962,8 @@ func (s *Server) StartAdmin() {
 			allUsers := s.users.List()
 			// Filter by admin's org — each org sees only their own users
 			var adminOrgID string
-			if s.authProv.Enabled() {
-				if sess, err := auth.SessionFromRequest(r, s.authProv); err == nil {
-					adminOrgID = sess.OrgID
-				}
+			if sess, err := auth.SessionFromRequest(r, s.authProv); err == nil {
+				adminOrgID = sess.OrgID
 			}
 			list := allUsers
 			if adminOrgID != "" {
