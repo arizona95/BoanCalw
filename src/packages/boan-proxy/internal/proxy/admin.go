@@ -695,7 +695,21 @@ func (s *Server) StartAdmin() {
 				}
 			}
 		}
-		if err := s.orgServer.CompileWikiWithLLM(defaultOrgID, g3LLMURL, g3LLMModel); err != nil {
+		// Wiki compile needs local LLM access (ollama) → use local policy server, not GCP
+		localPolicyURL := "http://boan-policy-server:8081"
+		compileURL := fmt.Sprintf("%s/org/%s/v1/wiki/compile", localPolicyURL, defaultOrgID)
+		compileBody, _ := json.Marshal(map[string]string{"llm_url": g3LLMURL, "llm_model": g3LLMModel})
+		compileResp, compileErr := http.Post(compileURL, "application/json", bytes.NewReader(compileBody))
+		if compileErr != nil {
+			// Fallback to orgServer (GCP)
+			compileErr = s.orgServer.CompileWikiWithLLM(defaultOrgID, g3LLMURL, g3LLMModel)
+		} else {
+			compileResp.Body.Close()
+			if compileResp.StatusCode >= 300 {
+				compileErr = fmt.Errorf("local policy server returned %d", compileResp.StatusCode)
+			}
+		}
+		if err := compileErr; err != nil {
 			w.WriteHeader(http.StatusBadGateway)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
