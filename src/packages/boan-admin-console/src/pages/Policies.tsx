@@ -145,13 +145,7 @@ export default function Policies() {
         return;
       }
     }
-    // G1 custom pattern 정규식 검증 — Go 서버에서 실행되므로 (?i) 등
-    // JS 미지원 문법은 경고만 하고 저장은 진행 (서버가 최종 검증)
-    const g1Warnings: string[] = [];
-    for (const p of cleanedG1Custom) {
-      try { new RegExp(p.pattern); }
-      catch { g1Warnings.push(p.pattern); }
-    }
+    // G1 정규식은 Go 서버에서 실행 — JS 검증 생략 ((?i) 등 Go 전용 문법 지원)
     try {
       const updated = await policyApi.update({
         network_whitelist: whitelistPreview,
@@ -164,7 +158,7 @@ export default function Policies() {
         },
       });
       setPolicy(updated);
-      setMsg({ type: "ok", text: g1Warnings.length > 0 ? `저장됨 (G1 패턴 ${g1Warnings.length}개는 서버에서 검증)` : "저장됨" });
+      setMsg({ type: "ok", text: "저장됨" });
     } catch (e: unknown) { setMsg({ type: "err", text: e instanceof Error ? e.message : "저장 실패" }); }
     finally { setSaving(false); }
   };
