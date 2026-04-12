@@ -503,11 +503,14 @@ func (s *Server) StartAdmin() {
 
 	// 소유자 IP 제한: BOAN_OWNER_ALLOWED_IPS 에 등록된 IP에서만 소유자 로그인 가능.
 	// 미등록 IP에서 소유자 이메일로 로그인 시 → 일반 사용자로 다운그레이드.
+	// 미설정 (env 빈 값) 시 fail-closed: 소유자 로그인 전부 차단.
+	// 소유자 PC 에서만 명시적으로 BOAN_OWNER_ALLOWED_IPS=127.0.0.1 설정.
 	ownerAllowedIPs := splitCSV(os.Getenv("BOAN_OWNER_ALLOWED_IPS"))
 
 	isOwnerIPAllowed := func(r *http.Request) bool {
 		if len(ownerAllowedIPs) == 0 {
-			return true // 미설정 시 제한 없음
+			log.Printf("[owner-ip] BOAN_OWNER_ALLOWED_IPS not set — blocking all owner logins (fail-closed)")
+			return false
 		}
 		clientIP := r.Header.Get("X-Forwarded-For")
 		if clientIP == "" {
