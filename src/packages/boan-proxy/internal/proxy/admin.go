@@ -1998,11 +1998,39 @@ func (s *Server) StartAdmin() {
 
 		if r.Method == http.MethodGet {
 			allUsers := s.users.List()
-			// Filter by admin's org — each org sees only their own users
+			// Merge users from GCP org server (central source of truth)
 			var adminOrgID string
 			if sess, err := auth.SessionFromRequest(r, s.authProv); err == nil {
 				adminOrgID = sess.OrgID
 			}
+			orgID := adminOrgID
+			if orgID == "" {
+				orgID = defaultOrgID
+			}
+			if remoteUsers, err := s.orgServer.ListUsers(orgID); err == nil {
+				seen := make(map[string]bool)
+				for _, u := range allUsers {
+					seen[strings.ToLower(u.Email)] = true
+				}
+				for _, ru := range remoteUsers {
+					if seen[strings.ToLower(ru.Email)] {
+						continue
+					}
+					// Remote user not in local store — add it
+					status := userstore.StatusPending
+					if ru.Status == "approved" {
+						status = userstore.StatusApproved
+					}
+					allUsers = append(allUsers, &userstore.User{
+						Email:     ru.Email,
+						Role:      ru.Role,
+						OrgID:     orgID,
+						Status:    status,
+						CreatedAt: time.Now(),
+					})
+				}
+			}
+			// Filter by admin's org
 			list := allUsers
 			if adminOrgID != "" {
 				list = nil
