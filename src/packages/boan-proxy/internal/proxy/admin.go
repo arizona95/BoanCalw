@@ -669,12 +669,42 @@ func (s *Server) StartAdmin() {
 		if requireEdit(w, r) {
 			return
 		}
-		if err := s.orgServer.CompileWiki(defaultOrgID); err != nil {
+		// Get G3 LLM from registry for wiki compilation
+		var g3LLMURL, g3LLMModel string
+		if s.cfg.LLMRegistryURL != "" {
+			regURL := strings.TrimRight(s.cfg.LLMRegistryURL, "/") + "/llm/list"
+			if resp, err := http.Get(regURL); err == nil {
+				defer resp.Body.Close()
+				var llms []struct {
+					Name     string   `json:"name"`
+					Endpoint string   `json:"endpoint"`
+					Roles    []string `json:"roles"`
+					Healthy  bool     `json:"healthy"`
+				}
+				if json.NewDecoder(resp.Body).Decode(&llms) == nil {
+					for _, l := range llms {
+						for _, role := range l.Roles {
+							if role == "g3" && l.Healthy && l.Endpoint != "" {
+								g3LLMURL = l.Endpoint + "/v1/chat/completions"
+								g3LLMModel = l.Name
+								break
+							}
+						}
+						if g3LLMURL != "" { break }
+					}
+				}
+			}
+		}
+		if err := s.orgServer.CompileWikiWithLLM(defaultOrgID, g3LLMURL, g3LLMModel); err != nil {
 			w.WriteHeader(http.StatusBadGateway)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":    "ok",
+			"llm_used":  g3LLMModel,
+			"llm_url":   g3LLMURL,
+		})
 	})
 
 	// ── Wiki pages (all pages with content) ──

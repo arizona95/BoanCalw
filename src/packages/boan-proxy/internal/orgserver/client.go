@@ -203,10 +203,21 @@ func (c *Client) GetTrainingLog(orgID string) ([]map[string]any, error) {
 }
 
 func (c *Client) CompileWiki(orgID string) error {
+	return c.CompileWikiWithLLM(orgID, "", "")
+}
+
+func (c *Client) CompileWikiWithLLM(orgID, llmURL, llmModel string) error {
 	if !c.Enabled() {
 		return fmt.Errorf("org server not configured")
 	}
-	return c.postJSON(fmt.Sprintf("%s/org/%s/v1/wiki/compile", c.baseURL, orgID), map[string]string{})
+	body := map[string]string{}
+	if llmURL != "" {
+		body["llm_url"] = llmURL
+	}
+	if llmModel != "" {
+		body["llm_model"] = llmModel
+	}
+	return c.postJSON(fmt.Sprintf("%s/org/%s/v1/wiki/compile", c.baseURL, orgID), body)
 }
 
 func (c *Client) GetWikiIndex(orgID string) (map[string]any, error) {

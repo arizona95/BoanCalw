@@ -796,12 +796,26 @@ func (s *Server) compileWiki(w http.ResponseWriter, r *http.Request, orgID strin
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// Priority: request body > policy config > server config
+	var body struct {
+		LLMURL   string `json:"llm_url"`
+		LLMModel string `json:"llm_model"`
+	}
+	json.NewDecoder(r.Body).Decode(&body)
+
 	llmURL := s.cfg.WikiLLMURL
 	llmModel := s.cfg.WikiLLMModel
 	llmKey := s.cfg.WikiLLMKey
 	if p.Guardrail.WikiLLMURL != "" {
 		llmURL = p.Guardrail.WikiLLMURL
 		llmModel = p.Guardrail.WikiLLMModel
+	}
+	// Request body overrides (from LLM Registry G3 binding)
+	if body.LLMURL != "" {
+		llmURL = body.LLMURL
+	}
+	if body.LLMModel != "" {
+		llmModel = body.LLMModel
 	}
 	if err := s.wikiStore.Compile(r.Context(), llmURL, llmModel, llmKey, s.trainingLog, p.Guardrail); err != nil {
 		w.WriteHeader(http.StatusBadGateway)
