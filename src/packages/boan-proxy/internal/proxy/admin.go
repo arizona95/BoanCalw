@@ -639,10 +639,11 @@ func (s *Server) StartAdmin() {
 			}
 		}
 		// Fetch wiki pages — try local policy-server first (wiki compiled locally),
-		// fall back to GCP orgserver
+		// fall back to GCP orgserver. Use no-proxy client to avoid HTTP_PROXY.
+		noProxyFetch := &http.Client{Transport: &http.Transport{Proxy: nil}}
 		localWikiURL := fmt.Sprintf("http://boan-policy-server:8081/org/%s/v1/wiki/pages", defaultOrgID)
 		var wikiPages []map[string]any
-		if resp, err := http.Get(localWikiURL); err == nil {
+		if resp, err := noProxyFetch.Get(localWikiURL); err == nil {
 			defer resp.Body.Close()
 			json.NewDecoder(resp.Body).Decode(&wikiPages)
 		}
@@ -654,7 +655,7 @@ func (s *Server) StartAdmin() {
 		}
 		localIndexURL := fmt.Sprintf("http://boan-policy-server:8081/org/%s/v1/wiki", defaultOrgID)
 		var wikiIndex map[string]any
-		if resp, err := http.Get(localIndexURL); err == nil {
+		if resp, err := noProxyFetch.Get(localIndexURL); err == nil {
 			defer resp.Body.Close()
 			json.NewDecoder(resp.Body).Decode(&wikiIndex)
 		}
@@ -713,10 +714,14 @@ func (s *Server) StartAdmin() {
 			}
 		}
 		// Wiki compile needs local LLM access (ollama) → use local policy server, not GCP
+		// Use a no-proxy client to avoid HTTP_PROXY environment variable routing through boan-proxy
+		noProxyClient := &http.Client{Transport: &http.Transport{Proxy: nil}}
 		localPolicyURL := "http://boan-policy-server:8081"
 		compileURL := fmt.Sprintf("%s/org/%s/v1/wiki/compile", localPolicyURL, defaultOrgID)
 		compileBody, _ := json.Marshal(map[string]string{"llm_url": g3LLMURL, "llm_model": g3LLMModel})
-		compileResp, compileErr := http.Post(compileURL, "application/json", bytes.NewReader(compileBody))
+		compileReq, _ := http.NewRequest(http.MethodPost, compileURL, bytes.NewReader(compileBody))
+		compileReq.Header.Set("Content-Type", "application/json")
+		compileResp, compileErr := noProxyClient.Do(compileReq)
 		if compileErr != nil {
 			// Fallback to orgServer (GCP)
 			compileErr = s.orgServer.CompileWikiWithLLM(defaultOrgID, g3LLMURL, g3LLMModel)
@@ -734,7 +739,7 @@ func (s *Server) StartAdmin() {
 		// After successful compile, read proposals and create approval requests
 		proposalCount := 0
 		localPagesURL := fmt.Sprintf("http://boan-policy-server:8081/org/%s/v1/wiki/pages", defaultOrgID)
-		if pResp, err := http.Get(localPagesURL); err == nil {
+		if pResp, err := noProxyClient.Get(localPagesURL); err == nil {
 			defer pResp.Body.Close()
 			var pages []struct {
 				Path    string `json:"path"`
