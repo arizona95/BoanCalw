@@ -1,0 +1,222 @@
+{
+  "id": "boanclaw",
+  "name": "boanclaw",
+  "version": "1.0.0",
+  "displayName": "BoanClaw Security Agent",
+  "description": "Security agent plugin for OpenClaw — proxy-based sandboxing, git guard, audit",
+  "author": "SDS-RED",
+  "license": "MIT",
+  "main": "../dist/index.js",
+  "activationEvents": [
+    "onStartup",
+    "onCommand:boanclaw"
+  ],
+  "tools": [
+    {
+      "name": "mount",
+      "description": "Mount a workspace path through boan-proxy security layer",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Absolute path to mount"
+          },
+          "readOnly": {
+            "type": "boolean",
+            "description": "Mount as read-only"
+          }
+        },
+        "required": ["path"]
+      }
+    },
+    {
+      "name": "audit",
+      "description": "Run security audit via boan-proxy /status endpoint",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "llm-use",
+      "description": "Route LLM usage request through boan-proxy for policy enforcement",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "prompt": {
+            "type": "string",
+            "description": "The prompt to send"
+          },
+          "model": {
+            "type": "string",
+            "description": "Model identifier"
+          },
+          "maxTokens": {
+            "type": "number",
+            "description": "Maximum tokens"
+          },
+          "temperature": {
+            "type": "number",
+            "description": "Sampling temperature"
+          },
+          "allowedTools": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "List of allowed tool names"
+          }
+        },
+        "required": ["prompt"]
+      }
+    },
+    {
+      "name": "session",
+      "description": "Manage BoanClaw session (start/stop/status)",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": ["start", "stop", "status"],
+            "description": "Session action"
+          }
+        }
+      }
+    },
+    {
+      "name": "computer_screenshot",
+      "description": "Take a screenshot of the user's GCP workstation remote desktop. Returns the current screen state as an image.",
+      "inputSchema": { "type": "object", "properties": {} }
+    },
+    {
+      "name": "computer_click",
+      "description": "Click at (x, y) coordinates on the GCP workstation screen.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": { "type": "number", "description": "X coordinate" },
+          "y": { "type": "number", "description": "Y coordinate" },
+          "button": { "type": "string", "enum": ["left", "right", "middle"], "description": "Mouse button" }
+        },
+        "required": ["x", "y"]
+      }
+    },
+    {
+      "name": "computer_double_click",
+      "description": "Double-click at (x, y) on the GCP workstation screen.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": { "type": "number", "description": "X coordinate" },
+          "y": { "type": "number", "description": "Y coordinate" }
+        },
+        "required": ["x", "y"]
+      }
+    },
+    {
+      "name": "computer_right_click",
+      "description": "Right-click at (x, y) on the GCP workstation screen.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": { "type": "number", "description": "X coordinate" },
+          "y": { "type": "number", "description": "Y coordinate" }
+        },
+        "required": ["x", "y"]
+      }
+    },
+    {
+      "name": "computer_scroll",
+      "description": "Scroll the mouse wheel at (x, y) on the GCP workstation screen.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": { "type": "number", "description": "X coordinate" },
+          "y": { "type": "number", "description": "Y coordinate" },
+          "direction": { "type": "string", "enum": ["up", "down"], "description": "Scroll direction" },
+          "amount": { "type": "number", "description": "Number of scroll ticks" }
+        },
+        "required": ["x", "y"]
+      }
+    },
+    {
+      "name": "computer_type",
+      "description": "Type text into the GCP workstation (sends keyboard input).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "text": { "type": "string", "description": "Text to type" }
+        },
+        "required": ["text"]
+      }
+    },
+    {
+      "name": "computer_key",
+      "description": "Press a special key or keyboard shortcut on the GCP workstation. Examples: Return, Tab, Escape, Ctl-C, Ctl-V, F5, Delete.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "description": "Key name (e.g. Return, Tab, Escape, Ctl-C, F5, Delete, BackSpace)" }
+        },
+        "required": ["name"]
+      }
+    },
+    {
+      "name": "computer_move",
+      "description": "Move the mouse cursor to (x, y) on the GCP workstation screen.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": { "type": "number", "description": "X coordinate" },
+          "y": { "type": "number", "description": "Y coordinate" }
+        },
+        "required": ["x", "y"]
+      }
+    },
+    {
+      "name": "computer_click_query",
+      "description": "Find a UI element by natural language description and click it using OCR.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string", "description": "Natural language description of element to click" },
+          "double": { "type": "boolean", "description": "If true, double-click instead of single click" }
+        },
+        "required": ["query"]
+      }
+    }
+  ],
+  "commands": [
+    {
+      "name": "boanclaw",
+      "description": "BoanClaw security controls",
+      "subcommands": ["mount", "session", "audit"]
+    }
+  ],
+  "configuration": {
+    "proxyUrl": {
+      "type": "string",
+      "default": "http://boan-proxy:18080",
+      "description": "URL of the boan-proxy instance"
+    },
+    "allowedDirs": {
+      "type": "array",
+      "default": ["/workspace", "/home", "/tmp/boan"],
+      "description": "Directories allowed for mounting"
+    },
+    "gitGuardEnabled": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable git command interception"
+    },
+    "autoCommit": {
+      "type": "boolean",
+      "default": true,
+      "description": "Auto-commit file changes to session branch"
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "properties": {}
+  }
+}
