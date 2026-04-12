@@ -638,6 +638,12 @@ func (s *Server) StartAdmin() {
 				rejectCount++
 			}
 		}
+		// Also fetch wiki pages
+		wikiPages, _ := s.orgServer.GetWikiPages(defaultOrgID)
+		if wikiPages == nil {
+			wikiPages = []map[string]any{}
+		}
+		wikiIndex, _ := s.orgServer.GetWikiIndex(defaultOrgID)
 		json.NewEncoder(w).Encode(map[string]any{
 			"entries": entries,
 			"stats": map[string]int{
@@ -647,7 +653,48 @@ func (s *Server) StartAdmin() {
 				"approve": approveCount,
 				"reject":  rejectCount,
 			},
+			"wiki_pages": wikiPages,
+			"wiki_index": wikiIndex,
 		})
+	})
+
+	// ── Wiki compile (owner only) ──
+	mux.HandleFunc("/api/admin/wiki/compile", func(w http.ResponseWriter, r *http.Request) {
+		if cors(w, r) { return }
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		if requireEdit(w, r) {
+			return
+		}
+		if err := s.orgServer.CompileWiki(defaultOrgID); err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	// ── Wiki pages (all pages with content) ──
+	mux.HandleFunc("/api/admin/wiki/pages", func(w http.ResponseWriter, r *http.Request) {
+		if cors(w, r) { return }
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodGet {
+			http.NotFound(w, r)
+			return
+		}
+		pages, err := s.orgServer.GetWikiPages(defaultOrgID)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		if pages == nil {
+			pages = []map[string]any{}
+		}
+		json.NewEncoder(w).Encode(pages)
 	})
 
 	// ── auto-update: version check + trigger ──

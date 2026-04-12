@@ -47,6 +47,7 @@ type Server struct {
 	guardrail     *GuardrailEvaluator
 	wikiGuardrail *GuardrailEvaluator
 	trainingLog   *HITLTrainingLog
+	wikiStore     *WikiStore
 }
 
 type checkinRequest struct {
@@ -86,6 +87,7 @@ func New(cfg Config) *Server {
 		guardrail:     NewGuardrailEvaluator(cfg.GuardrailLLMURL, cfg.GuardrailLLMModel, cfg.GuardrailLLMKey),
 		wikiGuardrail: NewGuardrailEvaluator(cfg.WikiLLMURL, cfg.WikiLLMModel, cfg.WikiLLMKey),
 		trainingLog:   NewHITLTrainingLog(trainingLogPath),
+		wikiStore:     NewWikiStore(cfg.DataDir),
 	}
 }
 
@@ -109,6 +111,10 @@ func (s *Server) Start(ctx context.Context) error {
 				"/org/{org_id}/v1/org-settings",
 				"/org/{org_id}/v1/checkin",
 				"/org/{org_id}/v1/guardrail/evaluate",
+				"/org/{org_id}/v1/wiki/compile",
+				"/org/{org_id}/v1/wiki",
+				"/org/{org_id}/v1/wiki/pages",
+				"/org/{org_id}/v1/wiki/page/{path}",
 			},
 		})
 	})
@@ -173,6 +179,15 @@ func (s *Server) handleOrg(w http.ResponseWriter, r *http.Request) {
 		s.autoJudge(w, r, orgID)
 	case rest == "v1/guardrail/training-log" && r.Method == http.MethodGet:
 		s.getTrainingLog(w, orgID)
+	case rest == "v1/wiki/compile" && r.Method == http.MethodPost:
+		s.compileWiki(w, r, orgID)
+	case rest == "v1/wiki" && r.Method == http.MethodGet:
+		s.getWikiIndex(w, orgID)
+	case strings.HasPrefix(rest, "v1/wiki/page/") && r.Method == http.MethodGet:
+		pagePath := strings.TrimPrefix(rest, "v1/wiki/page/")
+		s.getWikiPage(w, pagePath)
+	case rest == "v1/wiki/pages" && r.Method == http.MethodGet:
+		s.getWikiPages(w)
 	case rest == "policy.json" && r.Method == http.MethodGet:
 		s.getPolicy(w, orgID)
 	case rest == "policy" && r.Method == http.MethodPost:
@@ -772,6 +787,84 @@ func (s *Server) getTrainingLog(w http.ResponseWriter, orgID string) {
 		filtered = []HITLDecision{}
 	}
 	json.NewEncoder(w).Encode(filtered)
+}
+
+func (s *Server) compileWiki(w http.ResponseWriter, r *http.Request, orgID string) {
+	w.Header().Set("Content-Type", "application/json")
+	p, err := s.store.EnsureDefault(orgID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	llmURL := s.cfg.WikiLLMURL
+	llmModel := s.cfg.WikiLLMModel
+	llmKey := s.cfg.WikiLLMKey
+	if p.Guardrail.WikiLLMURL != "" {
+		llmURL = p.Guardrail.WikiLLMURL
+		llmModel = p.Guardrail.WikiLLMModel
+	}
+	if err := s.wikiStore.Compile(r.Context(), llmURL, llmModel, llmKey, s.trainingLog, p.Guardrail); err != nil {
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (s *Server) getWikiIndex(w http.ResponseWriter, _ string) {
+	w.Header().Set("Content-Type", "application/json")
+	index, err := s.wikiStore.GetIndex()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	pages := s.wikiStore.ListPages()
+	json.NewEncoder(w).Encode(map[string]any{
+		"index": index,
+		"pages": pages,
+	})
+}
+
+func (s *Server) getWikiPage(w http.ResponseWriter, pagePath string) {
+	w.Header().Set("Content-Type", "application/json")
+	content, err := s.wikiStore.GetPage(pagePath)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]any{
+		"path":    pagePath,
+		"content": content,
+	})
+}
+
+func (s *Server) getWikiPages(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	pages := s.wikiStore.ListPages()
+	// Return pages with their content
+	type pageWithContent struct {
+		Path      string `json:"path"`
+		Title     string `json:"title"`
+		UpdatedAt string `json:"updated_at"`
+		Size      int64  `json:"size"`
+		Content   string `json:"content"`
+	}
+	var result []pageWithContent
+	for _, p := range pages {
+		content, _ := s.wikiStore.GetPage(p.Path)
+		result = append(result, pageWithContent{
+			Path:      p.Path,
+			Title:     p.Title,
+			UpdatedAt: p.UpdatedAt,
+			Size:      p.Size,
+			Content:   content,
+		})
+	}
+	if result == nil {
+		result = []pageWithContent{}
+	}
+	json.NewEncoder(w).Encode(result)
 }
 
 func env(key, fallback string) string {

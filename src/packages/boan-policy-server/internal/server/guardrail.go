@@ -493,7 +493,7 @@ func (s *Server) wikiEvaluateGuardrail(w http.ResponseWriter, r *http.Request, o
 	} else if p.Guardrail.WikiLLMURL != "" {
 		wikiEval = NewGuardrailEvaluator(p.Guardrail.WikiLLMURL, p.Guardrail.WikiLLMModel, s.cfg.WikiLLMKey)
 	}
-	resp, err := wikiEval.WikiEvaluate(r.Context(), p.Guardrail, s.trainingLog, body)
+	resp, err := wikiEval.WikiEvaluateWithStore(r.Context(), p.Guardrail, s.trainingLog, s.wikiStore, body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -501,22 +501,32 @@ func (s *Server) wikiEvaluateGuardrail(w http.ResponseWriter, r *http.Request, o
 	json.NewEncoder(w).Encode(resp)
 }
 
-// WikiEvaluate — Tier 2 평가: training log(wiki)를 few-shot context로 포함하여 LLM 평가
+// WikiEvaluate — Tier 2 평가: compiled wiki context 우선, fallback으로 raw entries 사용
 func (e *GuardrailEvaluator) WikiEvaluate(ctx context.Context, cfg policy.GuardrailConfig, log *HITLTrainingLog, req GuardrailEvaluateRequest) (GuardrailEvaluateResponse, error) {
+	return e.WikiEvaluateWithStore(ctx, cfg, log, nil, req)
+}
+
+// WikiEvaluateWithStore — WikiStore가 있으면 compiled wiki context를 사용
+func (e *GuardrailEvaluator) WikiEvaluateWithStore(ctx context.Context, cfg policy.GuardrailConfig, log *HITLTrainingLog, ws *WikiStore, req GuardrailEvaluateRequest) (GuardrailEvaluateResponse, error) {
 	text := strings.TrimSpace(req.Text)
 	if text == "" {
 		return GuardrailEvaluateResponse{Decision: "block", Reason: "empty text", Confidence: 1, Tier: 2}, nil
 	}
 
-	// training log에서 최근 50건을 wiki context로 구성
+	// Try compiled wiki context first
 	wikiContext := ""
-	if log != nil {
+	if ws != nil {
+		wikiContext = ws.GetContext()
+	}
+
+	// If compiled wiki is empty/not available, fall back to raw entries
+	if wikiContext == "" && log != nil {
 		recent := log.Recent(50)
 		if len(recent) > 0 {
 			var sb strings.Builder
 			sb.WriteString("Past decisions (wiki knowledge):\n")
 			for _, d := range recent {
-				sb.WriteString(fmt.Sprintf("- text=%q reason=%q → %s (confidence=%.2f, source=%s)\n",
+				sb.WriteString(fmt.Sprintf("- text=%q reason=%q -> %s (confidence=%.2f, source=%s)\n",
 					truncate(d.Text, 80), d.Reason, d.Decision, d.Confidence, d.Source))
 			}
 			wikiContext = sb.String()
@@ -869,4 +879,357 @@ func (e *GuardrailEvaluator) ProposeG1Amendment(ctx context.Context, cfg policy.
 	}
 	parsed.ProposedAt = time.Now().UTC().Format(time.RFC3339)
 	return &parsed, nil
+}
+
+// ── WikiStore: Karpathy-pattern wiki storage ────────────────────────────────
+
+// WikiPageInfo describes a single wiki page on disk.
+type WikiPageInfo struct {
+	Path      string `json:"path"`
+	Title     string `json:"title"`
+	UpdatedAt string `json:"updated_at"`
+	Size      int64  `json:"size"`
+}
+
+// WikiStore manages compiled wiki markdown pages on disk.
+type WikiStore struct {
+	mu      sync.RWMutex
+	baseDir string // e.g. /data/policies/wiki
+}
+
+func NewWikiStore(dataDir string) *WikiStore {
+	dir := dataDir + "/wiki"
+	os.MkdirAll(dir, 0755)
+	os.MkdirAll(dir+"/patterns", 0755)
+	os.MkdirAll(dir+"/proposals", 0755)
+	return &WikiStore{baseDir: dir}
+}
+
+// GetIndex returns the content of index.md.
+func (ws *WikiStore) GetIndex() (string, error) {
+	ws.mu.RLock()
+	defer ws.mu.RUnlock()
+	data, err := os.ReadFile(ws.baseDir + "/index.md")
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	return string(data), nil
+}
+
+// GetPage returns the content of a specific wiki page by relative path.
+func (ws *WikiStore) GetPage(relPath string) (string, error) {
+	ws.mu.RLock()
+	defer ws.mu.RUnlock()
+	// Sanitize path to prevent traversal
+	clean := strings.ReplaceAll(relPath, "..", "")
+	clean = strings.TrimPrefix(clean, "/")
+	if clean == "" {
+		return "", fmt.Errorf("empty path")
+	}
+	data, err := os.ReadFile(ws.baseDir + "/" + clean)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("page not found: %s", relPath)
+		}
+		return "", err
+	}
+	return string(data), nil
+}
+
+// ListPages returns metadata for all wiki files.
+func (ws *WikiStore) ListPages() []WikiPageInfo {
+	ws.mu.RLock()
+	defer ws.mu.RUnlock()
+	var pages []WikiPageInfo
+	wikiWalkDir(ws.baseDir, ws.baseDir, &pages)
+	return pages
+}
+
+func wikiWalkDir(root, dir string, out *[]WikiPageInfo) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		full := dir + "/" + e.Name()
+		if e.IsDir() {
+			wikiWalkDir(root, full, out)
+			continue
+		}
+		if !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		rel := strings.TrimPrefix(full, root+"/")
+		info, _ := e.Info()
+		var modTime string
+		var size int64
+		if info != nil {
+			modTime = info.ModTime().UTC().Format(time.RFC3339)
+			size = info.Size()
+		}
+		title := strings.TrimSuffix(e.Name(), ".md")
+		*out = append(*out, WikiPageInfo{
+			Path:      rel,
+			Title:     title,
+			UpdatedAt: modTime,
+			Size:      size,
+		})
+	}
+}
+
+// GetContext returns the compiled wiki as a short context string for G3 evaluation.
+func (ws *WikiStore) GetContext() string {
+	ws.mu.RLock()
+	defer ws.mu.RUnlock()
+	var sb strings.Builder
+	// Include overview.md if present
+	if data, err := os.ReadFile(ws.baseDir + "/overview.md"); err == nil {
+		content := strings.TrimSpace(string(data))
+		if content != "" {
+			sb.WriteString("## Security Overview\n")
+			sb.WriteString(content)
+			sb.WriteString("\n\n")
+		}
+	}
+	// Include pattern files
+	patternEntries, _ := os.ReadDir(ws.baseDir + "/patterns")
+	for _, e := range patternEntries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		if data, err := os.ReadFile(ws.baseDir + "/patterns/" + e.Name()); err == nil {
+			content := strings.TrimSpace(string(data))
+			if content != "" {
+				sb.WriteString(content)
+				sb.WriteString("\n\n")
+			}
+		}
+	}
+	return sb.String()
+}
+
+// Compile reads all raw HITL entries and uses an LLM to generate/update wiki pages.
+func (ws *WikiStore) Compile(ctx context.Context, llmURL, llmModel, llmKey string, log *HITLTrainingLog, cfg policy.GuardrailConfig) error {
+	if llmURL == "" || llmModel == "" {
+		return fmt.Errorf("wiki LLM not configured for compilation")
+	}
+
+	// Read ALL training log entries
+	entries := log.Recent(10000) // effectively all
+	if len(entries) == 0 {
+		return fmt.Errorf("no training log entries to compile")
+	}
+
+	// Build training log summary
+	var entrySummary strings.Builder
+	entrySummary.WriteString(fmt.Sprintf("Total HITL decisions: %d\n\n", len(entries)))
+	// Stats
+	humanCount, autoCount, approveCount, rejectCount := 0, 0, 0, 0
+	reasonCounts := map[string]int{}
+	for _, d := range entries {
+		if d.Source == "human" {
+			humanCount++
+		} else {
+			autoCount++
+		}
+		if d.Decision == "approve" {
+			approveCount++
+		} else {
+			rejectCount++
+		}
+		if d.Reason != "" {
+			reasonCounts[d.Reason]++
+		}
+	}
+	entrySummary.WriteString(fmt.Sprintf("Human decisions: %d, Auto decisions: %d\n", humanCount, autoCount))
+	entrySummary.WriteString(fmt.Sprintf("Approvals: %d, Rejections: %d\n\n", approveCount, rejectCount))
+
+	// Include recent entries as examples (max 50)
+	exampleCount := len(entries)
+	if exampleCount > 50 {
+		exampleCount = 50
+	}
+	entrySummary.WriteString("Recent decisions:\n")
+	for _, d := range entries[len(entries)-exampleCount:] {
+		entrySummary.WriteString(fmt.Sprintf("- [%s] %s: text=%q reason=%q -> %s (confidence=%.2f, source=%s)\n",
+			d.Timestamp, d.Mode, truncate(d.Text, 60), d.Reason, d.Decision, d.Confidence, d.Source))
+	}
+
+	// Top reasons
+	entrySummary.WriteString("\nTop flagged reasons:\n")
+	for reason, count := range reasonCounts {
+		entrySummary.WriteString(fmt.Sprintf("- %q: %d times\n", reason, count))
+	}
+
+	client := &http.Client{Timeout: 120 * time.Second}
+
+	callLLM := func(systemPrompt, userPrompt string) (string, error) {
+		payload := map[string]any{
+			"model": llmModel,
+			"messages": []map[string]string{
+				{"role": "system", "content": systemPrompt},
+				{"role": "user", "content": userPrompt},
+			},
+			"temperature": 0,
+			"stream":      false,
+		}
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			return "", err
+		}
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, llmURL, bytes.NewReader(raw))
+		if err != nil {
+			return "", err
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		if llmKey != "" {
+			httpReq.Header.Set("Authorization", "Bearer "+llmKey)
+		}
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			return "", err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+			return "", fmt.Errorf("wiki compile LLM returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		}
+		var upstream struct {
+			Choices []struct {
+				Message struct{ Content string `json:"content"` } `json:"message"`
+			} `json:"choices"`
+			Message  struct{ Content string `json:"content"` } `json:"message"`
+			Response string                                     `json:"response"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&upstream); err != nil {
+			return "", err
+		}
+		content := ""
+		if len(upstream.Choices) > 0 {
+			content = strings.TrimSpace(upstream.Choices[0].Message.Content)
+		}
+		if content == "" {
+			content = strings.TrimSpace(upstream.Message.Content)
+		}
+		if content == "" {
+			content = strings.TrimSpace(upstream.Response)
+		}
+		return content, nil
+	}
+
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+
+	compiledAt := time.Now().UTC().Format(time.RFC3339)
+	logData := entrySummary.String()
+
+	// 1. Generate overview.md
+	overviewContent, err := callLLM(
+		"You are a security analyst for BoanClaw guardrail system. Analyze the HITL decision log and produce a concise security posture overview in markdown. "+
+			"Include: overall threat profile, key trends, areas of concern, and recommendations. Keep it under 500 words. Output raw markdown only, no code fences.",
+		fmt.Sprintf("Constitution:\n%s\n\nTraining log data:\n%s", strings.TrimSpace(cfg.Constitution), logData),
+	)
+	if err != nil {
+		overviewContent = fmt.Sprintf("# Security Overview\n\nCompilation failed: %v\n\nStats: %d total, %d human, %d auto, %d approve, %d reject",
+			err, len(entries), humanCount, autoCount, approveCount, rejectCount)
+	}
+	os.WriteFile(ws.baseDir+"/overview.md", []byte(overviewContent), 0644)
+
+	// 2. Generate pattern pages
+	patternsContent, err := callLLM(
+		"You are a security analyst. Analyze the HITL decision log and identify distinct security PATTERNS (categories of blocked/approved content). "+
+			"For each pattern, write a short markdown section with: pattern name, description, frequency, typical decision, and examples. "+
+			"Separate each pattern with '---PATTERN_BREAK---'. Output raw markdown, no code fences.",
+		fmt.Sprintf("Training log data:\n%s", logData),
+	)
+	if err == nil && patternsContent != "" {
+		// Split into individual pattern pages
+		patternSections := strings.Split(patternsContent, "---PATTERN_BREAK---")
+		for i, section := range patternSections {
+			section = strings.TrimSpace(section)
+			if section == "" {
+				continue
+			}
+			// Extract title from first heading or use index
+			name := fmt.Sprintf("pattern-%d", i+1)
+			lines := strings.SplitN(section, "\n", 2)
+			if len(lines) > 0 {
+				heading := strings.TrimSpace(strings.TrimLeft(lines[0], "#"))
+				if heading != "" {
+					// Sanitize for filename
+					safeName := strings.ToLower(heading)
+					safeName = strings.Map(func(r rune) rune {
+						if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+							return r
+						}
+						if r == ' ' || r == '_' {
+							return '-'
+						}
+						return -1
+					}, safeName)
+					if len(safeName) > 50 {
+						safeName = safeName[:50]
+					}
+					if safeName != "" {
+						name = safeName
+					}
+				}
+			}
+			os.WriteFile(ws.baseDir+"/patterns/"+name+".md", []byte(section), 0644)
+		}
+	}
+
+	// 3. Generate G1 change suggestions
+	g1Content, err := callLLM(
+		"You are a regex security advisor. Analyze the HITL decision log and current G1 patterns. "+
+			"Suggest specific regex pattern additions/changes for the G1 layer. "+
+			"Output markdown with each suggestion as a bullet point including the regex, description, and mode (credential/block). No code fences.",
+		fmt.Sprintf("Current G1 patterns:\n%s\n\nTraining log data:\n%s",
+			func() string {
+				var sb strings.Builder
+				for _, p := range cfg.G1CustomPatterns {
+					sb.WriteString(fmt.Sprintf("- pattern=%q desc=%q mode=%s\n", p.Pattern, p.Description, p.Mode))
+				}
+				return sb.String()
+			}(), logData),
+	)
+	if err == nil && g1Content != "" {
+		os.WriteFile(ws.baseDir+"/proposals/g1-changes.md", []byte(g1Content), 0644)
+	}
+
+	// 4. Generate G2 constitution suggestions
+	g2Content, err := callLLM(
+		"You are a constitution advisor for BoanClaw guardrail. Analyze the HITL decision log and current constitution. "+
+			"Suggest specific amendments to the constitution to better handle observed patterns. "+
+			"Output markdown with clear before/after suggestions. No code fences.",
+		fmt.Sprintf("Current constitution:\n%s\n\nTraining log data:\n%s", strings.TrimSpace(cfg.Constitution), logData),
+	)
+	if err == nil && g2Content != "" {
+		os.WriteFile(ws.baseDir+"/proposals/g2-changes.md", []byte(g2Content), 0644)
+	}
+
+	// 5. Write compilation log entry
+	logEntry := fmt.Sprintf("## Compilation at %s\n\n- Entries processed: %d\n- Human: %d, Auto: %d\n- Approve: %d, Reject: %d\n\n---\n\n",
+		compiledAt, len(entries), humanCount, autoCount, approveCount, rejectCount)
+	// Append to log.md
+	existingLog, _ := os.ReadFile(ws.baseDir + "/log.md")
+	os.WriteFile(ws.baseDir+"/log.md", []byte(string(existingLog)+logEntry), 0644)
+
+	// 6. Write index.md
+	pages := []WikiPageInfo{}
+	wikiWalkDir(ws.baseDir, ws.baseDir, &pages)
+	var indexBuf strings.Builder
+	indexBuf.WriteString(fmt.Sprintf("# BoanClaw Wiki\n\nLast compiled: %s\n\nEntries processed: %d\n\n## Pages\n\n", compiledAt, len(entries)))
+	for _, p := range pages {
+		if p.Path == "index.md" {
+			continue
+		}
+		indexBuf.WriteString(fmt.Sprintf("- [%s](%s) -- updated %s\n", p.Title, p.Path, p.UpdatedAt))
+	}
+	os.WriteFile(ws.baseDir+"/index.md", []byte(indexBuf.String()), 0644)
+
+	return nil
 }

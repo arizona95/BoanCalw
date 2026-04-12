@@ -202,6 +202,43 @@ func (c *Client) GetTrainingLog(orgID string) ([]map[string]any, error) {
 	return entries, nil
 }
 
+func (c *Client) CompileWiki(orgID string) error {
+	if !c.Enabled() {
+		return fmt.Errorf("org server not configured")
+	}
+	return c.postJSON(fmt.Sprintf("%s/org/%s/v1/wiki/compile", c.baseURL, orgID), map[string]string{})
+}
+
+func (c *Client) GetWikiIndex(orgID string) (map[string]any, error) {
+	if !c.Enabled() {
+		return nil, fmt.Errorf("org server not configured")
+	}
+	url := fmt.Sprintf("%s/org/%s/v1/wiki", c.baseURL, orgID)
+	resp, err := c.client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var result map[string]any
+	json.NewDecoder(resp.Body).Decode(&result)
+	return result, nil
+}
+
+func (c *Client) GetWikiPages(orgID string) ([]map[string]any, error) {
+	if !c.Enabled() {
+		return nil, fmt.Errorf("org server not configured")
+	}
+	url := fmt.Sprintf("%s/org/%s/v1/wiki/pages", c.baseURL, orgID)
+	resp, err := c.client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var result []map[string]any
+	json.NewDecoder(resp.Body).Decode(&result)
+	return result, nil
+}
+
 func (c *Client) DeleteUser(orgID, email string) error {
 	if !c.Enabled() {
 		return nil
