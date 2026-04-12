@@ -702,7 +702,7 @@ func (s *Server) StartAdmin() {
 				if json.NewDecoder(resp.Body).Decode(&llms) == nil {
 					for _, l := range llms {
 						for _, role := range l.Roles {
-							if role == "g3" && l.Healthy && l.Endpoint != "" {
+							if role == "g3" && l.Endpoint != "" {
 								g3LLMURL = l.Endpoint + "/v1/chat/completions"
 								g3LLMModel = l.Name
 								break
