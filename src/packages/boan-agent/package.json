@@ -1,0 +1,27 @@
+{
+  "name": "boan-agent",
+  "version": "1.0.0",
+  "description": "BoanClaw security agent - OpenClaw plugin",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "openclaw": {
+    "extensions": ["./dist/index.js"]
+  },
+  "files": [
+    "dist",
+    "src/plugin.json"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "clean": "rm -rf dist",
+    "test": "vitest run",
+    "lint": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "vitest": "^1.0.0",
+    "@types/node": "^22.0.0"
+  }
+}
