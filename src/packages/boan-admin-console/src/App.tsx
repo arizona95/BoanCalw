@@ -44,10 +44,31 @@ function useVersion(enabled: boolean) {
 
   const triggerUpdate = async () => {
     setUpdating(true);
+    const startVersion = version?.current;
     try {
       await fetch("/api/admin/update", { method: "POST", credentials: "include" });
-      setTimeout(() => window.location.reload(), 90_000);
     } catch { /* noop */ }
+
+    // Poll until version changes OR timeout (15 min max)
+    const startTime = Date.now();
+    const MAX_WAIT = 15 * 60 * 1000; // 15 min
+    const pollVersion = async () => {
+      if (Date.now() - startTime > MAX_WAIT) {
+        setUpdating(false);
+        return;
+      }
+      try {
+        const r = await fetch("/api/admin/version", { credentials: "include" });
+        const v = await r.json();
+        if (v.current && v.current !== startVersion && !v.update_available) {
+          // Version changed AND no longer pending update — rebuild complete
+          window.location.reload();
+          return;
+        }
+      } catch { /* server may be down during restart, keep polling */ }
+      setTimeout(pollVersion, 5000); // poll every 5s
+    };
+    setTimeout(pollVersion, 30_000); // wait 30s before first poll (rebuild just started)
   };
 
   return { version, updating, triggerUpdate };
