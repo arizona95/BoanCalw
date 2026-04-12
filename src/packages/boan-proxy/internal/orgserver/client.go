@@ -155,6 +155,53 @@ func (c *Client) AppendTrainingLog(orgID string, entry map[string]any) error {
 	return c.doJSON(http.MethodPost, fmt.Sprintf("%s/org/%s/v1/guardrail/training-log", c.baseURL, orgID), entry)
 }
 
+func (c *Client) ProposeG1Amendment(orgID string) (map[string]any, error) {
+	if !c.Enabled() {
+		return nil, fmt.Errorf("org server not configured")
+	}
+	url := fmt.Sprintf("%s/org/%s/v1/guardrail/propose-g1-amendment", c.baseURL, orgID)
+	raw, _ := json.Marshal(map[string]string{})
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return nil, fmt.Errorf("propose-g1-amendment returned %d: %s", resp.StatusCode, string(body))
+	}
+	var result map[string]any
+	json.NewDecoder(resp.Body).Decode(&result)
+	return result, nil
+}
+
+func (c *Client) UpdatePolicy(orgID string, update map[string]any) error {
+	if !c.Enabled() {
+		return nil
+	}
+	return c.doJSON(http.MethodPut, fmt.Sprintf("%s/org/%s/v1/policy", c.baseURL, orgID), update)
+}
+
+func (c *Client) GetTrainingLog(orgID string) ([]map[string]any, error) {
+	if !c.Enabled() {
+		return nil, nil
+	}
+	url := fmt.Sprintf("%s/org/%s/v1/guardrail/training-log", c.baseURL, orgID)
+	resp, err := c.client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var entries []map[string]any
+	json.NewDecoder(resp.Body).Decode(&entries)
+	return entries, nil
+}
+
 func (c *Client) DeleteUser(orgID, email string) error {
 	if !c.Enabled() {
 		return nil

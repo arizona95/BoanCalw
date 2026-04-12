@@ -15,6 +15,7 @@ import FileManager from "./pages/FileManager";
 import Observability from "./pages/Observability";
 import MyBoanClaw from "./pages/MyBoanClaw";
 import MyGCP from "./pages/MyGCP";
+import Wiki from "./pages/Wiki";
 
 const ROLE_COLOR: Record<string, string> = {
   owner: "bg-blue-100 text-blue-800",
@@ -80,6 +81,7 @@ function Shell() {
         { path: "/credentials", label: "Credentials", icon: "🔑" },
         { path: "/approvals", label: "Approvals", icon: "✅" },
         { path: "/observability", label: "Observability", icon: "🔭" },
+        { path: "/wiki", label: "G3 Wiki", icon: "📚" },
         { path: "/authorization", label: "Authorization", icon: "🔐" },
         { path: "/my-boanclaw", label: "BoanClaw", icon: "🦞", separator: true },
         { path: "/files", label: "File Manager", icon: "📂" },
@@ -214,6 +216,7 @@ function Shell() {
               <Route path="/credentials" element={<Credentials />} />
               <Route path="/approvals" element={canEdit ? <Approvals /> : <ReadOnly />} />
               <Route path="/observability" element={canEdit ? <Observability /> : <ReadOnly />} />
+              <Route path="/wiki" element={canEdit ? <Wiki /> : <ReadOnly />} />
               {/* Authorization = Users + SSO 통합 */}
               <Route path="/authorization" element={canEdit ? <Authorization /> : <ReadOnly />} />
               {/* legacy redirects so 직접 URL bookmark 도 동작 */}

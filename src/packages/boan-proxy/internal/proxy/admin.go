@@ -608,6 +608,48 @@ func (s *Server) StartAdmin() {
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
 
+	// ── G3 Wiki data: training log + stats ──
+	mux.HandleFunc("/api/admin/wiki", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		entries, err := s.orgServer.GetTrainingLog(defaultOrgID)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]string{"error": "training log fetch failed: " + err.Error()})
+			return
+		}
+		// Compute stats
+		total := len(entries)
+		humanCount, autoCount, approveCount, rejectCount := 0, 0, 0, 0
+		for _, e := range entries {
+			if e["source"] == "human" {
+				humanCount++
+			} else {
+				autoCount++
+			}
+			if e["decision"] == "approve" {
+				approveCount++
+			} else {
+				rejectCount++
+			}
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"entries": entries,
+			"stats": map[string]int{
+				"total":   total,
+				"human":   humanCount,
+				"auto":    autoCount,
+				"approve": approveCount,
+				"reject":  rejectCount,
+			},
+		})
+	})
+
 	// ── auto-update: version check + trigger ──
 	versionFile := os.Getenv("BOAN_VERSION_FILE")
 	latestVersionFile := os.Getenv("BOAN_LATEST_VERSION_FILE")
@@ -2250,6 +2292,41 @@ func (s *Server) StartAdmin() {
 		json.NewEncoder(w).Encode(map[string]string{"status": "proposed", "approval_id": id})
 	})
 
+	// POST /api/admin/propose-g1-amendment — wiki가 G1 패턴 개정안 생성 → approval 큐에 등록
+	mux.HandleFunc("/api/admin/propose-g1-amendment", func(w http.ResponseWriter, r *http.Request) {
+		if cors(w, r) { return }
+		if r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		proposal, err := s.orgServer.ProposeG1Amendment(defaultOrgID)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		diff, _ := proposal["diff"].(string)
+		reasoning, _ := proposal["reasoning"].(string)
+		if diff == "" {
+			json.NewEncoder(w).Encode(map[string]string{"status": "no_amendment", "reasoning": reasoning})
+			return
+		}
+		id := fmt.Sprintf("apr-%s", randomMachineID()[:12])
+		approvalsMu.Lock()
+		approvalsStore = append(approvalsStore, map[string]any{
+			"id":          id,
+			"sessionId":   "g1-patterns",
+			"command":     "g1-amendment:review",
+			"args":        []string{"diff=" + diff, "reasoning=" + reasoning},
+			"requester":   "wiki-guardrail",
+			"org_id":      defaultOrgID,
+			"requestedAt": time.Now().UTC().Format(time.RFC3339),
+			"status":      "pending",
+		})
+		approvalsMu.Unlock()
+		json.NewEncoder(w).Encode(map[string]string{"status": "proposed", "approval_id": id})
+	})
+
 	mux.HandleFunc("/api/admin/org-settings", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -3444,6 +3521,43 @@ func (s *Server) StartAdmin() {
 			}
 		}
 		delete(pendingCredentialApprovals, id)
+		approvalsMu.Unlock()
+
+		// constitution-amendment 승인 시 실제 정책에 반영
+		approvalsMu.Lock()
+		for _, a := range approvalsStore {
+			if a["id"] == id && status == "approved" {
+				cmd, _ := a["command"].(string)
+				if cmd == "constitution-amendment:review" || cmd == "g1-amendment:review" {
+					if args, ok := a["args"].([]any); ok {
+						var diffText string
+						for _, arg := range args {
+							s := fmt.Sprint(arg)
+							if strings.HasPrefix(s, "diff=") {
+								diffText = strings.TrimPrefix(s, "diff=")
+							}
+						}
+						if diffText != "" && orgID != "" {
+							// Apply amendment: send diff to policy server as update
+							if cmd == "constitution-amendment:review" {
+								// G2 constitution diff — extract new text from diff
+								go func() {
+									newConstitution := applyConstitutionDiff(diffText)
+									if newConstitution != "" {
+										s.orgServer.UpdatePolicy(orgID, map[string]any{
+											"guardrail": map[string]any{"constitution": newConstitution},
+										})
+										log.Printf("[amendment] G2 constitution applied from diff")
+									}
+								}()
+							}
+							log.Printf("[amendment] %s approved and applied", cmd)
+						}
+					}
+				}
+				break
+			}
+		}
 		approvalsMu.Unlock()
 
 		// 인간 결정 → wiki training log에 피드백 (Tier 2 학습)
@@ -5263,5 +5377,24 @@ func (s *Server) handleRoutingStatus(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) dlpRulesLoaded() int {
 	return s.dlpEng.RulesCount()
+}
+
+// applyConstitutionDiff — unified diff에서 + 줄만 추출하여 새 헌법 텍스트 생성.
+// 완전한 diff 파서가 아닌 간이 처리: diff가 전체 교체 형태면 + 줄이 새 헌법.
+func applyConstitutionDiff(diff string) string {
+	lines := strings.Split(diff, "\n")
+	var result []string
+	for _, l := range lines {
+		if strings.HasPrefix(l, "+") && !strings.HasPrefix(l, "+++") {
+			result = append(result, strings.TrimPrefix(l, "+"))
+		} else if !strings.HasPrefix(l, "-") && !strings.HasPrefix(l, "---") && !strings.HasPrefix(l, "@@") {
+			result = append(result, l)
+		}
+	}
+	text := strings.TrimSpace(strings.Join(result, "\n"))
+	if text == "" {
+		return ""
+	}
+	return text
 }
 

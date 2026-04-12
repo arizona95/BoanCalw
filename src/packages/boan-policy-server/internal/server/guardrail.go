@@ -764,3 +764,109 @@ func (e *GuardrailEvaluator) ProposeAmendment(ctx context.Context, cfg policy.Gu
 	parsed.ProposedAt = time.Now().UTC().Format(time.RFC3339)
 	return &parsed, nil
 }
+
+// ProposeG1Amendment — training log 분석 → G1 정규식 패턴 추가/수정 제안
+func (e *GuardrailEvaluator) ProposeG1Amendment(ctx context.Context, cfg policy.GuardrailConfig, log *HITLTrainingLog) (*AmendmentProposal, error) {
+	if e.llmURL == "" || e.llmModel == "" {
+		return nil, fmt.Errorf("wiki LLM not configured for G1 amendment proposals")
+	}
+
+	wikiContext := ""
+	if log != nil {
+		recent := log.Recent(100)
+		if len(recent) > 0 {
+			var sb strings.Builder
+			sb.WriteString("Recent guardrail decisions:\n")
+			for _, d := range recent {
+				sb.WriteString(fmt.Sprintf("- text=%q reason=%q → %s (source=%s)\n",
+					truncate(d.Text, 60), d.Reason, d.Decision, d.Source))
+			}
+			wikiContext = sb.String()
+		}
+	}
+
+	// Current G1 patterns
+	g1Patterns := ""
+	if len(cfg.G1CustomPatterns) > 0 {
+		var sb strings.Builder
+		sb.WriteString("Current G1 patterns:\n")
+		for _, p := range cfg.G1CustomPatterns {
+			sb.WriteString(fmt.Sprintf("- pattern=%q desc=%q mode=%s\n", p.Pattern, p.Description, p.Mode))
+		}
+		g1Patterns = sb.String()
+	}
+
+	systemPrompt := fmt.Sprintf(
+		"You are the BoanClaw G1 Pattern Advisor.\n"+
+			"G1 patterns are regex rules that detect/redact sensitive data (credentials, phone numbers, etc).\n\n"+
+			"%s\n"+
+			"%s\n"+
+			"Based on patterns in recent HITL decisions, suggest NEW G1 regex patterns to add.\n"+
+			"Focus on: data that was repeatedly blocked/approved → should become automatic G1 rules.\n"+
+			"Return strict JSON: {\"diff\":\"list of new patterns as: +pattern | description | mode(credential/block)\",\"reasoning\":\"why these patterns are needed\"}",
+		g1Patterns, wikiContext,
+	)
+	payload := map[string]any{
+		"model": e.llmModel,
+		"messages": []map[string]string{
+			{"role": "system", "content": systemPrompt},
+			{"role": "user", "content": "Propose new G1 regex patterns based on accumulated wiki knowledge."},
+		},
+		"temperature": 0,
+		"stream":      false,
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, e.llmURL, bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if e.llmKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+e.llmKey)
+	}
+
+	resp, err := e.client.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return nil, fmt.Errorf("G1 amendment llm returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var upstream struct {
+		Choices []struct {
+			Message struct{ Content string `json:"content"` } `json:"message"`
+		} `json:"choices"`
+		Message  struct{ Content string `json:"content"` } `json:"message"`
+		Response string                                     `json:"response"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&upstream); err != nil {
+		return nil, err
+	}
+	content := ""
+	if len(upstream.Choices) > 0 {
+		content = strings.TrimSpace(upstream.Choices[0].Message.Content)
+	}
+	if content == "" {
+		content = strings.TrimSpace(upstream.Message.Content)
+	}
+	if content == "" {
+		content = strings.TrimSpace(upstream.Response)
+	}
+	if content == "" {
+		return nil, fmt.Errorf("G1 amendment llm returned no content")
+	}
+
+	var parsed AmendmentProposal
+	if err := decodeLooseJSON(content, &parsed); err != nil {
+		return nil, err
+	}
+	parsed.ProposedAt = time.Now().UTC().Format(time.RFC3339)
+	return &parsed, nil
+}

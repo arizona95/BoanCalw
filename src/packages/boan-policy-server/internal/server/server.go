@@ -167,6 +167,8 @@ func (s *Server) handleOrg(w http.ResponseWriter, r *http.Request) {
 		s.appendTrainingLog(w, r, orgID)
 	case rest == "v1/guardrail/propose-amendment" && r.Method == http.MethodPost:
 		s.proposeAmendment(w, r, orgID)
+	case rest == "v1/guardrail/propose-g1-amendment" && r.Method == http.MethodPost:
+		s.proposeG1Amendment(w, r, orgID)
 	case rest == "v1/guardrail/auto-judge" && r.Method == http.MethodPost:
 		s.autoJudge(w, r, orgID)
 	case rest == "v1/guardrail/training-log" && r.Method == http.MethodGet:
@@ -740,6 +742,21 @@ func (s *Server) autoJudge(w http.ResponseWriter, r *http.Request, orgID string)
 		Source:     "auto",
 	})
 	json.NewEncoder(w).Encode(resp)
+}
+
+func (s *Server) proposeG1Amendment(w http.ResponseWriter, r *http.Request, orgID string) {
+	w.Header().Set("Content-Type", "application/json")
+	p, err := s.store.EnsureDefault(orgID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	proposal, err := s.wikiGuardrail.ProposeG1Amendment(r.Context(), p.Guardrail, s.trainingLog)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	json.NewEncoder(w).Encode(proposal)
 }
 
 func (s *Server) getTrainingLog(w http.ResponseWriter, orgID string) {
