@@ -41,16 +41,27 @@ function makeMountRow(seed?: Partial<MountRuleRow>): MountRuleRow {
   };
 }
 
-// G1 custom pattern row — pattern + description + mode
-type G1Mode = "credential" | "block";
-type G1PatternRow = { id: string; pattern: string; description: string; mode: G1Mode };
+// G1 custom pattern row — pattern + description + replacement + mode
+type G1Mode = "redact" | "credential" | "block";
+type G1PatternRow = {
+  id: string;
+  pattern: string;
+  description: string;
+  replacement: string;
+  mode: G1Mode;
+};
 
 function makeG1Row(seed?: Partial<G1PatternRow>): G1PatternRow {
+  const mode: G1Mode =
+    seed?.mode === "credential" || seed?.mode === "block" || seed?.mode === "redact"
+      ? seed.mode
+      : (seed?.replacement && seed.replacement.trim()) ? "redact" : "block";
   return {
     id: Math.random().toString(36).slice(2, 10),
     pattern: seed?.pattern ?? "",
     description: seed?.description ?? "",
-    mode: seed?.mode === "credential" ? "credential" : "block",
+    replacement: seed?.replacement ?? "",
+    mode,
   };
 }
 
@@ -68,7 +79,7 @@ export default function Policies() {
   const [mountRules, setMountRules] = useState<MountRuleRow[]>([]);
   // Guardrail — G1 / G2 / G3 각각의 설정
   const [guardrailSubTab, setGuardrailSubTab] = useState<GuardrailSubTab>("G1");
-  const [g1DefaultPatterns, setG1DefaultPatterns] = useState<string[]>([]);
+  const [g1DefaultPatterns, setG1DefaultPatterns] = useState<import("../api").G1DefaultEntry[]>([]);
   const [g1Rows, setG1Rows] = useState<G1PatternRow[]>([]);
   const [constitution, setConstitution] = useState("");
   const [g3WikiHint, setG3WikiHint] = useState("");
@@ -92,22 +103,20 @@ export default function Policies() {
         setG1DefaultPatterns(g1.patterns ?? []);
         const storedG1 = p.guardrail?.g1_custom_patterns ?? [];
         if (storedG1.length > 0) {
-          setG1Rows(storedG1.map((g) => makeG1Row({ pattern: g.pattern, description: g.description ?? "", mode: g.mode })));
-        } else {
-          // 최초 로드 — 정책에 아무것도 없으면 기본 5줄을 편집 가능한 행으로 seed.
-          // 사용자는 이 값을 수정/삭제/추가할 수 있음. save 시 현재 상태 그대로 저장.
-          const defaultDescs: Record<string, string> = {
-            "(?i)-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----": "PEM 형식 private key 헤더",
-            "(?i)\\b(?:ghp|github_pat|sk-[a-z0-9]|AKIA|AIza)[A-Za-z0-9_\\-]{8,}\\b": "GitHub/OpenAI/AWS/Google API 키 prefix",
-            "(?i)\\beyJ[A-Za-z0-9_\\-]+\\.[A-Za-z0-9_\\-]+\\.[A-Za-z0-9_\\-]+\\b": "JWT 토큰 (base64 헤더.payload.signature)",
-            "(?i)\\b(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key)\\s*[:=]\\s*\\S+": "password/secret/token 변수 할당 표현",
-            "(?i)\\b(?:setx?|export)\\s+[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_KEY)[A-Z0-9_]*\\s*[= ]\\s*\\S+": "환경변수 export TOKEN=... 패턴",
-          };
           setG1Rows(
-            (g1.patterns ?? []).map((pat) =>
-              makeG1Row({ pattern: pat, description: defaultDescs[pat] ?? "", mode: "credential" })
+            storedG1.map((g) =>
+              makeG1Row({
+                pattern: g.pattern,
+                description: g.description ?? "",
+                replacement: g.replacement ?? "",
+                mode: g.mode,
+              })
             )
           );
+        } else {
+          // 최초 로드 — 정책에 아무것도 없으면 서버에서 받은 기본 시드를 편집 가능한 행으로 펼침.
+          // 각 시드는 {pattern, replacement, description, mode} 구조로, 한 줄 = 한 가지 감지 대상.
+          setG1Rows((g1.patterns ?? []).map((d) => makeG1Row(d)));
         }
         setConstitution(p.guardrail?.constitution ?? "");
         setG3WikiHint(p.guardrail?.g3_wiki_hint ?? "");
@@ -129,7 +138,12 @@ export default function Policies() {
   const cleanedG1Custom: G1CustomPattern[] = useMemo(
     () =>
       g1Rows
-        .map((r) => ({ pattern: r.pattern.trim(), description: r.description.trim(), mode: r.mode }))
+        .map((r) => ({
+          pattern: r.pattern.trim(),
+          description: r.description.trim(),
+          replacement: r.replacement.trim(),
+          mode: r.mode,
+        }))
         .filter((r) => r.pattern.length > 0),
     [g1Rows]
   );
@@ -357,8 +371,12 @@ export default function Policies() {
               <div>
                 <h2 className="text-sm font-semibold mb-1">G1 · 정규식 가드레일</h2>
                 <p className="text-xs text-gray-500">
-                  모든 사용자(allow 포함) 무조건 적용. credential 패턴 및 위험 키워드 감지. 매칭되면 <b>block</b>.
-                  기본 5개 패턴은 최초 로드 시 seed 되며, 자유롭게 수정/삭제/추가 가능. LLM 이 제안하는 G1 변경은 Approvals → Guardrail Diff 탭에서 승인.
+                  모든 사용자(allow 포함) 무조건 적용. 매칭되면 동작 분기:
+                  {" "}<b>redact</b>(매칭 부분을 치환값으로 교체 후 통과) /
+                  {" "}<b>credential</b>(자격증명 플로우, legacy) /
+                  {" "}<b>block</b>(즉시 차단).<br/>
+                  예: <code className="font-mono text-[11px]">폰번호 → <span className="text-blue-600">{"{{G1::phone_number}}"}</span></code>.
+                  {" "}한 줄 = 한 가지 감지 대상. 기본 시드는 최초 로드 시 편집 가능한 행으로 펼쳐집니다.
                 </p>
               </div>
 
@@ -391,8 +409,19 @@ export default function Policies() {
                           onChange={(e) =>
                             setG1Rows((rows) => rows.map((r) => (r.id === row.id ? { ...r, pattern: e.target.value } : r)))
                           }
-                          placeholder="(?i)\bproject-alpha\b"
+                          placeholder="(?i)\b01[016-9][-.\s]?\d{3,4}[-.\s]?\d{4}\b"
                           className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-xs font-mono bg-white"
+                          title="정규식 (Go syntax, (?i) 등 지원)"
+                        />
+                        <span className="text-xs text-gray-400 select-none">→</span>
+                        <input
+                          value={row.replacement}
+                          onChange={(e) =>
+                            setG1Rows((rows) => rows.map((r) => (r.id === row.id ? { ...r, replacement: e.target.value } : r)))
+                          }
+                          placeholder="{{G1::phone_number}}"
+                          className="w-56 px-3 py-2 border border-gray-300 rounded-lg text-xs font-mono bg-white"
+                          title="매칭된 텍스트를 이 값으로 치환 (예: {{G1::phone_number}}). 비우고 모드를 block 으로 하면 차단."
                         />
                         <select
                           value={row.mode}
@@ -400,8 +429,9 @@ export default function Policies() {
                             setG1Rows((rows) => rows.map((r) => (r.id === row.id ? { ...r, mode: e.target.value as G1Mode } : r)))
                           }
                           className="px-2 py-2 border border-gray-300 rounded-lg text-xs bg-white"
-                          title="credential: 매칭값을 credential 치환 플로우로 / block: 즉시 차단"
+                          title="redact: 치환해서 통과 / credential: 자격증명 플로우 (legacy) / block: 즉시 차단"
                         >
+                          <option value="redact">redact</option>
                           <option value="credential">credential</option>
                           <option value="block">block</option>
                         </select>

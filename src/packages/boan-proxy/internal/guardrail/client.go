@@ -139,10 +139,11 @@ func (c *Client) GetConstitution(ctx context.Context, orgID string) (string, err
 	return p.Guardrail.Constitution, nil
 }
 
-// GuardrailG1Rule — input_gate 로 전달할 G1 정규식 + mode
+// GuardrailG1Rule — input_gate 로 전달할 G1 규칙.
 type GuardrailG1Rule struct {
-	Pattern string
-	Mode    string // "credential" | "block"
+	Pattern     string
+	Replacement string
+	Mode        string // "redact" | "credential" | "block"
 }
 
 // GetGuardrailRules — policy-server에서 G1 patterns + G3 wiki hint 조회
@@ -171,6 +172,7 @@ func (c *Client) GetGuardrailRules(ctx context.Context, orgID string) (*Guardrai
 			G1CustomPatterns []struct {
 				Pattern     string `json:"pattern"`
 				Description string `json:"description"`
+				Replacement string `json:"replacement"`
 				Mode        string `json:"mode"`
 			} `json:"g1_custom_patterns"`
 			G3WikiHint string `json:"g3_wiki_hint"`
@@ -183,8 +185,9 @@ func (c *Client) GetGuardrailRules(ctx context.Context, orgID string) (*Guardrai
 	for _, pat := range p.Guardrail.G1CustomPatterns {
 		if trimmed := strings.TrimSpace(pat.Pattern); trimmed != "" {
 			rules = append(rules, GuardrailG1Rule{
-				Pattern: trimmed,
-				Mode:    strings.ToLower(strings.TrimSpace(pat.Mode)),
+				Pattern:     trimmed,
+				Replacement: pat.Replacement,
+				Mode:        strings.ToLower(strings.TrimSpace(pat.Mode)),
 			})
 		}
 	}

@@ -69,7 +69,8 @@ export interface MountRule {
 export interface G1CustomPattern {
   pattern: string;
   description?: string;
-  mode?: "credential" | "block"; // default "block"
+  replacement?: string;                          // 예: "{{G1::phone_number}}"
+  mode?: "redact" | "credential" | "block";      // default "redact" if replacement set, else "block"
 }
 
 export interface GuardrailConfig {
@@ -395,8 +396,15 @@ export const mountApi = {
   config: () => request<MountConfig>("/api/mount/config"),
 };
 
+export interface G1DefaultEntry {
+  pattern: string;
+  replacement: string;
+  description: string;
+  mode: string;
+}
+
 export interface G1DefaultsResponse {
-  patterns: string[];
+  patterns: G1DefaultEntry[];
 }
 
 export const guardrailApi = {

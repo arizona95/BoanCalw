@@ -27,22 +27,117 @@ type InputGateRequest struct {
 	G1Patterns []G1PatternRule `json:"g1_patterns,omitempty"`
 }
 
-// G1PatternRule — 정규식 + 매칭 시 동작. Mode:
-//   "credential" — credential 치환 flow (기본 5개 패턴이 사용)
+// G1PatternRule — 정규식 + 매칭 시 동작.
+// Mode:
+//   "redact"     — 매칭된 텍스트를 Replacement 로 치환 후 downstream 으로 통과
+//   "credential" — credential 치환 flow (legacy, Replacement 없으면 이 경로)
 //   "block"      — 단순 차단 (프로젝트명/사내 도메인 등)
 type G1PatternRule struct {
-	Pattern string `json:"pattern"`
-	Mode    string `json:"mode,omitempty"` // "credential" | "block", default "block"
+	Pattern     string `json:"pattern"`
+	Replacement string `json:"replacement,omitempty"`
+	Mode        string `json:"mode,omitempty"`
 }
 
-// DefaultG1Patterns — 코드에 하드코딩된 기본 G1 정규식 패턴 (소스 문자열).
-// 관리 콘솔의 Guardrail G1 섹션에 read-only 로 표시하기 위해 노출.
-var DefaultG1Patterns = []string{
-	`(?i)-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----`,
-	`(?i)\b(?:ghp|github_pat|sk-[a-z0-9]|AKIA|AIza)[A-Za-z0-9_\-]{8,}\b`,
-	`(?i)\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b`,
-	`(?i)\b(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key)\s*[:=]\s*\S+`,
-	`(?i)\b(?:setx?|export)\s+[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_KEY)[A-Z0-9_]*\s*[= ]\s*\S+`,
+// DefaultG1Pattern — 기본 seed 정규식 한 개의 완전한 정의.
+// UI 가 최초 로드 시 이 목록을 받아서 편집 가능한 행으로 펼침.
+type DefaultG1Pattern struct {
+	Pattern     string `json:"pattern"`
+	Replacement string `json:"replacement"`
+	Description string `json:"description"`
+	Mode        string `json:"mode"`
+}
+
+// DefaultG1Patterns — 기본 G1 정규식 시드.
+// 한 패턴에 여러 종류를 alternation 으로 묶지 않음 — 한 줄 = 한 가지 감지 대상.
+// 매칭되면 Replacement 플레이스홀더로 치환되어 downstream 에 전달 (차단 X, 원문 노출 X).
+var DefaultG1Patterns = []DefaultG1Pattern{
+	// --- 인증/비밀 ---
+	{
+		Pattern:     `(?i)-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----`,
+		Replacement: `{{G1::private_key}}`,
+		Description: `PEM 형식 private key 헤더`,
+		Mode:        "redact",
+	},
+	{
+		Pattern:     `\bghp_[A-Za-z0-9]{20,}\b`,
+		Replacement: `{{G1::github_token}}`,
+		Description: `GitHub Personal Access Token (classic)`,
+		Mode:        "redact",
+	},
+	{
+		Pattern:     `\bgithub_pat_[A-Za-z0-9_]{20,}\b`,
+		Replacement: `{{G1::github_token}}`,
+		Description: `GitHub Personal Access Token (fine-grained)`,
+		Mode:        "redact",
+	},
+	{
+		Pattern:     `\bsk-[A-Za-z0-9_\-]{20,}\b`,
+		Replacement: `{{G1::openai_key}}`,
+		Description: `OpenAI API 키`,
+		Mode:        "redact",
+	},
+	{
+		Pattern:     `\bAKIA[A-Z0-9]{16}\b`,
+		Replacement: `{{G1::aws_access_key}}`,
+		Description: `AWS Access Key ID`,
+		Mode:        "redact",
+	},
+	{
+		Pattern:     `\bAIza[A-Za-z0-9_\-]{35}\b`,
+		Replacement: `{{G1::google_api_key}}`,
+		Description: `Google API 키`,
+		Mode:        "redact",
+	},
+	{
+		Pattern:     `\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b`,
+		Replacement: `{{G1::jwt}}`,
+		Description: `JWT 토큰 (base64 header.payload.signature)`,
+		Mode:        "redact",
+	},
+	// --- 변수 할당 형태 ---
+	{
+		Pattern:     `(?i)\b(?:password|passwd|pwd)\s*[:=]\s*\S+`,
+		Replacement: `{{G1::password_assignment}}`,
+		Description: `password/passwd/pwd = ... 변수 할당`,
+		Mode:        "redact",
+	},
+	{
+		Pattern:     `(?i)\b(?:secret|token|api[_-]?key|access[_-]?key)\s*[:=]\s*\S+`,
+		Replacement: `{{G1::secret_assignment}}`,
+		Description: `secret/token/api_key = ... 변수 할당`,
+		Mode:        "redact",
+	},
+	{
+		Pattern:     `(?i)\b(?:setx?|export)\s+[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_KEY)[A-Z0-9_]*\s*[= ]\s*\S+`,
+		Replacement: `{{G1::env_secret_export}}`,
+		Description: `export/setx/set TOKEN=... 환경변수 설정`,
+		Mode:        "redact",
+	},
+	// --- PII ---
+	{
+		Pattern:     `\b01[016-9][-.\s]?\d{3,4}[-.\s]?\d{4}\b`,
+		Replacement: `{{G1::phone_number}}`,
+		Description: `한국 휴대전화 번호 (010/011/016~019)`,
+		Mode:        "redact",
+	},
+	{
+		Pattern:     `\b\d{6}-\d{7}\b`,
+		Replacement: `{{G1::korean_rrn}}`,
+		Description: `한국 주민등록번호`,
+		Mode:        "redact",
+	},
+	{
+		Pattern:     `\b(?:4\d{12}(?:\d{3})?|5[1-5]\d{14}|3[47]\d{13}|6(?:011|5\d{2})\d{12})\b`,
+		Replacement: `{{G1::credit_card}}`,
+		Description: `신용카드 번호 (Visa/Mastercard/Amex/Discover)`,
+		Mode:        "redact",
+	},
+	{
+		Pattern:     `[\w.%+\-]+@[\w.\-]+\.[A-Za-z]{2,}`,
+		Replacement: `{{G1::email}}`,
+		Description: `이메일 주소`,
+		Mode:        "redact",
+	},
 }
 
 type InputGateResponse struct {
@@ -88,15 +183,16 @@ var (
 func compileDefaultG1Patterns() []*regexp.Regexp {
 	out := make([]*regexp.Regexp, 0, len(DefaultG1Patterns))
 	for _, p := range DefaultG1Patterns {
-		out = append(out, regexp.MustCompile(p))
+		out = append(out, regexp.MustCompile(p.Pattern))
 	}
 	return out
 }
 
-// compiledG1Rule — 컴파일된 G1 규칙 (regex + 매칭 시 동작 모드)
+// compiledG1Rule — 컴파일된 G1 규칙 (regex + 치환값 + 모드)
 type compiledG1Rule struct {
-	re   *regexp.Regexp
-	mode string // "credential" | "block"
+	re          *regexp.Regexp
+	replacement string
+	mode        string // "redact" | "credential" | "block"
 }
 
 // compileG1Rules — 사용자 정의 G1 규칙을 컴파일 (에러 나는건 조용히 무시)
@@ -112,10 +208,22 @@ func compileG1Rules(rules []G1PatternRule) []compiledG1Rule {
 			continue
 		}
 		mode := strings.ToLower(strings.TrimSpace(r.Mode))
-		if mode != "credential" && mode != "block" {
-			mode = "block"
+		switch mode {
+		case "redact", "credential", "block":
+			// ok
+		default:
+			// default: replacement 있으면 redact, 없으면 block
+			if strings.TrimSpace(r.Replacement) != "" {
+				mode = "redact"
+			} else {
+				mode = "block"
+			}
 		}
-		out = append(out, compiledG1Rule{re: re, mode: mode})
+		out = append(out, compiledG1Rule{
+			re:          re,
+			replacement: r.Replacement,
+			mode:        mode,
+		})
 	}
 	return out
 }
@@ -188,10 +296,22 @@ func evaluateInputGateWithLocal(
 				g1Rules = append(g1Rules, compiledG1Rule{re: re, mode: "credential"})
 			}
 		}
+		// 먼저 redact 규칙을 모두 적용 (매칭된 부분을 replacement 로 치환 후 계속 흐름 진행).
+		// 나머지 block/credential 규칙은 이후에 평가.
 		for _, rule := range g1Rules {
+			if rule.mode == "redact" && rule.replacement != "" {
+				if rule.re.MatchString(text) {
+					text = rule.re.ReplaceAllString(text, rule.replacement)
+				}
+			}
+		}
+		for _, rule := range g1Rules {
+			if rule.mode == "redact" {
+				continue
+			}
 			if rule.re.MatchString(text) {
 				// mode=credential → credential substitution flow
-				// mode=block → 즉시 block (substitution 우회)
+				// mode=block       → 즉시 block
 				action := "credential_required"
 				reason := "[G1] credential-like pattern matched: " + rule.re.String()
 				if rule.mode == "block" {

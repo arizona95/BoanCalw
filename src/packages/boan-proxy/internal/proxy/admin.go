@@ -1348,7 +1348,7 @@ func (s *Server) StartAdmin() {
 		var g1Patterns []G1PatternRule
 		if rules, _ := s.guardrail.GetGuardrailRules(ctx, orgID); rules != nil {
 			for _, r := range rules.G1Patterns {
-				g1Patterns = append(g1Patterns, G1PatternRule{Pattern: r.Pattern, Mode: r.Mode})
+				g1Patterns = append(g1Patterns, G1PatternRule{Pattern: r.Pattern, Replacement: r.Replacement, Mode: r.Mode})
 			}
 		}
 		req := InputGateRequest{
@@ -1852,7 +1852,7 @@ func (s *Server) StartAdmin() {
 		if rules, _ := s.guardrail.GetGuardrailRules(r.Context(), sess.OrgID); rules != nil {
 			body.G1Patterns = make([]G1PatternRule, 0, len(rules.G1Patterns))
 			for _, r := range rules.G1Patterns {
-				body.G1Patterns = append(body.G1Patterns, G1PatternRule{Pattern: r.Pattern, Mode: r.Mode})
+				body.G1Patterns = append(body.G1Patterns, G1PatternRule{Pattern: r.Pattern, Replacement: r.Replacement, Mode: r.Mode})
 			}
 		}
 
@@ -2695,23 +2695,43 @@ func (s *Server) StartAdmin() {
 				json.NewEncoder(w).Encode(map[string]string{"error": "고정 소유자는 삭제할 수 없습니다."})
 				return
 			}
-			// 1) GCP VM 먼저 삭제 시도 (best-effort) — 실패해도 user 삭제는 진행
+			// 삭제 대상 조직 = 관리자 세션의 org. 세션 없으면 defaultOrgID.
+			targetOrg := defaultOrgID
+			if sess, err := auth.SessionFromRequest(r, s.authProv); err == nil && sess.OrgID != "" {
+				targetOrg = sess.OrgID
+			}
+
+			// 1) GCP VM 삭제 시도 — workstation info 는 GCP org server 에서 조회 (local 에 없을 수 있음).
 			if s.workstations != nil {
-				current, _ := s.users.Workstation(body.Email)
-				if err := s.workstations.Delete(r.Context(), body.Email, defaultOrgID, current); err != nil {
-					log.Printf("workstation delete failed for %s (proceeding with user delete): %v", body.Email, err)
-				} else {
-					log.Printf("workstation deleted for %s", body.Email)
+				var ws *userstore.Workstation
+				// 우선 local 확인
+				if local, _ := s.users.Workstation(body.Email); local != nil {
+					ws = local
+				} else if remoteUsers, err := s.orgs.ClientFor(targetOrg).ListUsers(targetOrg); err == nil {
+					for _, ru := range remoteUsers {
+						if strings.EqualFold(ru.Email, body.Email) && ru.Workstation != nil && ru.Workstation.InstanceID != "" {
+							ws = &userstore.Workstation{
+								Provider:   ru.Workstation.Provider,
+								Platform:   ru.Workstation.Platform,
+								InstanceID: ru.Workstation.InstanceID,
+								Region:     ru.Workstation.Region,
+							}
+							break
+						}
+					}
+				}
+				if ws != nil && ws.InstanceID != "" {
+					if err := s.workstations.Delete(r.Context(), body.Email, targetOrg, ws); err != nil {
+						log.Printf("workstation delete failed for %s (proceeding): %v", body.Email, err)
+					} else {
+						log.Printf("workstation deleted for %s (instance %s)", body.Email, ws.InstanceID)
+					}
 				}
 			}
-			// 2) local user store 에서 제거
-			if err := s.users.Delete(body.Email); err != nil {
-				w.WriteHeader(http.StatusNotFound)
-				json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-				return
-			}
-			// 3) org server 에서 제거
-			if err := s.orgs.ClientFor(defaultOrgID).DeleteUser(defaultOrgID, body.Email); err != nil {
+			// 2) local userstore 에서 제거 (있을 때만; 없어도 계속 진행)
+			_ = s.users.Delete(body.Email)
+			// 3) org server 에서 제거 — 진실의 원천.
+			if err := s.orgs.ClientFor(targetOrg).DeleteUser(targetOrg, body.Email); err != nil {
 				w.WriteHeader(http.StatusBadGateway)
 				json.NewEncoder(w).Encode(map[string]string{"error": "조직 서버 삭제 실패: " + err.Error()})
 				return

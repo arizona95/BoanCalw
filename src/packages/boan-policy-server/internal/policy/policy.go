@@ -116,7 +116,11 @@ type GuardrailConfig struct {
 type G1CustomPattern struct {
 	Pattern     string `json:"pattern"`
 	Description string `json:"description,omitempty"`
-	Mode        string `json:"mode,omitempty"` // "credential" | "block"
+	// Replacement: 매칭된 텍스트를 이 값으로 치환해서 downstream 에 전달.
+	// 예: "{{G1::phone_number}}" → 원문의 폰번호 자리에 플레이스홀더가 들어가고 가드레일은 통과.
+	// 비어있고 Mode="block" 이면 차단. 비어있고 Mode="credential" 이면 기존 credential swap 로직.
+	Replacement string `json:"replacement,omitempty"`
+	Mode        string `json:"mode,omitempty"` // "redact" | "block" | "credential" (legacy)
 }
 
 type Policy struct {
