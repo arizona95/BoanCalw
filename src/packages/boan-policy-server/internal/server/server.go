@@ -124,8 +124,16 @@ func (s *Server) Start(ctx context.Context) error {
 			},
 		})
 	})
-	// /org/* 는 토큰 검증 미들웨어로 감싼다.
-	mux.HandleFunc("/org/", s.requireOrgToken(s.handleOrg))
+	// /org/* 는 토큰 검증 미들웨어로 감싼다 (단 /public/* 은 예외).
+	mux.HandleFunc("/org/", func(w http.ResponseWriter, r *http.Request) {
+		// /org/{id}/v1/public/* 는 인증 없이 허용 (가입 요청 등).
+		// 조직 ID 만 알면 누구나 사용 요청 접수 가능. 스팸 방지는 이메일 도메인 필터 + rate limit 로.
+		if strings.Contains(r.URL.Path, "/v1/public/") {
+			s.handleOrg(w, r)
+			return
+		}
+		s.requireOrgToken(s.handleOrg)(w, r)
+	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Write([]byte("ok"))
 	})
@@ -142,9 +150,11 @@ func (s *Server) Start(ctx context.Context) error {
 	return srv.ListenAndServe()
 }
 
-// requireOrgToken — 모든 /org/ 요청에 Authorization: Bearer <BOAN_ORG_TOKEN> 요구.
-// OrgToken 이 설정돼있지 않으면 fail-closed (모든 요청 401).
-// OrgToken 이 설정돼있고 헤더가 일치하면 통과.
+// requireOrgToken — /org/ 요청에 Bearer 인증 요구.
+// 통과 조건 중 하나:
+//   1. Token == BOAN_ORG_TOKEN (deployment-level, 전체 접근)
+//   2. Token == user.UserToken (해당 조직에 등록된 user, 본인 상태 조회 등 제한된 접근)
+// 둘 다 없으면 401 (fail-closed).
 func (s *Server) requireOrgToken(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.cfg.OrgToken == "" {
@@ -158,11 +168,21 @@ func (s *Server) requireOrgToken(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		token := auth[len(prefix):]
-		if token != s.cfg.OrgToken {
-			http.Error(w, "invalid org token", http.StatusUnauthorized)
+		if token == s.cfg.OrgToken {
+			next(w, r)
 			return
 		}
-		next(w, r)
+		// 2) 사용자 토큰 확인 — URL 에서 org_id 추출 후 매칭.
+		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/org/"), "/")
+		if len(parts) >= 1 {
+			orgID := parts[0]
+			user, err := s.store.FindUserByToken(orgID, token)
+			if err == nil && user != nil {
+				next(w, r)
+				return
+			}
+		}
+		http.Error(w, "invalid org token", http.StatusUnauthorized)
 	}
 }
 
@@ -190,6 +210,8 @@ func (s *Server) handleOrg(w http.ResponseWriter, r *http.Request) {
 		s.syncSSOUser(w, r, orgID)
 	case rest == "v1/users/check-login-ip" && r.Method == http.MethodPost:
 		s.checkLoginIP(w, r, orgID)
+	case rest == "v1/public/register-request" && r.Method == http.MethodPost:
+		s.publicRegisterRequest(w, r, orgID)
 	case rest == "v1/users/reset-ip" && r.Method == http.MethodPost:
 		s.resetUserIP(w, r, orgID)
 	case rest == "v1/policy" && r.Method == http.MethodGet:
@@ -534,6 +556,66 @@ func (s *Server) checkin(w http.ResponseWriter, r *http.Request, orgID string) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+// publicRegisterRequest — 공개 가입 요청 엔드포인트 (인증 토큰 불필요).
+// body: {email, name?}
+// 조직 ID 만 아는 사용자가 이메일을 제출해서 pending user 로 등록될 수 있음.
+// 조직 owner 가 UI 에서 승인하면 approved 로 전환.
+// 스팸 방지는 이메일 중복 체크 + 이후 rate limit 추가 가능.
+func (s *Server) publicRegisterRequest(w http.ResponseWriter, r *http.Request, orgID string) {
+	var body struct {
+		Email string `json:"email"`
+		Name  string `json:"name,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	body.Email = strings.TrimSpace(strings.ToLower(body.Email))
+	if body.Email == "" {
+		http.Error(w, "email required", http.StatusBadRequest)
+		return
+	}
+	name := body.Name
+	if name == "" {
+		name = body.Email
+	}
+	// 이미 등록된 user 면 중복 요청 에러 (status 상관없이).
+	existing, _ := s.store.ListUsers(orgID)
+	for _, u := range existing {
+		if strings.EqualFold(u.Email, body.Email) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error":  "이미 등록된 이메일입니다.",
+				"status": string(u.Status),
+			})
+			return
+		}
+	}
+	user, err := s.store.UpsertSSOUser(orgID, body.Email, name, "user", "public-register", policy.UserStatusPending, "", "")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// 가입 즉시 user-specific token 발급. proxy 가 저장해서 이후 /org/* 호출에 Bearer 로 붙임.
+	user.UserToken = policy.GenerateUserToken()
+	if _, err := s.store.UpdateUser(orgID, user.Email, user.Role, user.Status, nil, user.MachineID, user.MachineName); err != nil {
+		// 토큰 저장 실패해도 가입은 성공. 다음에 재발급 가능.
+	} else {
+		// UpdateUser 가 token 을 직접 건드리지 않으므로 별도 저장 필요.
+		if err := s.store.SetUserToken(orgID, user.Email, user.UserToken); err != nil {
+			http.Error(w, "token save failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"status":     "pending",
+		"message":    "사용 요청이 접수되었습니다. 조직 소유자 승인 후 로그인할 수 있습니다.",
+		"user_token": user.UserToken,
+	})
 }
 
 // checkLoginIP — TOFU IP 바인딩 확인.

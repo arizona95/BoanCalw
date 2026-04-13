@@ -1,7 +1,7 @@
 project_id          = "ai-security-test-473701"
 project_name        = "ai-security-test"
 region              = "asia-northeast3"
-org_id              = "sds-corp"
+org_id              = "sds2-corp"
 policy_server_image = "gcr.io/ai-security-test-473701/boan-policy-server:latest"
 admin_api_image     = "gcr.io/ai-security-test-473701/boan-proxy:latest"
 enable_firebase_hosting = false

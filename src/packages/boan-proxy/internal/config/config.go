@@ -15,6 +15,11 @@ type Config struct {
 	OrgID                     string        `json:"org_id"`
 	PolicyURL                 string        `json:"policy_url"`
 	OrgToken                  string        `json:"org_token"`
+	// PolicyURLPattern: 조직 ID → policy-server URL 자동 해석 공식.
+	// 사용자가 org_id 만 입력하면 proxy 가 이걸로 URL 조립.
+	// 기본값은 현재 GCP 프로젝트 구조. 다른 프로젝트면 install 시 override.
+	// "{org_id}" 또는 "%s" 를 조직 ID 자리표시자로 씀.
+	PolicyURLPattern          string        `json:"policy_url_pattern"`
 	PolicyTTL                 time.Duration `json:"policy_ttl"`
 	AuditEndpoint             string        `json:"audit_endpoint"`
 	TLSCACert                 string        `json:"tls_ca_cert"`
@@ -77,6 +82,7 @@ func Load() (*Config, error) {
 		OrgID:                     env("BOAN_ORG_ID", ""),
 		PolicyURL:                 env("BOAN_POLICY_URL", ""),
 		OrgToken:                  env("BOAN_ORG_TOKEN", ""),
+		PolicyURLPattern:          env("BOAN_POLICY_URL_PATTERN", "https://boan-policy-server-{org_id}-3avhtf4kka-du.a.run.app"),
 		PolicyTTL:                 60 * time.Second,
 		AuditEndpoint:             env("BOAN_AUDIT_ENDPOINT", ""),
 		TLSCACert:                 env("BOAN_CA_CERT", "/etc/boan/ca.crt"),

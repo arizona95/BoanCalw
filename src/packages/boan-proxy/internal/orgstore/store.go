@@ -11,6 +11,8 @@ package orgstore
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	neturl "net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -229,4 +231,94 @@ func (s *Store) ClientFor(orgID string) *orgserver.Client {
 		return orgserver.New("")
 	}
 	return orgserver.NewWithToken(entry.URL, entry.Token)
+}
+
+// ResolveURLFromPattern — orgID 를 pattern 에 끼워넣어 policy-server URL 생성.
+// pattern 에 "{org_id}" 또는 "%s" 가 있으면 그걸 orgID 로 대체.
+// 둘 다 없으면 pattern 을 URL 그대로 사용.
+func ResolveURLFromPattern(pattern, orgID string) string {
+	if pattern == "" {
+		return ""
+	}
+	if strings.Contains(pattern, "{org_id}") {
+		return strings.ReplaceAll(pattern, "{org_id}", orgID)
+	}
+	if strings.Contains(pattern, "%s") {
+		return strings.Replace(pattern, "%s", orgID, 1)
+	}
+	return pattern
+}
+
+// ExtractOrgIDFromURL — Cloud Run URL 에서 org_id 파싱.
+// 입력 예:
+//   https://boan-policy-server-sds-corp-3avhtf4kka-du.a.run.app
+//   https://boan-policy-server-sds-corp-105340775837.asia-northeast3.run.app
+// → "sds-corp"
+// 형식:
+//   boan-policy-server-{ORG}-{HASH|PROJECT_NUMBER}[-{REGION}][.REGION].run.app
+// 실패 시 ("", error).
+func ExtractOrgIDFromURL(rawURL string) (string, error) {
+	u, err := neturl.Parse(rawURL)
+	if err != nil {
+		return "", fmt.Errorf("invalid URL: %w", err)
+	}
+	host := u.Host
+	if host == "" {
+		host = strings.TrimPrefix(strings.TrimPrefix(rawURL, "https://"), "http://")
+		if idx := strings.Index(host, "/"); idx >= 0 {
+			host = host[:idx]
+		}
+	}
+	const prefix = "boan-policy-server-"
+	if !strings.HasPrefix(host, prefix) {
+		return "", fmt.Errorf("URL 은 boan-policy-server-{org_id}- 형식이어야 합니다")
+	}
+	rest := strings.TrimPrefix(host, prefix)
+	// ".a.run.app" 또는 ".run.app" 제거.
+	rest = strings.TrimSuffix(rest, ".a.run.app")
+	rest = strings.TrimSuffix(rest, ".run.app")
+	// rest 예: "sds-corp-3avhtf4kka-du" 또는 "sds-corp-105340775837.asia-northeast3"
+	// `-` 와 `.` 로 분리하고, 첫번째 "해시스러운" 부분 직전까지를 org_id 로 간주.
+	parts := strings.FieldsFunc(rest, func(r rune) bool { return r == '-' || r == '.' })
+	for i, p := range parts {
+		if isHashLike(p) {
+			if i == 0 {
+				return "", fmt.Errorf("org_id 를 URL 에서 추출할 수 없습니다")
+			}
+			return strings.Join(parts[:i], "-"), nil
+		}
+	}
+	return "", fmt.Errorf("org_id 를 URL 에서 추출할 수 없습니다")
+}
+
+// isHashLike — Cloud Run 프로젝트 번호 (10+ digits) 또는 hash (9+ alphanumeric) 판별.
+// 단순히 "org_id 의 후보 부분은 아니다" 라고 구별 가능하도록.
+func isHashLike(s string) bool {
+	if len(s) < 9 {
+		return false
+	}
+	// 전부 숫자인가? (project number)
+	allDigits := true
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			allDigits = false
+			break
+		}
+	}
+	if allDigits && len(s) >= 10 {
+		return true
+	}
+	// 숫자가 포함된 10+ 영숫자 (hash)?
+	hasDigit := false
+	hasLetter := false
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			hasDigit = true
+		} else if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+			hasLetter = true
+		} else {
+			return false
+		}
+	}
+	return hasDigit && hasLetter && len(s) >= 9
 }

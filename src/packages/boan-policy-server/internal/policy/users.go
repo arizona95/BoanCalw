@@ -1,6 +1,8 @@
 package policy
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
@@ -10,6 +12,33 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 )
+
+// GenerateUserToken — 32 바이트 랜덤 hex 토큰.
+func GenerateUserToken() string {
+	b := make([]byte, 32)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// FindUserByToken — user_token 으로 user 조회. 없으면 nil.
+// 토큰 기반 인증 시 middleware 가 이걸로 user status/role 확인.
+func (s *Store) FindUserByToken(orgID, token string) (*OrgUser, error) {
+	if token == "" {
+		return nil, nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	users, err := s.loadUsers(orgID)
+	if err != nil {
+		return nil, err
+	}
+	for _, u := range users {
+		if u.UserToken != "" && u.UserToken == token {
+			return u, nil
+		}
+	}
+	return nil, nil
+}
 
 type UserStatus string
 
@@ -34,6 +63,10 @@ type OrgUser struct {
 	// RegisteredIP: TOFU (Trust On First Use) — 첫 로그인 시 자동 캡처, 이후 이 IP 에서만 로그인 허용.
 	// owner/user 구분 없이 동일 패턴. GCP 중앙 저장 → 모든 배포에서 일관.
 	RegisteredIP string `json:"registered_ip,omitempty"`
+	// UserToken: 가입 시 발급되는 user-specific bearer token.
+	// proxy 가 저장해서 이 user 가 속한 조직의 policy-server 요청에 Bearer 로 붙임.
+	// pending 상태일 때도 유효 — 승인 상태 polling 용. 승인 후엔 일반 API 사용.
+	UserToken string `json:"user_token,omitempty"`
 }
 
 type Workstation struct {
@@ -253,6 +286,24 @@ func (s *Store) CheckOrCaptureLoginIP(orgID, email, clientIP string) (bool, stri
 		return false, "ip_mismatch", u.RegisteredIP, nil
 	}
 	return false, "user_not_found", "", nil
+}
+
+// SetUserToken — user 의 UserToken 을 설정/재발급.
+func (s *Store) SetUserToken(orgID, email, token string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	users, err := s.loadUsers(orgID)
+	if err != nil {
+		return err
+	}
+	email = strings.TrimSpace(strings.ToLower(email))
+	for _, u := range users {
+		if u.Email == email {
+			u.UserToken = token
+			return s.saveUsers(orgID, users)
+		}
+	}
+	return ErrUserNotFound
 }
 
 // ResetUserIP — 관리자가 IP 재설정 (예: 사용자가 PC 교체 시).

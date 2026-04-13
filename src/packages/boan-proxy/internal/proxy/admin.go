@@ -2326,6 +2326,86 @@ func (s *Server) StartAdmin() {
 		})
 	})
 
+	// POST /api/auth/join-org — 한 줄 설치 후 사용자 가입 UX.
+	// 입력: {email, url} — 소유자가 알려준 조직서버 URL + 사용자 이메일.
+	// URL 에서 org_id 자동 파싱 → 공개 register → user_token 받아 orgs.json 저장.
+	mux.HandleFunc("/api/auth/join-org", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		if r.Method == http.MethodOptions {
+			w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		var joinBody struct {
+			Email string `json:"email"`
+			URL   string `json:"url"`
+		}
+		json.NewDecoder(r.Body).Decode(&joinBody)
+		joinBody.Email = strings.TrimSpace(strings.ToLower(joinBody.Email))
+		joinBody.URL = strings.TrimRight(strings.TrimSpace(joinBody.URL), "/")
+		if joinBody.Email == "" || joinBody.URL == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "조직서버 URL 과 이메일을 입력해주세요."})
+			return
+		}
+		if !s.authProv.ValidateEmailDomain(joinBody.Email) {
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]string{"error": "허용된 회사 이메일만 사용할 수 있습니다."})
+			return
+		}
+		parsedOrgID, parseErr := orgstore.ExtractOrgIDFromURL(joinBody.URL)
+		if parseErr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": parseErr.Error()})
+			return
+		}
+		payload, _ := json.Marshal(map[string]string{"email": joinBody.Email})
+		req, _ := http.NewRequest(http.MethodPost, joinBody.URL+"/org/"+parsedOrgID+"/v1/public/register-request", bytes.NewReader(payload))
+		req.Header.Set("Content-Type", "application/json")
+		httpClient := &http.Client{Timeout: 15 * time.Second}
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]string{"error": "조직서버 접속 실패: " + err.Error()})
+			return
+		}
+		defer resp.Body.Close()
+		var respBody struct {
+			Status    string `json:"status"`
+			Message   string `json:"message"`
+			UserToken string `json:"user_token"`
+			Error     string `json:"error"`
+		}
+		json.NewDecoder(resp.Body).Decode(&respBody)
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			w.WriteHeader(resp.StatusCode)
+			json.NewEncoder(w).Encode(map[string]string{"error": respBody.Error})
+			return
+		}
+		if err := s.orgs.Upsert(orgstore.Entry{
+			OrgID: parsedOrgID,
+			URL:   joinBody.URL,
+			Token: respBody.UserToken,
+			Label: parsedOrgID,
+		}); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "로컬 저장 실패: " + err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  respBody.Status,
+			"message": respBody.Message,
+			"org_id":  parsedOrgID,
+		})
+	})
+
 	mux.HandleFunc("/api/auth/register", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodOptions {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
