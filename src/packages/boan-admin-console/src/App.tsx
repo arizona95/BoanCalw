@@ -118,7 +118,7 @@ function Shell() {
         { path: "/my-gcp", label: "Personal Computer", icon: "🖥️" },
       ];
 
-  const fullBleed = location.pathname === "/my-boanclaw" || location.pathname === "/my-gcp";
+  const fullBleed = location.pathname === "/my-boanclaw" || location.pathname === "/my-gcp" || location.pathname === "/wiki-graph";
   // FileManager needs a wider content area — ~1.3x default max-w-7xl
   const wideContent = location.pathname === "/files";
   const showMyBoanClaw = location.pathname === "/my-boanclaw";

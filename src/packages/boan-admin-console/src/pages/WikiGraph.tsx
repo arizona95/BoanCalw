@@ -5,9 +5,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ReactFlow,
+  ReactFlowProvider,
   Background,
   Controls,
   MiniMap,
+  useReactFlow,
   type Node,
   type Edge,
   type NodeProps,
@@ -118,6 +120,38 @@ function renderContent(content: string, nodes: Map<string, WikiNode>, onClick: (
   }
   if (i < content.length) parts.push(content.slice(i));
   return <>{parts}</>;
+}
+
+// 노드 변경 시 fitView 자동 호출하는 inner 컴포넌트.
+function GraphCanvas({ flowNodes, flowEdges, onNodeClick, onPaneClick }: {
+  flowNodes: Node[]; flowEdges: Edge[]; onNodeClick: (id: string) => void; onPaneClick: () => void;
+}) {
+  const { fitView } = useReactFlow();
+  useEffect(() => {
+    if (flowNodes.length > 0) {
+      // 두 번 호출 — 한 번은 즉시(레이아웃 후), 한 번은 이미지/엣지 계산 후.
+      const t1 = setTimeout(() => fitView({ padding: 0.15, duration: 0, maxZoom: 4 }), 100);
+      const t2 = setTimeout(() => fitView({ padding: 0.15, duration: 400, maxZoom: 4 }), 500);
+      return () => { clearTimeout(t1); clearTimeout(t2); };
+    }
+  }, [flowNodes, fitView]);
+  return (
+    <ReactFlow
+      nodes={flowNodes}
+      edges={flowEdges}
+      nodeTypes={nodeTypes}
+      fitView
+      fitViewOptions={{ padding: 0.2 }}
+      minZoom={0.1}
+      maxZoom={3}
+      onNodeClick={(_, n) => onNodeClick(n.id)}
+      onPaneClick={onPaneClick}
+    >
+      <Background gap={16} />
+      <Controls />
+      <MiniMap pannable zoomable />
+    </ReactFlow>
+  );
 }
 
 // ── 메인 컴포넌트 ────────────────────────────────────────
@@ -257,7 +291,7 @@ export default function WikiGraph() {
   };
 
   return (
-    <div className="p-6 max-w-[1400px]">
+    <div className="p-4 w-full h-full flex flex-col min-h-0">
       <div className="flex items-center justify-between mb-3">
         <div>
           <h1 className="text-xl font-bold text-gray-800">G3 Wiki Graph</h1>
@@ -354,9 +388,9 @@ export default function WikiGraph() {
       {msg && <div className="mb-2 text-xs text-green-600 bg-green-50 border border-green-200 rounded px-2 py-1">{msg}</div>}
       {err && <div className="mb-2 text-xs text-red-600 bg-red-50 border border-red-200 rounded px-2 py-1">{err}</div>}
 
-      {/* 그래프 + drawer */}
-      <div className="flex gap-3">
-        <div className="flex-1 bg-white border border-gray-200 rounded-xl overflow-hidden" style={{ height: 650 }}>
+      {/* 그래프 + drawer — 남은 viewport 전부 채움 */}
+      <div className="flex gap-3 flex-1 min-h-0">
+        <div className="flex-1 bg-white border border-gray-200 rounded-xl overflow-hidden min-h-0">
           {loading ? (
             <div className="h-full flex items-center justify-center text-sm text-gray-400">로딩 중...</div>
           ) : flowNodes.length === 0 ? (
@@ -365,26 +399,20 @@ export default function WikiGraph() {
               <div className="text-xs">위 skill.wiki_edit 에 입력 넣고 실행하거나 "+ 노드" 로 수동 추가.</div>
             </div>
           ) : (
-            <ReactFlow
-              nodes={flowNodes}
-              edges={flowEdges}
-              nodeTypes={nodeTypes}
-              fitView
-              minZoom={0.3}
-              maxZoom={2}
-              onNodeClick={(_, n) => setSelected(n.id)}
-              onPaneClick={() => setSelected(null)}
-            >
-              <Background gap={16} />
-              <Controls />
-              <MiniMap pannable zoomable />
-            </ReactFlow>
+            <ReactFlowProvider>
+              <GraphCanvas
+                flowNodes={flowNodes}
+                flowEdges={flowEdges}
+                onNodeClick={(id) => setSelected(id)}
+                onPaneClick={() => setSelected(null)}
+              />
+            </ReactFlowProvider>
           )}
         </div>
 
         {/* drawer */}
         {selectedNode && (
-          <div className="w-96 bg-white border border-gray-200 rounded-xl p-4 overflow-y-auto" style={{ maxHeight: 650 }}>
+          <div className="w-96 bg-white border border-gray-200 rounded-xl p-4 overflow-y-auto min-h-0">
             <div className="flex items-start justify-between gap-2 mb-2">
               <h2 className="text-sm font-bold text-gray-800">{selectedNode.definition}</h2>
               <button
