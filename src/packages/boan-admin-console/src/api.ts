@@ -449,6 +449,20 @@ export interface SkillWikiEditResult {
   llm_raw?: string;
 }
 
+export interface DialogTurn {
+  role: "llm" | "human";
+  content: string;
+  examples?: string[];
+}
+
+export interface ClarificationDialog {
+  id?: string;
+  topic_node_id?: string;
+  turns: DialogTurn[];
+  started_at?: string;
+  ended_at?: string | null;
+}
+
 export const wikiGraphApi = {
   listNodes: () => request<WikiNode[]>("/api/wiki-graph/nodes"),
   getNode: (id: string) => request<WikiNode>(`/api/wiki-graph/nodes/${id}`),
@@ -469,6 +483,13 @@ export const wikiGraphApi = {
     request<WikiDecision>("/api/wiki-graph/decisions", { method: "POST", body: JSON.stringify(d) }),
   runWikiEdit: (d: WikiDecision) =>
     request<SkillWikiEditResult>("/api/wiki-graph/skill/wiki_edit", {
+      method: "POST",
+      body: JSON.stringify(d),
+    }),
+  listDialogs: (limit = 50) =>
+    request<ClarificationDialog[]>(`/api/wiki-graph/dialogs?limit=${limit}`),
+  upsertDialog: (d: ClarificationDialog) =>
+    request<ClarificationDialog>("/api/wiki-graph/dialogs", {
       method: "POST",
       body: JSON.stringify(d),
     }),

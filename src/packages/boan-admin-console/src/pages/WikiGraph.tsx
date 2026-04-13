@@ -24,6 +24,8 @@ import {
   type WikiNode,
   type WikiEdge,
   type WikiDecision,
+  type ClarificationDialog,
+  type DialogTurn,
 } from "../api";
 
 // ── relation 별 색상/스타일 ──────────────────────────────
@@ -175,7 +177,33 @@ export default function WikiGraph() {
   const [skillRunning, setSkillRunning] = useState(false);
 
   // Layout
-  const [direction, setDirection] = useState<"LR" | "TB">("TB");
+  const [direction, setDirection] = useState<"LR" | "TB">("LR");
+
+  // Tab + raw data + dialog
+  type Tab = "graph" | "raw" | "dialog";
+  const [tab, setTab] = useState<Tab>("graph");
+  const [decisions, setDecisions] = useState<WikiDecision[]>([]);
+  const [dialogs, setDialogs] = useState<ClarificationDialog[]>([]);
+  const [activeDialog, setActiveDialog] = useState<string | null>(null);
+  const [userMsg, setUserMsg] = useState("");
+  const [newDialogTopic, setNewDialogTopic] = useState("");
+
+  const loadRaw = useCallback(async () => {
+    try {
+      const [ds, dlgs] = await Promise.all([
+        wikiGraphApi.listDecisions(200),
+        wikiGraphApi.listDialogs(100),
+      ]);
+      setDecisions(ds);
+      setDialogs(dlgs);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    }
+  }, []);
+
+  useEffect(() => {
+    if (tab === "raw" || tab === "dialog") loadRaw();
+  }, [tab, loadRaw]);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -290,41 +318,92 @@ export default function WikiGraph() {
     }
   };
 
+  const appendTurn = async (dialogID: string, role: "human" | "llm", content: string) => {
+    const d = dialogs.find((x) => x.id === dialogID);
+    if (!d) return;
+    const next: ClarificationDialog = {
+      ...d,
+      turns: [...d.turns, { role, content }],
+    };
+    await wikiGraphApi.upsertDialog(next);
+    loadRaw();
+  };
+
+  const createDialog = async () => {
+    const dlg = await wikiGraphApi.upsertDialog({
+      topic_node_id: newDialogTopic || undefined,
+      turns: [{ role: "human", content: "대화 시작" }],
+    });
+    setActiveDialog(dlg.id ?? null);
+    setNewDialogTopic("");
+    loadRaw();
+  };
+
   return (
-    <div className="p-4 w-full h-full flex flex-col min-h-0">
-      <div className="flex items-center justify-between mb-3">
-        <div>
-          <h1 className="text-xl font-bold text-gray-800">G3 Wiki Graph</h1>
-          <p className="text-xs text-gray-500 mt-1">
-            LLM 이 HITL 결정을 보고 자발적으로 편집하는 지식 그래프. 노드 = 생각, 엣지 = 관계.
-          </p>
+    <div className="flex-1 h-full flex flex-col min-h-0 min-w-0">
+      {/* 상단 타이틀 + 탭 + 컨트롤 */}
+      <div className="px-4 pt-3 pb-2 border-b border-gray-200 bg-white/60 backdrop-blur">
+        <div className="flex items-center justify-between gap-4">
+          <div className="min-w-0">
+            <h1 className="text-lg font-bold text-gray-800">G3 Wiki Graph</h1>
+            <p className="text-[11px] text-gray-500 mt-0.5 truncate">
+              LLM 이 HITL 결정을 보고 자발적으로 편집하는 지식 그래프 + raw 데이터 + LLM↔사용자 대화
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            {tab === "graph" && (
+              <>
+                <select
+                  value={direction}
+                  onChange={(e) => setDirection(e.target.value as "LR" | "TB")}
+                  className="text-xs border border-gray-300 rounded px-2 py-1"
+                >
+                  <option value="LR">가로 배치</option>
+                  <option value="TB">세로 배치</option>
+                </select>
+                <button
+                  onClick={() => setShowCreate(!showCreate)}
+                  className="text-xs px-3 py-1.5 border border-gray-300 rounded hover:bg-gray-50"
+                >
+                  {showCreate ? "취소" : "+ 노드"}
+                </button>
+              </>
+            )}
+            <button
+              onClick={() => { load(); loadRaw(); }}
+              className="text-xs px-3 py-1.5 border border-gray-300 rounded hover:bg-gray-50"
+            >
+              ↻ 새로고침
+            </button>
+          </div>
         </div>
-        <div className="flex gap-2">
-          <select
-            value={direction}
-            onChange={(e) => setDirection(e.target.value as "LR" | "TB")}
-            className="text-xs border border-gray-300 rounded px-2 py-1"
-          >
-            <option value="TB">세로 배치</option>
-            <option value="LR">가로 배치</option>
-          </select>
-          <button
-            onClick={() => setShowCreate(!showCreate)}
-            className="text-xs px-3 py-1.5 border border-gray-300 rounded hover:bg-gray-50"
-          >
-            {showCreate ? "취소" : "+ 노드"}
-          </button>
-          <button
-            onClick={load}
-            className="text-xs px-3 py-1.5 border border-gray-300 rounded hover:bg-gray-50"
-          >
-            ↻ 새로고침
-          </button>
+        {/* 탭 */}
+        <div className="flex gap-1 mt-2 -mb-2">
+          {([
+            { id: "graph",  label: `🕸️ Graph (${nodes.length})` },
+            { id: "raw",    label: `📋 Raw 결정 (${decisions.length})` },
+            { id: "dialog", label: `💬 LLM 대화 (${dialogs.length})` },
+          ] as const).map((t) => (
+            <button
+              key={t.id}
+              onClick={() => setTab(t.id)}
+              className={`px-3 py-1.5 text-xs font-medium border-b-2 -mb-px transition-colors ${
+                tab === t.id
+                  ? "border-boan-600 text-boan-700"
+                  : "border-transparent text-gray-500 hover:text-gray-700"
+              }`}
+            >
+              {t.label}
+            </button>
+          ))}
         </div>
       </div>
 
+      {/* 이 아래는 탭 별 본문 wrapper */}
+      <div className="flex-1 min-h-0 flex flex-col p-3 gap-3">
+      {tab === "graph" && (<>
       {/* skill.wiki_edit 테스트 */}
-      <div className="mb-3 bg-gradient-to-r from-purple-50 to-blue-50 border border-purple-200 rounded-lg p-3">
+      <div className="bg-gradient-to-r from-purple-50 to-blue-50 border border-purple-200 rounded-lg p-3">
         <div className="text-xs font-medium text-gray-700 mb-1.5">⚡ skill.wiki_edit 수동 실행 (LLM 이 그래프 편집)</div>
         <div className="flex gap-2">
           <select
@@ -476,7 +555,7 @@ export default function WikiGraph() {
       </div>
 
       {/* 범례 */}
-      <div className="mt-3 flex flex-wrap gap-3 text-[10px] text-gray-500">
+      <div className="flex flex-wrap gap-3 text-[10px] text-gray-500">
         <span className="font-semibold">관계:</span>
         {Object.entries(RELATION_STYLES).map(([k, v]) => (
           <span key={k} className="flex items-center gap-1">
@@ -484,6 +563,184 @@ export default function WikiGraph() {
             {v.label}
           </span>
         ))}
+      </div>
+      </>)}
+
+      {/* ── Raw 결정 탭 ── */}
+      {tab === "raw" && (
+        <div className="flex-1 min-h-0 bg-white border border-gray-200 rounded-xl overflow-hidden flex flex-col">
+          <div className="px-3 py-2 border-b border-gray-100 text-xs text-gray-500 flex-shrink-0">
+            HITL approve/deny 라벨 이력 (최근 200건) — LLM 이 관찰하는 원시 데이터
+          </div>
+          <div className="flex-1 overflow-y-auto">
+            <table className="w-full text-xs">
+              <thead className="bg-gray-50 border-b border-gray-200 sticky top-0">
+                <tr>
+                  <th className="text-left px-3 py-2 font-semibold text-gray-500 w-32">시각</th>
+                  <th className="text-left px-3 py-2 font-semibold text-gray-500 w-20">결정</th>
+                  <th className="text-left px-3 py-2 font-semibold text-gray-500 w-28">이유</th>
+                  <th className="text-left px-3 py-2 font-semibold text-gray-500">입력 원문</th>
+                  <th className="text-left px-3 py-2 font-semibold text-gray-500 w-24">라벨러</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {decisions.length === 0 ? (
+                  <tr><td colSpan={5} className="text-center py-8 text-gray-400">아직 라벨링된 결정이 없습니다.</td></tr>
+                ) : decisions.map((d, i) => (
+                  <tr key={d.id ?? i} className={d.decision === "deny" ? "bg-red-50/30" : "bg-green-50/30"}>
+                    <td className="px-3 py-1.5 text-gray-400 font-mono whitespace-nowrap">
+                      {d.timestamp ? new Date(d.timestamp).toLocaleString("ko-KR", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "-"}
+                    </td>
+                    <td className="px-3 py-1.5">
+                      <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded ${
+                        d.decision === "approve" ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"
+                      }`}>
+                        {d.decision}
+                      </span>
+                    </td>
+                    <td className="px-3 py-1.5 text-gray-600 truncate max-w-[180px]" title={d.reason}>
+                      {d.reason || "-"}
+                    </td>
+                    <td className="px-3 py-1.5 text-gray-700 font-mono truncate max-w-[600px]" title={d.input}>
+                      {d.input}
+                    </td>
+                    <td className="px-3 py-1.5 text-gray-400">{d.labeler || "-"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* ── LLM↔Human 대화 탭 ── */}
+      {tab === "dialog" && (
+        <div className="flex-1 min-h-0 flex gap-3">
+          {/* 좌측: 대화 목록 */}
+          <div className="w-72 bg-white border border-gray-200 rounded-xl flex flex-col overflow-hidden">
+            <div className="px-3 py-2 border-b border-gray-100 flex items-center gap-2">
+              <input
+                value={newDialogTopic}
+                onChange={(e) => setNewDialogTopic(e.target.value)}
+                placeholder="주제 노드 ID (선택)"
+                className="flex-1 text-xs border border-gray-200 rounded px-2 py-1 font-mono"
+              />
+              <button
+                onClick={createDialog}
+                className="text-xs px-2 py-1 bg-boan-600 text-white rounded hover:bg-boan-700"
+              >
+                + 대화
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto divide-y divide-gray-100">
+              {dialogs.length === 0 ? (
+                <div className="p-4 text-center text-xs text-gray-400">대화 없음</div>
+              ) : dialogs.map((d) => (
+                <button
+                  key={d.id}
+                  onClick={() => setActiveDialog(d.id ?? null)}
+                  className={`w-full text-left px-3 py-2 hover:bg-gray-50 ${
+                    activeDialog === d.id ? "bg-boan-50" : ""
+                  }`}
+                >
+                  <div className="text-xs font-medium text-gray-700 truncate">
+                    {d.turns[0]?.content.slice(0, 40) ?? "(비어있음)"}
+                  </div>
+                  <div className="text-[10px] text-gray-400 mt-0.5 flex justify-between">
+                    <span>{d.turns.length} 턴</span>
+                    <span>{d.started_at ? new Date(d.started_at).toLocaleString("ko-KR", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : ""}</span>
+                  </div>
+                  {d.topic_node_id && (
+                    <div className="text-[10px] text-boan-600 font-mono mt-0.5">🔗 {d.topic_node_id.slice(0, 24)}</div>
+                  )}
+                </button>
+              ))}
+            </div>
+          </div>
+          {/* 우측: 대화 본문 */}
+          <div className="flex-1 bg-white border border-gray-200 rounded-xl flex flex-col overflow-hidden">
+            {activeDialog ? (() => {
+              const d = dialogs.find((x) => x.id === activeDialog);
+              if (!d) return <div className="p-6 text-sm text-gray-400">대화를 찾을 수 없음</div>;
+              return <>
+                <div className="px-4 py-2 border-b border-gray-100 flex items-center justify-between">
+                  <div className="text-xs text-gray-500">
+                    {d.turns.length} 턴 · 시작 {d.started_at ? new Date(d.started_at).toLocaleString("ko-KR") : "-"}
+                  </div>
+                  {d.topic_node_id && (
+                    <button
+                      onClick={() => { setSelected(d.topic_node_id!); setTab("graph"); }}
+                      className="text-[11px] text-boan-600 hover:underline font-mono"
+                    >
+                      🔗 노드로 이동: {d.topic_node_id.slice(0, 20)}
+                    </button>
+                  )}
+                </div>
+                <div className="flex-1 overflow-y-auto p-4 space-y-3">
+                  {d.turns.map((t, i) => (
+                    <DialogTurnView key={i} turn={t} />
+                  ))}
+                </div>
+                <div className="border-t border-gray-100 p-3 flex gap-2">
+                  <textarea
+                    value={userMsg}
+                    onChange={(e) => setUserMsg(e.target.value)}
+                    placeholder="사용자 답변을 여기에 입력..."
+                    rows={2}
+                    className="flex-1 text-xs border border-gray-200 rounded px-2 py-1 resize-none"
+                  />
+                  <button
+                    disabled={!userMsg.trim()}
+                    onClick={async () => {
+                      await appendTurn(d.id!, "human", userMsg.trim());
+                      setUserMsg("");
+                    }}
+                    className="text-xs px-4 py-1 bg-boan-600 text-white rounded hover:bg-boan-700 disabled:opacity-40 self-end"
+                  >
+                    답변
+                  </button>
+                </div>
+              </>;
+            })() : (
+              <div className="flex-1 flex items-center justify-center text-sm text-gray-400">
+                좌측에서 대화를 선택하거나 "+ 대화" 로 새로 시작
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      </div>
+    </div>
+  );
+}
+
+// ── DialogTurn 렌더 ────────────────────────────────────
+function DialogTurnView({ turn }: { turn: DialogTurn }) {
+  const isLLM = turn.role === "llm";
+  return (
+    <div className={`flex ${isLLM ? "justify-start" : "justify-end"}`}>
+      <div
+        className={`max-w-[80%] rounded-lg px-3 py-2 text-xs ${
+          isLLM ? "bg-boan-50 border border-boan-200 text-gray-800" : "bg-boan-600 text-white"
+        }`}
+      >
+        <div className={`text-[10px] font-semibold mb-1 ${isLLM ? "text-boan-700" : "text-boan-100"}`}>
+          {isLLM ? "🤖 LLM" : "👤 사람"}
+        </div>
+        <div className="whitespace-pre-wrap leading-relaxed">{turn.content}</div>
+        {turn.examples && turn.examples.length > 0 && (
+          <div className="mt-2 pt-2 border-t border-white/20">
+            <div className="text-[10px] font-semibold mb-1 opacity-70">예시:</div>
+            <ul className="space-y-1">
+              {turn.examples.map((ex, i) => (
+                <li key={i} className="text-[11px] font-mono opacity-90 pl-2 border-l-2 border-white/30">
+                  {ex}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
       </div>
     </div>
   );

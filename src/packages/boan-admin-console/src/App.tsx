@@ -224,7 +224,7 @@ function Shell() {
         )}
         <div className={fullBleed ? "flex-1 flex min-h-0" : wideContent ? "p-8 w-full max-w-[104rem] mx-auto" : "p-8 max-w-7xl mx-auto"}>
           {/* 일반 라우트 */}
-          <div className={showPersistentSurface ? "hidden" : "h-full"}>
+          <div className={showPersistentSurface ? "hidden" : fullBleed ? "h-full flex-1 flex min-w-0" : "h-full"}>
             <Routes>
               {/* default landing — owner: LLM Registry, viewer: org-overview */}
               <Route path="/" element={canEdit ? <Navigate to="/llm-registry" replace /> : <Navigate to="/org-overview" replace />} />
