@@ -502,45 +502,30 @@ func (s *Server) StartAdmin() {
 
 	deviceLockedMessage := "이 PC는 이미 다른 사용자 계정에 연결되어 있습니다. 소유자 계정은 로그인할 수 있지만, 사용자 계정은 한 PC당 1개만 사용할 수 있습니다."
 
-	// IP 바인딩은 GCP org-server 에 중앙 관리됨 (TOFU: Trust On First Use).
-	// 첫 로그인 시 client IP 가 자동으로 저장되고, 이후 로그인은 그 IP 에서만 허용.
-	// owner/user 구분 없이 동일 로직. 여러 배포가 있어도 GCP 한 곳에서 일관됨.
-	// 관리자가 IP 재설정 필요시: POST /org/{id}/v1/users/reset-ip
+	// 설치 바인딩 (TOFU: Trust On First Use).
+	// 이전엔 client IP 로 바인딩했으나 Docker 의 userland-proxy 가 source IP 를 bridge gateway 로
+	// 재작성해서 모든 사용자가 172.x 로 나오는 문제가 있었음. 대신 설치 시 자동 생성되는
+	// /data/users/machine_id (32-hex 랜덤) 를 바인딩 키로 사용 — Docker NAT 와 무관한 안정적 식별자.
+	// 관리자 리셋: POST /org/{id}/v1/users/reset-ip
 
-	extractClientIP := func(r *http.Request) string {
-		clientIP := r.Header.Get("X-Forwarded-For")
-		if clientIP == "" {
-			clientIP = r.Header.Get("X-Real-IP")
-		}
-		if clientIP == "" {
-			clientIP = r.RemoteAddr
-		}
-		if idx := strings.Index(clientIP, ","); idx > 0 {
-			clientIP = strings.TrimSpace(clientIP[:idx])
-		}
-		if idx := strings.LastIndex(clientIP, ":"); idx > 0 {
-			clientIP = clientIP[:idx]
-		}
-		return clientIP
-	}
-
-	// checkLoginIP — GCP org-server 에 TOFU IP 검증 요청.
+	// checkLoginIP — GCP org-server 에 TOFU 바인딩 검증 요청.
+	// 바인딩 값은 이 proxy 의 machine_id (설치 고유 ID).
 	// fail-closed: org-server 불통 시 로그인 차단.
 	checkLoginIP := func(email, orgID string, r *http.Request) (bool, string) {
-		clientIP := extractClientIP(r)
+		_ = r // 이전 signature 유지 (호출부 수정 최소화)
 		targetOrg := orgID
 		if targetOrg == "" {
 			targetOrg = defaultOrgID
 		}
-		allowed, reason, err := s.orgs.ClientFor(targetOrg).CheckLoginIP(targetOrg, email, clientIP)
+		allowed, reason, err := s.orgs.ClientFor(targetOrg).CheckLoginIP(targetOrg, email, machineID)
 		if err != nil {
-			log.Printf("[login-ip] org-server error for %s from %s: %v", email, clientIP, err)
+			log.Printf("[login-binding] org-server error for %s from install %s: %v", email, machineID, err)
 			return false, "조직 서버 연결 실패 — 관리자에게 문의하세요."
 		}
 		if !allowed {
-			log.Printf("[login-ip] blocked %s from IP %s (reason: %s)", email, clientIP, reason)
+			log.Printf("[login-binding] blocked %s from install %s (reason: %s)", email, machineID, reason)
 			if reason == "ip_mismatch" {
-				return false, "등록된 IP 에서만 로그인할 수 있습니다."
+				return false, "다른 PC 에서만 로그인 가능 — 본 PC 는 등록된 설치가 아닙니다."
 			}
 			if reason == "user_not_found" {
 				return false, "" // caller 가 별도 처리 (remote register 등)
@@ -548,7 +533,7 @@ func (s *Server) StartAdmin() {
 			return false, "로그인이 허용되지 않았습니다."
 		}
 		if reason == "captured" {
-			log.Printf("[login-ip] captured IP %s for %s (first login — TOFU)", clientIP, email)
+			log.Printf("[login-binding] captured install %s for %s (first login — TOFU)", machineID, email)
 		}
 		return true, ""
 	}

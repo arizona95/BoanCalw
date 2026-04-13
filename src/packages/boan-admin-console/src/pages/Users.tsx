@@ -91,7 +91,7 @@ export default function Users() {
                 <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500">권한</th>
                 <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500">조직</th>
                 <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500">상태</th>
-                <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500">등록 IP</th>
+                <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500">바인딩 PC</th>
                 <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500">가입일</th>
                 <th className="text-right px-4 py-3 text-xs font-semibold text-gray-500">관리</th>
               </tr>
@@ -132,8 +132,12 @@ export default function Users() {
                       </span>
                     )}
                   </td>
-                  <td className="px-4 py-3 text-xs font-mono text-gray-500">
-                    {u.registered_ip || <span className="text-gray-300">-</span>}
+                  <td className="px-4 py-3 text-xs font-mono text-gray-500" title={u.registered_ip ?? ""}>
+                    {u.registered_ip
+                      ? u.registered_ip.length > 16
+                        ? `${u.registered_ip.slice(0, 8)}…${u.registered_ip.slice(-4)}`
+                        : u.registered_ip
+                      : <span className="text-gray-300">-</span>}
                   </td>
                   <td className="px-4 py-3 text-xs text-gray-400">{u.created_at}</td>
                   <td className="px-4 py-3 text-right">
