@@ -54,6 +54,7 @@ type Server struct {
 	wikiGuardrail *GuardrailEvaluator
 	trainingLog   *HITLTrainingLog
 	wikiStore     *WikiStore
+	wikiGraph     *policy.WikiGraphStore
 }
 
 type checkinRequest struct {
@@ -94,6 +95,7 @@ func New(cfg Config) *Server {
 		wikiGuardrail: NewGuardrailEvaluator(cfg.WikiLLMURL, cfg.WikiLLMModel, cfg.WikiLLMKey),
 		trainingLog:   NewHITLTrainingLog(trainingLogPath),
 		wikiStore:     NewWikiStore(cfg.DataDir),
+		wikiGraph:     policy.NewWikiGraphStore(cfg.DataDir),
 	}
 }
 
@@ -212,6 +214,36 @@ func (s *Server) handleOrg(w http.ResponseWriter, r *http.Request) {
 		s.checkLoginIP(w, r, orgID)
 	case rest == "v1/public/register-request" && r.Method == http.MethodPost:
 		s.publicRegisterRequest(w, r, orgID)
+
+	// ── Wiki Graph: primitive tools (Layer A) ─────────────────────────
+	// LLM 이 자유롭게 조합해서 그래프를 편집할 수 있는 원시 API.
+	// 노드 역할/타입은 하드코드 안 함 — 순수 그래프.
+	case rest == "v1/wiki-graph/nodes" && r.Method == http.MethodGet:
+		s.wgListNodes(w, orgID)
+	case rest == "v1/wiki-graph/nodes" && r.Method == http.MethodPost:
+		s.wgCreateNode(w, r, orgID)
+	case strings.HasPrefix(rest, "v1/wiki-graph/nodes/") && r.Method == http.MethodGet:
+		s.wgGetNode(w, orgID, strings.TrimPrefix(rest, "v1/wiki-graph/nodes/"))
+	case strings.HasPrefix(rest, "v1/wiki-graph/nodes/") && r.Method == http.MethodPatch:
+		s.wgUpdateNode(w, r, orgID, strings.TrimPrefix(rest, "v1/wiki-graph/nodes/"))
+	case strings.HasPrefix(rest, "v1/wiki-graph/nodes/") && r.Method == http.MethodDelete:
+		s.wgDeleteNode(w, orgID, strings.TrimPrefix(rest, "v1/wiki-graph/nodes/"))
+	case rest == "v1/wiki-graph/edges" && r.Method == http.MethodGet:
+		s.wgListEdges(w, orgID)
+	case rest == "v1/wiki-graph/edges" && r.Method == http.MethodPost:
+		s.wgCreateEdge(w, r, orgID)
+	case strings.HasPrefix(rest, "v1/wiki-graph/edges/") && r.Method == http.MethodPatch:
+		s.wgUpdateEdge(w, r, orgID, strings.TrimPrefix(rest, "v1/wiki-graph/edges/"))
+	case strings.HasPrefix(rest, "v1/wiki-graph/edges/") && r.Method == http.MethodDelete:
+		s.wgDeleteEdge(w, orgID, strings.TrimPrefix(rest, "v1/wiki-graph/edges/"))
+	case rest == "v1/wiki-graph/decisions" && r.Method == http.MethodGet:
+		s.wgListDecisions(w, r, orgID)
+	case rest == "v1/wiki-graph/decisions" && r.Method == http.MethodPost:
+		s.wgAppendDecision(w, r, orgID)
+	case rest == "v1/wiki-graph/dialogs" && r.Method == http.MethodGet:
+		s.wgListDialogs(w, r, orgID)
+	case rest == "v1/wiki-graph/dialogs" && r.Method == http.MethodPost:
+		s.wgUpsertDialog(w, r, orgID)
 	case rest == "v1/users/reset-ip" && r.Method == http.MethodPost:
 		s.resetUserIP(w, r, orgID)
 	case rest == "v1/policy" && r.Method == http.MethodGet:
