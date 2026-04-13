@@ -116,7 +116,18 @@ export default function Policies() {
         } else {
           // 최초 로드 — 정책에 아무것도 없으면 서버에서 받은 기본 시드를 편집 가능한 행으로 펼침.
           // 각 시드는 {pattern, replacement, description, mode} 구조로, 한 줄 = 한 가지 감지 대상.
-          setG1Rows((g1.patterns ?? []).map((d) => makeG1Row(d)));
+          setG1Rows(
+            (g1.patterns ?? []).map((d) =>
+              makeG1Row({
+                pattern: d.pattern,
+                description: d.description,
+                replacement: d.replacement,
+                mode: (d.mode === "redact" || d.mode === "credential" || d.mode === "block")
+                  ? d.mode
+                  : "redact",
+              })
+            )
+          );
         }
         setConstitution(p.guardrail?.constitution ?? "");
         setG3WikiHint(p.guardrail?.g3_wiki_hint ?? "");

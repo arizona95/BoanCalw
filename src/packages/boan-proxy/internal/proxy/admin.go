@@ -3295,6 +3295,39 @@ func (s *Server) StartAdmin() {
 		}
 	}
 
+	// ── Wiki Graph pass-through (Layer A primitive API) ──────────────
+	// /api/wiki-graph/* → policy-server 의 /org/{id}/v1/wiki-graph/*
+	// Owner 권한 필요 (admin session).
+	mux.HandleFunc("/api/wiki-graph/", func(w http.ResponseWriter, r *http.Request) {
+		if cors(w, r) {
+			return
+		}
+		orgID := resolveOrg(r)
+		orgURL := policyBase
+		if entry, ok := s.orgs.Resolve(orgID); ok && entry.URL != "" {
+			orgURL = entry.URL
+		}
+		suffix := strings.TrimPrefix(r.URL.Path, "/api/wiki-graph/")
+		target := orgURL + "/org/" + orgID + "/v1/wiki-graph/" + suffix
+		if r.URL.RawQuery != "" {
+			target += "?" + r.URL.RawQuery
+		}
+		req, _ := http.NewRequestWithContext(r.Context(), r.Method, target, r.Body)
+		req.Header.Set("Content-Type", "application/json")
+		attachOrgAuth(req, orgID)
+		resp, err := client.Do(req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.WriteHeader(resp.StatusCode)
+		w.Write(raw)
+	})
+
 	mux.HandleFunc("/api/policy/", func(w http.ResponseWriter, r *http.Request) {
 		if cors(w, r) {
 			return

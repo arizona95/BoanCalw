@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -50,7 +51,9 @@ type WikiEdge struct {
 	From     string  `json:"from"`
 	To       string  `json:"to"`
 	Relation string  `json:"relation"`
-	Weight   float32 `json:"weight,omitempty"`
+	// Reason — 왜 이 엣지가 생겼는지. inline_ref 의 경우 [[id|reason]] 의 reason.
+	Reason string  `json:"reason,omitempty"`
+	Weight float32 `json:"weight,omitempty"`
 }
 
 // DecisionLog — approve/deny 라벨.
@@ -121,7 +124,6 @@ func (s *WikiGraphStore) UpsertNode(orgID string, n *WikiNode) error {
 		return ErrContentTooLong
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	now := time.Now().UTC()
 	if n.CreatedAt.IsZero() {
 		n.CreatedAt = now
@@ -130,7 +132,14 @@ func (s *WikiGraphStore) UpsertNode(orgID string, n *WikiNode) error {
 	if n.ID == "" {
 		n.ID = generateID("n")
 	}
-	return writeJSON(filepath.Join(s.orgDir(orgID), "nodes", n.ID+".json"), n)
+	if err := writeJSON(filepath.Join(s.orgDir(orgID), "nodes", n.ID+".json"), n); err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	s.mu.Unlock()
+	// inline link 동기화 (별도 lock 사용하므로 해제 후 호출).
+	_, _, _ = s.SyncInlineLinks(orgID, n.ID, n.Content)
+	return nil
 }
 
 func (s *WikiGraphStore) GetNode(orgID, id string) (*WikiNode, error) {
@@ -307,6 +316,106 @@ func (s *WikiGraphStore) ListDialogs(orgID string, limit int) ([]ClarificationDi
 		out = out[:limit]
 	}
 	return out, nil
+}
+
+// ── Inline link 파싱 ────────────────────────────────────
+//
+// Notion 스타일 inline link:
+//   [[node_id]]            — 단순 링크
+//   [[node_id|링크 이유]]  — 이 링크가 왜 생겼는지 맥락
+//
+// 노드 저장 시 content 를 파싱해서 자동으로 edge(relation="inline_ref") 동기화.
+// 이전 inline 링크 집합과 비교해 없어진 건 edge 삭제, 새로 생긴 건 edge 추가.
+
+var inlineLinkRegex = regexp.MustCompile(`\[\[([a-zA-Z0-9_\-]+)(?:\|([^\]]*))?\]\]`)
+
+type InlineLink struct {
+	TargetID string
+	Reason   string
+}
+
+// ParseInlineLinks — content 에서 [[id|reason]] 추출.
+func ParseInlineLinks(content string) []InlineLink {
+	matches := inlineLinkRegex.FindAllStringSubmatch(content, -1)
+	out := make([]InlineLink, 0, len(matches))
+	seen := make(map[string]bool) // 같은 target 중복은 첫 번째만 반영
+	for _, m := range matches {
+		target := m[1]
+		if seen[target] {
+			continue
+		}
+		seen[target] = true
+		reason := ""
+		if len(m) > 2 {
+			reason = m[2]
+		}
+		out = append(out, InlineLink{TargetID: target, Reason: reason})
+	}
+	return out
+}
+
+// SyncInlineLinks — 노드 저장 후 호출: 이 노드의 inline_ref edge 를 content 와 동기화.
+// 기존 inline_ref edge 중 content 에 없는 건 삭제, content 에 있는 새 것은 추가.
+// 반환: (added, removed) 개수.
+func (s *WikiGraphStore) SyncInlineLinks(orgID, nodeID, content string) (int, int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	parsed := ParseInlineLinks(content)
+	parsedMap := make(map[string]string, len(parsed))
+	for _, p := range parsed {
+		parsedMap[p.TargetID] = p.Reason
+	}
+
+	// 기존 inline_ref edge 수집.
+	allEdges, err := s.listEdgesLocked(orgID)
+	if err != nil {
+		return 0, 0, err
+	}
+	existingInline := make(map[string]*WikiEdge) // target -> edge
+	for i := range allEdges {
+		e := &allEdges[i]
+		if e.From == nodeID && e.Relation == "inline_ref" {
+			existingInline[e.To] = e
+		}
+	}
+
+	added, removed := 0, 0
+	// 없어진 것 삭제.
+	for target, e := range existingInline {
+		if _, stillThere := parsedMap[target]; !stillThere {
+			_ = os.Remove(filepath.Join(s.orgDir(orgID), "edges", e.ID+".json"))
+			removed++
+		}
+	}
+	// 새로 생긴 것 추가 (reason 바뀐 경우도 업데이트).
+	for target, reason := range parsedMap {
+		// 대상 노드 존재 여부 확인 — 없으면 skip (dangling link 는 edge 안 만듦)
+		if _, err := os.Stat(filepath.Join(s.orgDir(orgID), "nodes", target+".json")); err != nil {
+			continue
+		}
+		if e, exists := existingInline[target]; exists {
+			// reason 변경되면 업데이트
+			if e.Relation == "inline_ref" {
+				// weight 슬롯에 reason 해시를 넣진 않고, 간단히 edge 재저장.
+				// 현재 WikiEdge 에 reason 필드 없음 — 별도 meta 로 확장 가능하지만
+				// 일단 inline_ref 는 relation 으로만 식별, reason 은 content 원문에 있음.
+				_ = e
+			}
+			continue
+		}
+		newEdge := WikiEdge{
+			ID:       generateID("e"),
+			From:     nodeID,
+			To:       target,
+			Relation: "inline_ref",
+			Reason:   reason,
+		}
+		if err := writeJSON(filepath.Join(s.orgDir(orgID), "edges", newEdge.ID+".json"), &newEdge); err == nil {
+			added++
+		}
+	}
+	return added, removed, nil
 }
 
 // ── Helpers ──────────────────────────────────────────────
