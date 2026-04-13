@@ -2,23 +2,24 @@ import { useState, useEffect } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import Users from "./Users";
 import SSOSettings from "./SSOSettings";
+import OrgRegistry from "./OrgRegistry";
 
-// Authorization — Users 와 SSO 를 묶은 통합 화면.
-// URL pattern: /authorization?tab=users (default) | /authorization?tab=sso
-// 기존 /users / /sso URL 도 redirect 로 보존.
-type Tab = "users" | "sso";
+// Authorization — Users, SSO, Orgs 통합 화면.
+// URL pattern: /authorization?tab=users (default) | tab=sso | tab=orgs
+type Tab = "users" | "sso" | "orgs";
 
 export default function Authorization() {
   const location = useLocation();
   const navigate = useNavigate();
   const params = new URLSearchParams(location.search);
-  const initialTab: Tab = params.get("tab") === "sso" ? "sso" : "users";
+  const initialTab: Tab = ["sso", "orgs"].includes(params.get("tab") ?? "")
+    ? (params.get("tab") as Tab)
+    : "users";
   const [tab, setTab] = useState<Tab>(initialTab);
 
-  // URL 의 tab 파라미터 변경 시 동기화
   useEffect(() => {
     const t = new URLSearchParams(location.search).get("tab");
-    if (t === "sso" || t === "users") setTab(t);
+    if (t === "sso" || t === "users" || t === "orgs") setTab(t);
   }, [location.search]);
 
   const switchTab = (next: Tab) => {
@@ -37,6 +38,7 @@ export default function Authorization() {
         {([
           { id: "users", label: "👥 Users", desc: "조직 멤버 + 권한" },
           { id: "sso", label: "🔐 SSO", desc: "OTP / OAuth 등 인증 공급자" },
+          { id: "orgs", label: "🏢 조직", desc: "연결된 조직서버 (URL + 토큰)" },
         ] as const).map((t) => (
           <button
             key={t.id}
@@ -53,7 +55,7 @@ export default function Authorization() {
         ))}
       </div>
 
-      {tab === "users" ? <Users /> : <SSOSettings />}
+      {tab === "users" ? <Users /> : tab === "sso" ? <SSOSettings /> : <OrgRegistry />}
     </div>
   );
 }

@@ -2130,6 +2130,7 @@ func (s *Server) StartAdmin() {
 
 		var body struct {
 			Email string `json:"email"`
+			OrgID string `json:"org_id"` // multi-org: 로그인하려는 조직 선택
 		}
 		json.NewDecoder(r.Body).Decode(&body)
 		if body.Email == "" {
@@ -2152,7 +2153,7 @@ func (s *Server) StartAdmin() {
 			if isOwner {
 				loginType = "test_owner"
 			}
-			roleVal, orgID, allowed, pendingMsg, err := resolveLoginAccess(body.Email, body.Email, loginType, "", r)
+			roleVal, orgID, allowed, pendingMsg, err := resolveLoginAccess(body.Email, body.Email, loginType, body.OrgID, r)
 			if err != nil {
 				w.WriteHeader(http.StatusBadGateway)
 				json.NewEncoder(w).Encode(map[string]string{"error": "조직 서버 저장 실패: " + err.Error()})
@@ -2224,6 +2225,7 @@ func (s *Server) StartAdmin() {
 		var body struct {
 			Email string `json:"email"`
 			Code  string `json:"code"`
+			OrgID string `json:"org_id"`
 		}
 		json.NewDecoder(r.Body).Decode(&body)
 
@@ -2239,7 +2241,7 @@ func (s *Server) StartAdmin() {
 			return
 		}
 
-		roleVal, orgID, allowed, pendingMsg, err := resolveLoginAccess(body.Email, body.Email, "email_otp", "", r)
+		roleVal, orgID, allowed, pendingMsg, err := resolveLoginAccess(body.Email, body.Email, "email_otp", body.OrgID, r)
 		if err != nil {
 			w.WriteHeader(http.StatusBadGateway)
 			json.NewEncoder(w).Encode(map[string]string{"error": "조직 서버 저장 실패: " + err.Error()})

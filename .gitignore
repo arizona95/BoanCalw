@@ -3,3 +3,6 @@
 .boanclaw-version
 .boanclaw-latest
 .env
+
+# Per-org bearer tokens — never commit
+deploy/config/*.token

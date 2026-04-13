@@ -22,7 +22,7 @@ interface AuthCtx {
   user: AuthUser | null;
   loading: boolean;
   logout: () => Promise<void>;
-  login: (email: string, password: string) => Promise<void>;
+  login: (email: string, password: string, orgId?: string) => Promise<void>;
 }
 
 const Ctx = createContext<AuthCtx>({
@@ -62,12 +62,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setUser(null);
   };
 
-  const login = async (email: string, code: string) => {
+  const login = async (email: string, code: string, orgId?: string) => {
     const res = await fetch("/api/auth/verify-otp", {
       method: "POST",
       credentials: "include",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, code }),
+      body: JSON.stringify({ email, code, org_id: orgId ?? "" }),
     });
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));

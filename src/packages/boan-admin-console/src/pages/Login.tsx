@@ -3,6 +3,9 @@ import { Link } from "react-router-dom";
 import { useAuth } from "../auth";
 
 const LAST_LOGIN_EMAIL_KEY = "boanclaw:last-login-email";
+const LAST_LOGIN_ORG_KEY = "boanclaw:last-login-org";
+
+type OrgEntry = { org_id: string; label: string; url: string; is_active: boolean };
 
 export default function Login() {
   const { login } = useAuth();
@@ -20,6 +23,11 @@ export default function Login() {
   const [error, setError] = useState<string | null>(null);
   const [testMode, setTestMode] = useState(false);
   const [ownerEmail, setOwnerEmail] = useState("");
+  const [orgs, setOrgs] = useState<OrgEntry[]>([]);
+  const [selectedOrg, setSelectedOrg] = useState<string>(() => {
+    if (typeof window === "undefined") return "";
+    return window.localStorage.getItem(LAST_LOGIN_ORG_KEY) ?? "";
+  });
   const otpRefs = useRef<(HTMLInputElement | null)[]>([]);
 
   useEffect(() => {
@@ -53,10 +61,31 @@ export default function Login() {
       }
     };
     loadConfig();
+    const loadOrgs = async () => {
+      try {
+        const res = await fetch("/api/orgs");
+        const data = await res.json();
+        if (cancelled) return;
+        if (Array.isArray(data)) {
+          setOrgs(data);
+          setSelectedOrg((prev) => {
+            if (prev && data.some((o: OrgEntry) => o.org_id === prev)) return prev;
+            const active = data.find((o: OrgEntry) => o.is_active);
+            return active?.org_id ?? data[0]?.org_id ?? "";
+          });
+        }
+      } catch { /* ignore */ }
+    };
+    loadOrgs();
     return () => {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (selectedOrg) window.localStorage.setItem(LAST_LOGIN_ORG_KEY, selectedOrg);
+  }, [selectedOrg]);
 
   const handleSendOTP = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -67,7 +96,7 @@ export default function Login() {
       const res = await fetch("/api/auth/send-otp", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email }),
+        body: JSON.stringify({ email, org_id: selectedOrg }),
       });
       const data = await res.json();
       if (!res.ok) {
@@ -112,7 +141,7 @@ export default function Login() {
     setError(null);
     setLoading(true);
     try {
-      await login(email, code);
+      await login(email, code, selectedOrg);
       if (typeof window !== "undefined") {
         window.localStorage.setItem(LAST_LOGIN_EMAIL_KEY, email.trim());
       }
@@ -159,6 +188,25 @@ export default function Login() {
               </div>
 
               <form onSubmit={handleSendOTP} className="space-y-3">
+                {orgs.length > 0 && (
+                  <div>
+                    <label className="block text-[11px] font-medium text-gray-500 mb-1 ml-1">
+                      조직 {orgs.length > 1 && `(${orgs.length})`}
+                    </label>
+                    <select
+                      value={selectedOrg}
+                      onChange={(e) => setSelectedOrg(e.target.value)}
+                      disabled={orgs.length <= 1}
+                      className="w-full px-4 py-3 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-boan-500 disabled:bg-gray-50 disabled:text-gray-500"
+                    >
+                      {orgs.map((o) => (
+                        <option key={o.org_id} value={o.org_id}>
+                          {o.label}{o.is_active ? "  (기본)" : ""}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
                 <input
                   type="email"
                   placeholder="회사 이메일"
