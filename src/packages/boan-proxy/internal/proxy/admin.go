@@ -3297,6 +3297,9 @@ func (s *Server) StartAdmin() {
 	}
 
 	// lookupLLMByRole — registry 에서 주어진 role 의 첫 LLM 조회.
+	// 실제 model 이름은 registry 의 name 이 아니라 curl_template 안의 "model": "..."
+	// 값이 정답 — ollama 등 로컬 백엔드는 그 값으로 매칭.
+	modelRe := regexp.MustCompile(`"model"\s*:\s*"([^"]+)"`)
 	lookupLLMByRole := func(role string) (url, model string, found bool) {
 		if s.cfg.LLMRegistryURL == "" {
 			return
@@ -3308,10 +3311,12 @@ func (s *Server) StartAdmin() {
 		}
 		defer resp.Body.Close()
 		var llms []struct {
-			Name     string   `json:"name"`
-			Endpoint string   `json:"endpoint"`
-			Roles    []string `json:"roles"`
-			Healthy  bool     `json:"healthy"`
+			Name              string   `json:"name"`
+			Endpoint          string   `json:"endpoint"`
+			Roles             []string `json:"roles"`
+			Healthy           bool     `json:"healthy"`
+			CurlTemplate      string   `json:"curl_template"`
+			ImageCurlTemplate string   `json:"image_curl_template"`
 		}
 		if json.NewDecoder(resp.Body).Decode(&llms) != nil {
 			return
@@ -3321,9 +3326,23 @@ func (s *Server) StartAdmin() {
 				continue
 			}
 			for _, rl := range l.Roles {
-				if rl == role {
-					return l.Endpoint + "/v1/chat/completions", l.Name, true
+				if rl != role {
+					continue
 				}
+				modelID := l.Name
+				tmpl := l.CurlTemplate
+				if tmpl == "" {
+					tmpl = l.ImageCurlTemplate
+				}
+				if m := modelRe.FindStringSubmatch(tmpl); len(m) > 1 {
+					modelID = m[1]
+				}
+				// endpoint 가 /v1/chat/completions 로 끝나지 않으면 덧붙임.
+				ep := l.Endpoint
+				if !strings.Contains(ep, "/chat/completions") && !strings.HasSuffix(ep, "/chat") {
+					ep = strings.TrimRight(ep, "/") + "/v1/chat/completions"
+				}
+				return ep, modelID, true
 			}
 		}
 		return
