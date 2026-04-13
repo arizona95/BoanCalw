@@ -201,7 +201,7 @@ export default function Login() {
                     >
                       {orgs.map((o) => (
                         <option key={o.org_id} value={o.org_id}>
-                          {o.label}{o.is_active ? "  (기본)" : ""}
+                          {o.label}
                         </option>
                       ))}
                     </select>

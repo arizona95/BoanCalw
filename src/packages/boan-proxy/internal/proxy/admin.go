@@ -2389,15 +2389,19 @@ func (s *Server) StartAdmin() {
 			json.NewEncoder(w).Encode(map[string]string{"error": respBody.Error})
 			return
 		}
-		if err := s.orgs.Upsert(orgstore.Entry{
-			OrgID: parsedOrgID,
-			URL:   joinBody.URL,
-			Token: respBody.UserToken,
-			Label: parsedOrgID,
-		}); err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(map[string]string{"error": "로컬 저장 실패: " + err.Error()})
-			return
+		// 이미 존재하는 org 면 기존 token (admin token 일 수 있음) 유지 — overwrite 하지 않음.
+		// 신규 entry 만 user_token 으로 저장. 이 분리가 admin/user 권한을 분리.
+		if _, exists := s.orgs.Get(parsedOrgID); !exists {
+			if err := s.orgs.Add(orgstore.Entry{
+				OrgID: parsedOrgID,
+				URL:   joinBody.URL,
+				Token: respBody.UserToken,
+				Label: parsedOrgID,
+			}); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{"error": "로컬 저장 실패: " + err.Error()})
+				return
+			}
 		}
 		json.NewEncoder(w).Encode(map[string]string{
 			"status":  respBody.Status,
@@ -2517,25 +2521,33 @@ func (s *Server) StartAdmin() {
 				orgID = defaultOrgID
 			}
 			if remoteUsers, err := s.orgs.ClientFor(orgID).ListUsers(orgID); err == nil {
-				seen := make(map[string]bool)
+				// Index local by email for in-place update.
+				localByEmail := make(map[string]*userstore.User)
 				for _, u := range allUsers {
-					seen[strings.ToLower(u.Email)] = true
+					localByEmail[strings.ToLower(u.Email)] = u
 				}
 				for _, ru := range remoteUsers {
-					if seen[strings.ToLower(ru.Email)] {
-						continue
-					}
-					// Remote user not in local store — add it
 					status := userstore.StatusPending
 					if ru.Status == "approved" {
 						status = userstore.StatusApproved
 					}
+					if existing, ok := localByEmail[strings.ToLower(ru.Email)]; ok {
+						// GCP 가 진실의 원천 — role/status/IP 등 최신 값으로 overlay.
+						existing.Role = ru.Role
+						existing.Status = status
+						if ru.RegisteredIP != "" {
+							existing.RegisteredIP = ru.RegisteredIP
+						}
+						continue
+					}
+					// Remote user not in local store — add.
 					allUsers = append(allUsers, &userstore.User{
-						Email:     ru.Email,
-						Role:      ru.Role,
-						OrgID:     orgID,
-						Status:    status,
-						CreatedAt: time.Now(),
+						Email:        ru.Email,
+						Role:         ru.Role,
+						OrgID:        orgID,
+						Status:       status,
+						RegisteredIP: ru.RegisteredIP,
+						CreatedAt:    time.Now(),
 					})
 				}
 			}
@@ -2566,14 +2578,15 @@ func (s *Server) StartAdmin() {
 				if accessLevel == "" {
 					accessLevel = "ask" // 기존 사용자 기본값
 				}
+				// 역할은 org policy-server 의 user 레코드에 저장된 값을 그대로 사용.
+				// 로컬 env (BOAN_OWNER_EMAIL) 기반 매칭은 사용하지 않음 — 조직마다 owner 다를 수 있음.
+				displayRole := roles.Normalize(roles.Role(u.Role))
+				if displayRole != roles.Owner {
+					displayRole = roles.User
+				}
 				out = append(out, userView{
 					Email: u.Email,
-					Role: func() string {
-						if ownerMatch(u.Email) {
-							return string(roles.Owner)
-						}
-						return string(roles.User)
-					}(),
+					Role:  string(displayRole),
 					OrgID:       u.OrgID,
 					Status:      string(u.Status),
 					AccessLevel: accessLevel,
@@ -3269,16 +3282,30 @@ func (s *Server) StartAdmin() {
 		io.Copy(w, resp.Body)
 	}
 
+	// attachOrgAuth — org-scoped 요청에 Bearer 토큰 자동 첨부.
+	// orgstore 에서 해당 org 의 토큰을 꺼내 Authorization 헤더 세팅.
+	attachOrgAuth := func(req *http.Request, orgID string) {
+		if entry, ok := s.orgs.Resolve(orgID); ok && entry.Token != "" {
+			req.Header.Set("Authorization", "Bearer "+entry.Token)
+		}
+	}
+
 	mux.HandleFunc("/api/policy/", func(w http.ResponseWriter, r *http.Request) {
 		if cors(w, r) {
 			return
 		}
 		orgID := resolveOrg(r)
+		// Org 별 URL 로 전환 — policyBase env 대신 orgstore 에 저장된 URL 사용.
+		orgURL := policyBase
+		if entry, ok := s.orgs.Resolve(orgID); ok && entry.URL != "" {
+			orgURL = entry.URL
+		}
 		rest := strings.TrimPrefix(r.URL.Path, "/api/policy")
 		switch {
 		case rest == "/v1/policy" && r.Method == http.MethodGet:
 			req, _ := http.NewRequestWithContext(r.Context(), http.MethodGet,
-				policyBase+"/org/"+orgID+"/policy.json", nil)
+				orgURL+"/org/"+orgID+"/policy.json", nil)
+			attachOrgAuth(req, orgID)
 			resp, err := client.Do(req)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadGateway)
@@ -3311,8 +3338,9 @@ func (s *Server) StartAdmin() {
 			json.NewDecoder(r.Body).Decode(&body)
 			raw, _ := json.Marshal(body)
 			req, _ := http.NewRequestWithContext(r.Context(), http.MethodPost,
-				policyBase+"/org/"+orgID+"/policy", bytes.NewReader(raw))
+				orgURL+"/org/"+orgID+"/policy", bytes.NewReader(raw))
 			req.Header.Set("Content-Type", "application/json")
+			attachOrgAuth(req, orgID)
 			resp, err := client.Do(req)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadGateway)
@@ -3328,7 +3356,21 @@ func (s *Server) StartAdmin() {
 			if requireEdit(w, r) {
 				return
 			}
-			proxy(w, r, policyBase+"/org/"+orgID+"/policy/rollback/1")
+			// proxy helper 는 Authorization 헤더를 안 붙이므로 수동 요청.
+			req, _ := http.NewRequestWithContext(r.Context(), http.MethodPost,
+				orgURL+"/org/"+orgID+"/policy/rollback/1", r.Body)
+			attachOrgAuth(req, orgID)
+			resp, err := client.Do(req)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadGateway)
+				return
+			}
+			defer resp.Body.Close()
+			respRaw, _ := io.ReadAll(resp.Body)
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.WriteHeader(resp.StatusCode)
+			w.Write(respRaw)
 		default:
 			http.NotFound(w, r)
 		}

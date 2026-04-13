@@ -17,14 +17,15 @@ type Client struct {
 }
 
 type User struct {
-	Email       string       `json:"email"`
-	Name        string       `json:"name"`
-	MachineID   string       `json:"machine_id,omitempty"`
-	MachineName string       `json:"machine_name,omitempty"`
-	Role        string       `json:"role"`
-	OrgID       string       `json:"org_id"`
-	Status      string       `json:"status"`
-	Workstation *Workstation `json:"workstation,omitempty"`
+	Email        string       `json:"email"`
+	Name         string       `json:"name"`
+	MachineID    string       `json:"machine_id,omitempty"`
+	MachineName  string       `json:"machine_name,omitempty"`
+	Role         string       `json:"role"`
+	OrgID        string       `json:"org_id"`
+	Status       string       `json:"status"`
+	RegisteredIP string       `json:"registered_ip,omitempty"`
+	Workstation  *Workstation `json:"workstation,omitempty"`
 }
 
 type Workstation struct {

@@ -12,15 +12,16 @@ export default function SSOSettings() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [msg, setMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
-  const [orgIdCopied, setOrgIdCopied] = useState(false);
+  const [orgURL, setOrgURL] = useState("");
+  const [urlCopied, setUrlCopied] = useState(false);
 
   const orgId = user?.org_id ?? "";
-  const copyOrgId = async () => {
-    if (!orgId) return;
+  const copyURL = async () => {
+    if (!orgURL) return;
     try {
-      await navigator.clipboard.writeText(orgId);
-      setOrgIdCopied(true);
-      window.setTimeout(() => setOrgIdCopied(false), 1500);
+      await navigator.clipboard.writeText(orgURL);
+      setUrlCopied(true);
+      window.setTimeout(() => setUrlCopied(false), 1500);
     } catch {
       // ignore
     }
@@ -30,7 +31,16 @@ export default function SSOSettings() {
     policyApi.get().then((p) => {
       setAllowedDomains((p.org_settings?.allowed_domains ?? ["samsung.com"]).join(", "));
     }).catch((e) => setMsg({ type: "err", text: e.message })).finally(() => setLoading(false));
-  }, []);
+    // 현재 조직의 policy-server URL 을 /api/orgs 에서 조회 — 사용자에게 공유할 가입 URL.
+    fetch("/api/orgs", { credentials: "include" })
+      .then((r) => r.json())
+      .then((entries) => {
+        if (!Array.isArray(entries)) return;
+        const match = entries.find((o: { org_id: string }) => o.org_id === orgId);
+        if (match?.url) setOrgURL(match.url);
+      })
+      .catch(() => { /* ignore */ });
+  }, [orgId]);
 
   const save = async () => {
     setMsg(null); setSaving(true);
@@ -46,25 +56,25 @@ export default function SSOSettings() {
 
   return (
     <div>
-      {/* 🏢 조직 가입 ID — 새 사용자가 이 값으로 가입 신청 */}
-      {orgId && (
+      {/* 🏢 조직 가입 URL — 새 사용자가 이 URL 을 가입 화면에 입력하면 본 조직으로 요청이 들어옴. */}
+      {orgURL && (
         <div className="mb-5 rounded-xl border border-boan-200 bg-boan-50/50 p-4">
           <div className="flex items-start gap-3">
             <span className="text-2xl">🏢</span>
             <div className="flex-1 min-w-0">
-              <p className="text-sm font-semibold text-gray-800">조직 가입 ID</p>
+              <p className="text-sm font-semibold text-gray-800">조직 가입 URL</p>
               <p className="mt-0.5 text-xs text-gray-500">
-                새 사용자가 회원가입 시 이 ID 를 입력해야 본 조직으로 가입 신청이 들어옵니다.
+                새 사용자에게 이 URL 을 공유하면, 가입 화면에서 이 URL 로 가입 신청을 보낼 수 있습니다.
               </p>
               <div className="mt-2 flex items-center gap-2">
-                <code className="font-mono text-base font-bold text-boan-700 bg-white border border-boan-200 px-3 py-1.5 rounded-lg select-all">
-                  {orgId}
+                <code className="flex-1 font-mono text-xs text-boan-700 bg-white border border-boan-200 px-3 py-2 rounded-lg select-all break-all">
+                  {orgURL}
                 </code>
                 <button
-                  onClick={copyOrgId}
-                  className="text-xs px-3 py-1.5 rounded-lg bg-boan-600 text-white hover:bg-boan-700 transition-colors"
+                  onClick={copyURL}
+                  className="text-xs px-3 py-2 rounded-lg bg-boan-600 text-white hover:bg-boan-700 transition-colors whitespace-nowrap"
                 >
-                  {orgIdCopied ? "✓ 복사됨" : "📋 복사"}
+                  {urlCopied ? "✓ 복사됨" : "📋 복사"}
                 </button>
               </div>
             </div>
