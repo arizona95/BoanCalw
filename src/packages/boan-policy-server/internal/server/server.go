@@ -18,6 +18,7 @@ type Config struct {
 	Listen            string
 	DataDir           string
 	KeyDir            string
+	OrgToken          string
 	GuardrailLLMURL   string
 	GuardrailLLMModel string
 	GuardrailLLMKey   string
@@ -28,9 +29,14 @@ type Config struct {
 
 func LoadConfig() Config {
 	return Config{
-		Listen:            env("BOAN_LISTEN", ":8080"),
-		DataDir:           env("BOAN_DATA_DIR", "/data/policies"),
-		KeyDir:            env("BOAN_KEY_DIR", "/etc/boan-policy"),
+		Listen: env("BOAN_LISTEN", ":8080"),
+		DataDir: env("BOAN_DATA_DIR", "/data/policies"),
+		KeyDir:  env("BOAN_KEY_DIR", "/etc/boan-policy"),
+		// OrgToken: 이 policy-server 인스턴스의 조직 토큰.
+		// 모든 /org/ 요청은 Authorization: Bearer <token> 헤더를 가져야 함.
+		// 비어있으면 middleware 가 모든 요청을 401 로 거부 (fail-closed).
+		// 각 Cloud Run 인스턴스(= 조직 1개) 마다 고유 토큰을 deploy 시 주입.
+		OrgToken:          env("BOAN_ORG_TOKEN", ""),
 		GuardrailLLMURL:   env("BOAN_GUARDRAIL_LLM_URL", ""),
 		GuardrailLLMModel: env("BOAN_GUARDRAIL_LLM_MODEL", ""),
 		GuardrailLLMKey:   env("BOAN_GUARDRAIL_LLM_KEY", ""),
@@ -118,7 +124,8 @@ func (s *Server) Start(ctx context.Context) error {
 			},
 		})
 	})
-	mux.HandleFunc("/org/", s.handleOrg)
+	// /org/* 는 토큰 검증 미들웨어로 감싼다.
+	mux.HandleFunc("/org/", s.requireOrgToken(s.handleOrg))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Write([]byte("ok"))
 	})
@@ -133,6 +140,30 @@ func (s *Server) Start(ctx context.Context) error {
 		srv.Shutdown(context.Background())
 	}()
 	return srv.ListenAndServe()
+}
+
+// requireOrgToken — 모든 /org/ 요청에 Authorization: Bearer <BOAN_ORG_TOKEN> 요구.
+// OrgToken 이 설정돼있지 않으면 fail-closed (모든 요청 401).
+// OrgToken 이 설정돼있고 헤더가 일치하면 통과.
+func (s *Server) requireOrgToken(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.cfg.OrgToken == "" {
+			http.Error(w, "server not configured: BOAN_ORG_TOKEN unset", http.StatusUnauthorized)
+			return
+		}
+		auth := r.Header.Get("Authorization")
+		const prefix = "Bearer "
+		if !strings.HasPrefix(auth, prefix) {
+			http.Error(w, "missing bearer token", http.StatusUnauthorized)
+			return
+		}
+		token := auth[len(prefix):]
+		if token != s.cfg.OrgToken {
+			http.Error(w, "invalid org token", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
 }
 
 func (s *Server) handleOrg(w http.ResponseWriter, r *http.Request) {
@@ -157,6 +188,10 @@ func (s *Server) handleOrg(w http.ResponseWriter, r *http.Request) {
 		s.registerUser(w, r, orgID)
 	case rest == "v1/users/sso-sync" && r.Method == http.MethodPost:
 		s.syncSSOUser(w, r, orgID)
+	case rest == "v1/users/check-login-ip" && r.Method == http.MethodPost:
+		s.checkLoginIP(w, r, orgID)
+	case rest == "v1/users/reset-ip" && r.Method == http.MethodPost:
+		s.resetUserIP(w, r, orgID)
 	case rest == "v1/policy" && r.Method == http.MethodGet:
 		s.getPolicy(w, orgID)
 	case rest == "v1/policy" && (r.Method == http.MethodPut || r.Method == http.MethodPost):
@@ -499,6 +534,54 @@ func (s *Server) checkin(w http.ResponseWriter, r *http.Request, orgID string) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+// checkLoginIP — TOFU IP 바인딩 확인.
+// body: {email, client_ip}
+// resp: {allowed: bool, reason: "captured"|"match"|"ip_mismatch"|"user_not_found", registered_ip: string}
+// 첫 로그인 시 clientIP 를 RegisteredIP 로 자동 저장 (TOFU).
+// 이후 로그인부터는 저장된 IP 와 비교.
+func (s *Server) checkLoginIP(w http.ResponseWriter, r *http.Request, orgID string) {
+	var body struct {
+		Email    string `json:"email"`
+		ClientIP string `json:"client_ip"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if body.Email == "" || body.ClientIP == "" {
+		http.Error(w, "email and client_ip are required", http.StatusBadRequest)
+		return
+	}
+	allowed, reason, registeredIP, err := s.store.CheckOrCaptureLoginIP(orgID, body.Email, body.ClientIP)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"allowed":       allowed,
+		"reason":        reason,
+		"registered_ip": registeredIP,
+	})
+}
+
+// resetUserIP — 관리자가 사용자 IP 재설정 (PC 교체 등).
+func (s *Server) resetUserIP(w http.ResponseWriter, r *http.Request, orgID string) {
+	var body struct {
+		Email string `json:"email"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.store.ResetUserIP(orgID, body.Email); err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 func (s *Server) listUsers(w http.ResponseWriter, orgID string) {

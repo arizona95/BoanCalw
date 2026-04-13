@@ -35,6 +35,7 @@ type Gate struct {
 	mu        sync.RWMutex
 	policy    *Policy
 	policyURL string
+	orgToken  string
 	orgID     string
 	client    *http.Client
 	pubKey    ed25519.PublicKey
@@ -46,12 +47,23 @@ type Gate struct {
 }
 
 func NewGate(policyURL, orgID string) *Gate {
+	return NewGateWithToken(policyURL, orgID, "")
+}
+
+func NewGateWithToken(policyURL, orgID, orgToken string) *Gate {
 	return &Gate{
 		policyURL: policyURL,
+		orgToken:  orgToken,
 		orgID:     orgID,
 		client:    &http.Client{Timeout: 10 * time.Second},
 		policy:    &Policy{},
 	}
+}
+
+func (g *Gate) SetToken(t string) {
+	g.mu.Lock()
+	g.orgToken = t
+	g.mu.Unlock()
 }
 
 func NewGateWithKey(policyURL, orgID string, pubKey ed25519.PublicKey) *Gate {
@@ -146,7 +158,15 @@ func (g *Gate) refresh() {
 		return
 	}
 	url := fmt.Sprintf("%s/org/%s/network-policy.json", g.policyURL, g.orgID)
-	resp, err := g.client.Get(url)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		log.Printf("network gate: request build failed: %v", err)
+		return
+	}
+	if g.orgToken != "" {
+		req.Header.Set("Authorization", "Bearer "+g.orgToken)
+	}
+	resp, err := g.client.Do(req)
 	if err != nil {
 		log.Printf("network gate: refresh failed: %v", err)
 		return

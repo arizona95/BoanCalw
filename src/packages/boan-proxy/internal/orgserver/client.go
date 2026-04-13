@@ -12,6 +12,7 @@ import (
 
 type Client struct {
 	baseURL string
+	token   string
 	client  *http.Client
 }
 
@@ -39,10 +40,50 @@ type Workstation struct {
 }
 
 func New(baseURL string) *Client {
+	return NewWithToken(baseURL, "")
+}
+
+func NewWithToken(baseURL, token string) *Client {
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
+		token:   token,
 		client:  &http.Client{Timeout: 10 * time.Second},
 	}
+}
+
+// SetToken: 런타임에 토큰 갱신 (멀티 조직 전환용).
+func (c *Client) SetToken(token string) { c.token = token }
+
+// authedRequest: Bearer 헤더 자동 첨부.
+func (c *Client) authedRequest(method, url string, body io.Reader) (*http.Request, error) {
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	return req, nil
+}
+
+// authedGet / authedPost 헬퍼.
+func (c *Client) authedGet(url string) (*http.Response, error) {
+	req, err := c.authedRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	return c.client.Do(req)
+}
+
+func (c *Client) authedPost(url, contentType string, body io.Reader) (*http.Response, error) {
+	req, err := c.authedRequest(http.MethodPost, url, body)
+	if err != nil {
+		return nil, err
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	return c.client.Do(req)
 }
 
 func (c *Client) Enabled() bool {
@@ -53,7 +94,7 @@ func (c *Client) ListUsers(orgID string) ([]User, error) {
 	if !c.Enabled() {
 		return nil, nil
 	}
-	resp, err := c.client.Get(fmt.Sprintf("%s/org/%s/v1/users", c.baseURL, orgID))
+	resp, err := c.authedGet(fmt.Sprintf("%s/org/%s/v1/users", c.baseURL, orgID))
 	if err != nil {
 		return nil, err
 	}
@@ -129,7 +170,7 @@ func (c *Client) ProposeAmendment(orgID string) (map[string]any, error) {
 	}
 	url := fmt.Sprintf("%s/org/%s/v1/guardrail/propose-amendment", c.baseURL, orgID)
 	raw, _ := json.Marshal(map[string]string{})
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(raw))
+	req, err := c.authedRequest(http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
 		return nil, err
 	}
@@ -161,7 +202,7 @@ func (c *Client) ProposeG1Amendment(orgID string) (map[string]any, error) {
 	}
 	url := fmt.Sprintf("%s/org/%s/v1/guardrail/propose-g1-amendment", c.baseURL, orgID)
 	raw, _ := json.Marshal(map[string]string{})
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(raw))
+	req, err := c.authedRequest(http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
 		return nil, err
 	}
@@ -192,7 +233,7 @@ func (c *Client) GetTrainingLog(orgID string) ([]map[string]any, error) {
 		return nil, nil
 	}
 	url := fmt.Sprintf("%s/org/%s/v1/guardrail/training-log", c.baseURL, orgID)
-	resp, err := c.client.Get(url)
+	resp, err := c.authedGet(url)
 	if err != nil {
 		return nil, err
 	}
@@ -225,7 +266,7 @@ func (c *Client) GetWikiIndex(orgID string) (map[string]any, error) {
 		return nil, fmt.Errorf("org server not configured")
 	}
 	url := fmt.Sprintf("%s/org/%s/v1/wiki", c.baseURL, orgID)
-	resp, err := c.client.Get(url)
+	resp, err := c.authedGet(url)
 	if err != nil {
 		return nil, err
 	}
@@ -240,7 +281,7 @@ func (c *Client) GetWikiPages(orgID string) ([]map[string]any, error) {
 		return nil, fmt.Errorf("org server not configured")
 	}
 	url := fmt.Sprintf("%s/org/%s/v1/wiki/pages", c.baseURL, orgID)
-	resp, err := c.client.Get(url)
+	resp, err := c.authedGet(url)
 	if err != nil {
 		return nil, err
 	}
@@ -248,6 +289,47 @@ func (c *Client) GetWikiPages(orgID string) ([]map[string]any, error) {
 	var result []map[string]any
 	json.NewDecoder(resp.Body).Decode(&result)
 	return result, nil
+}
+
+// CheckLoginIP — TOFU IP 바인딩 확인.
+// 반환: allowed (로그인 허용 여부), reason ("captured"|"match"|"ip_mismatch"|"user_not_found").
+// 에러 시 (org-server 불통 등): fail-closed (allowed=false).
+func (c *Client) CheckLoginIP(orgID, email, clientIP string) (bool, string, error) {
+	if !c.Enabled() {
+		return false, "org_server_disabled", nil
+	}
+	body, _ := json.Marshal(map[string]string{"email": email, "client_ip": clientIP})
+	resp, err := c.authedPost(
+		fmt.Sprintf("%s/org/%s/v1/users/check-login-ip", c.baseURL, orgID),
+		"application/json",
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		return false, "network_error: " + err.Error(), err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return false, fmt.Sprintf("org_server_status_%d", resp.StatusCode), nil
+	}
+	var out struct {
+		Allowed bool   `json:"allowed"`
+		Reason  string `json:"reason"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return false, "decode_error", err
+	}
+	return out.Allowed, out.Reason, nil
+}
+
+// ResetUserIP — 관리자용: 사용자의 RegisteredIP 초기화.
+func (c *Client) ResetUserIP(orgID, email string) error {
+	if !c.Enabled() {
+		return nil
+	}
+	return c.postJSON(
+		fmt.Sprintf("%s/org/%s/v1/users/reset-ip", c.baseURL, orgID),
+		map[string]string{"email": email},
+	)
 }
 
 func (c *Client) DeleteUser(orgID, email string) error {
@@ -266,7 +348,7 @@ func (c *Client) doJSON(method, url string, body any) error {
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(method, url, bytes.NewReader(raw))
+	req, err := c.authedRequest(method, url, bytes.NewReader(raw))
 	if err != nil {
 		return err
 	}

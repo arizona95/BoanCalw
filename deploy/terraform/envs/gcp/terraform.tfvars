@@ -31,7 +31,7 @@ workstation_image_family = "windows-2022"
 workstation_subnetwork = "boanclaw-subnet-sds-corp"
 workstation_network_tags = ""
 workstation_rdp_source_ranges = ["61.101.189.117/32"]
-workstation_service_account = ""
+workstation_service_account = "boan-workstation-vm@ai-security-test-473701.iam.gserviceaccount.com"
 workstation_root_volume_gib = "100"
 workstation_console_base_url = "https://console.cloud.google.com/compute/instancesDetail/zones/{zone}/instances/{instance_name}?project={project}"
 workstation_web_base_url = ""

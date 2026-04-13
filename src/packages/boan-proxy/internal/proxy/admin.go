@@ -28,6 +28,7 @@ import (
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/audit"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/auth"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/orgserver"
+	"github.com/samsung-sds/boanclaw/boan-proxy/internal/orgstore"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/roles"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/userstore"
 )
@@ -452,7 +453,7 @@ func (s *Server) StartAdmin() {
 	}
 
 	syncOrgUser := func(email, name, orgID, role, provider, status string) error {
-		return s.orgServer.SyncUser(orgID, strings.TrimSpace(strings.ToLower(email)), name, role, provider, status, machineID, machineName)
+		return s.orgs.ClientFor(orgID).SyncUser(orgID, strings.TrimSpace(strings.ToLower(email)), name, role, provider, status, machineID, machineName)
 	}
 
 	inferBoundUser := func() string {
@@ -501,11 +502,10 @@ func (s *Server) StartAdmin() {
 
 	deviceLockedMessage := "이 PC는 이미 다른 사용자 계정에 연결되어 있습니다. 소유자 계정은 로그인할 수 있지만, 사용자 계정은 한 PC당 1개만 사용할 수 있습니다."
 
-	// 소유자 IP 제한: BOAN_OWNER_ALLOWED_IPS 에 등록된 IP에서만 소유자 로그인 가능.
-	// 미등록 IP에서 소유자 이메일로 로그인 시 → 일반 사용자로 다운그레이드.
-	// 미설정 (env 빈 값) 시 fail-closed: 소유자 로그인 전부 차단.
-	// 소유자 PC 에서만 명시적으로 BOAN_OWNER_ALLOWED_IPS=127.0.0.1 설정.
-	ownerAllowedIPs := splitCSV(os.Getenv("BOAN_OWNER_ALLOWED_IPS"))
+	// IP 바인딩은 GCP org-server 에 중앙 관리됨 (TOFU: Trust On First Use).
+	// 첫 로그인 시 client IP 가 자동으로 저장되고, 이후 로그인은 그 IP 에서만 허용.
+	// owner/user 구분 없이 동일 로직. 여러 배포가 있어도 GCP 한 곳에서 일관됨.
+	// 관리자가 IP 재설정 필요시: POST /org/{id}/v1/users/reset-ip
 
 	extractClientIP := func(r *http.Request) string {
 		clientIP := r.Header.Get("X-Forwarded-For")
@@ -524,51 +524,33 @@ func (s *Server) StartAdmin() {
 		return clientIP
 	}
 
-	// Check if the user's stored RegisteredIP matches the current request IP.
-	// Returns true if: IP matches, or user has no RegisteredIP (backward compat), or user not found locally.
-	isUserIPAllowed := func(email string, r *http.Request) bool {
-		u, err := s.users.Get(email)
-		if err != nil || u == nil {
-			return true // User not in local store — defer to login flow (remote check, etc.)
-		}
-		if u.RegisteredIP == "" {
-			return true // Legacy user without IP binding
-		}
+	// checkLoginIP — GCP org-server 에 TOFU IP 검증 요청.
+	// fail-closed: org-server 불통 시 로그인 차단.
+	checkLoginIP := func(email, orgID string, r *http.Request) (bool, string) {
 		clientIP := extractClientIP(r)
-		if clientIP != u.RegisteredIP {
-			log.Printf("[user-ip] blocked %s login from IP %s (registered: %s)", email, clientIP, u.RegisteredIP)
-			return false
+		targetOrg := orgID
+		if targetOrg == "" {
+			targetOrg = defaultOrgID
 		}
-		return true
-	}
-
-	isOwnerIPAllowed := func(r *http.Request) bool {
-		if len(ownerAllowedIPs) == 0 {
-			log.Printf("[owner-ip] BOAN_OWNER_ALLOWED_IPS not set — blocking all owner logins (fail-closed)")
-			return false
+		allowed, reason, err := s.orgs.ClientFor(targetOrg).CheckLoginIP(targetOrg, email, clientIP)
+		if err != nil {
+			log.Printf("[login-ip] org-server error for %s from %s: %v", email, clientIP, err)
+			return false, "조직 서버 연결 실패 — 관리자에게 문의하세요."
 		}
-		clientIP := r.Header.Get("X-Forwarded-For")
-		if clientIP == "" {
-			clientIP = r.Header.Get("X-Real-IP")
-		}
-		if clientIP == "" {
-			clientIP = r.RemoteAddr
-		}
-		// X-Forwarded-For can have multiple IPs; use the first (client)
-		if idx := strings.Index(clientIP, ","); idx > 0 {
-			clientIP = strings.TrimSpace(clientIP[:idx])
-		}
-		// Strip port from RemoteAddr
-		if idx := strings.LastIndex(clientIP, ":"); idx > 0 {
-			clientIP = clientIP[:idx]
-		}
-		for _, allowed := range ownerAllowedIPs {
-			if clientIP == allowed {
-				return true
+		if !allowed {
+			log.Printf("[login-ip] blocked %s from IP %s (reason: %s)", email, clientIP, reason)
+			if reason == "ip_mismatch" {
+				return false, "등록된 IP 에서만 로그인할 수 있습니다."
 			}
+			if reason == "user_not_found" {
+				return false, "" // caller 가 별도 처리 (remote register 등)
+			}
+			return false, "로그인이 허용되지 않았습니다."
 		}
-		log.Printf("[owner-ip] blocked owner login from IP %s (allowed: %v)", clientIP, ownerAllowedIPs)
-		return false
+		if reason == "captured" {
+			log.Printf("[login-ip] captured IP %s for %s (first login — TOFU)", clientIP, email)
+		}
+		return true, ""
 	}
 
 	resolveLoginAccess := func(email, name, provider, wantOrgID string, r *http.Request) (roles.Role, string, bool, string, error) {
@@ -579,12 +561,8 @@ func (s *Server) StartAdmin() {
 		}
 
 		if ownerMatch(email) {
-			// IP 검증: 등록된 IP에서만 소유자 로그인 허용
-			if !isOwnerIPAllowed(r) {
-				// 소유자 이메일이지만 미등록 IP → 일반 사용자로 다운그레이드
-				syncLocalUser(email, orgID, string(roles.User), userstore.StatusApproved)
-				return roles.User, orgID, true, "", nil
-			}
+			// IP 검증은 이 함수 밖의 checkLoginIP 에서 GCP 중앙 서버 경유로 수행됨 (TOFU).
+			// 여기서는 로컬/원격 user 레코드 생성만.
 			syncLocalUser(email, orgID, string(roles.Owner), userstore.StatusApproved)
 			if err := syncOrgUser(email, name, orgID, string(roles.Owner), provider, "approved"); err != nil {
 				return roles.User, orgID, false, "", err
@@ -596,7 +574,7 @@ func (s *Server) StartAdmin() {
 			return roles.User, orgID, false, deviceLockedMessage, nil
 		}
 
-		if users, err := s.orgServer.ListUsers(orgID); err == nil {
+		if users, err := s.orgs.ClientFor(orgID).ListUsers(orgID); err == nil {
 			for _, u := range users {
 				if !strings.EqualFold(u.Email, email) {
 					continue
@@ -655,7 +633,7 @@ func (s *Server) StartAdmin() {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		entries, err := s.orgServer.GetTrainingLog(defaultOrgID)
+		entries, err := s.orgs.ClientFor(defaultOrgID).GetTrainingLog(defaultOrgID)
 		if err != nil {
 			w.WriteHeader(http.StatusBadGateway)
 			json.NewEncoder(w).Encode(map[string]string{"error": "training log fetch failed: " + err.Error()})
@@ -686,7 +664,7 @@ func (s *Server) StartAdmin() {
 			json.NewDecoder(resp.Body).Decode(&wikiPages)
 		}
 		if len(wikiPages) == 0 {
-			wikiPages, _ = s.orgServer.GetWikiPages(defaultOrgID)
+			wikiPages, _ = s.orgs.ClientFor(defaultOrgID).GetWikiPages(defaultOrgID)
 		}
 		if wikiPages == nil {
 			wikiPages = []map[string]any{}
@@ -698,7 +676,7 @@ func (s *Server) StartAdmin() {
 			json.NewDecoder(resp.Body).Decode(&wikiIndex)
 		}
 		if wikiIndex == nil {
-			wikiIndex, _ = s.orgServer.GetWikiIndex(defaultOrgID)
+			wikiIndex, _ = s.orgs.ClientFor(defaultOrgID).GetWikiIndex(defaultOrgID)
 		}
 		json.NewEncoder(w).Encode(map[string]any{
 			"entries": entries,
@@ -762,7 +740,7 @@ func (s *Server) StartAdmin() {
 		compileResp, compileErr := noProxyClient.Do(compileReq)
 		if compileErr != nil {
 			// Fallback to orgServer (GCP)
-			compileErr = s.orgServer.CompileWikiWithLLM(defaultOrgID, g3LLMURL, g3LLMModel)
+			compileErr = s.orgs.ClientFor(defaultOrgID).CompileWikiWithLLM(defaultOrgID, g3LLMURL, g3LLMModel)
 		} else {
 			compileResp.Body.Close()
 			if compileResp.StatusCode >= 300 {
@@ -838,7 +816,7 @@ func (s *Server) StartAdmin() {
 			http.NotFound(w, r)
 			return
 		}
-		pages, err := s.orgServer.GetWikiPages(defaultOrgID)
+		pages, err := s.orgs.ClientFor(defaultOrgID).GetWikiPages(defaultOrgID)
 		if err != nil {
 			w.WriteHeader(http.StatusBadGateway)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
@@ -1026,6 +1004,13 @@ func (s *Server) StartAdmin() {
 			})
 			return
 		}
+		// TOFU IP 검증 (GCP 중앙)
+		if ok, msg := checkLoginIP(userInfo.Email, gcpOrgID, r); !ok && msg != "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]any{"error": msg})
+			return
+		}
 		sess := &auth.Session{
 			Sub:   userInfo.Sub,
 			Email: userInfo.Email,
@@ -1095,6 +1080,13 @@ func (s *Server) StartAdmin() {
 				"org_id": orgID,
 				"email":  body.Email,
 			})
+			return
+		}
+		// TOFU IP 검증 (GCP 중앙)
+		if ok, msg := checkLoginIP(body.Email, orgID, r); !ok && msg != "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]any{"error": msg})
 			return
 		}
 		sess := &auth.Session{
@@ -1964,12 +1956,6 @@ func (s *Server) StartAdmin() {
 		var orgID string
 
 		if u, err := s.users.Authenticate(body.Email, body.Password); err == nil {
-			// Per-user IP binding check
-			if !isUserIPAllowed(body.Email, r) {
-				w.WriteHeader(http.StatusForbidden)
-				json.NewEncoder(w).Encode(map[string]string{"error": "등록된 IP에서만 로그인 가능합니다."})
-				return
-			}
 			roleVal = roles.Normalize(roles.Role(u.Role))
 			orgID = u.OrgID
 			if orgID == "" {
@@ -1996,6 +1982,13 @@ func (s *Server) StartAdmin() {
 			return
 		}
 
+		// TOFU IP 검증 (GCP 중앙)
+		if ok, msg := checkLoginIP(body.Email, orgID, r); !ok && msg != "" {
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]string{"error": msg})
+			return
+		}
+
 		if err := issueSession(w, body.Email, body.Email, roleVal, orgID); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(map[string]string{"error": "세션 생성 실패"})
@@ -2008,6 +2001,116 @@ func (s *Server) StartAdmin() {
 			"org_id":     orgID,
 		})
 		warmWorkstation(body.Email, orgID)
+	})
+
+	// GET /api/orgs — public list (login screen dropdown).
+	// Returns [{org_id, label, url, is_active}] with token redacted.
+	mux.HandleFunc("/api/orgs", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		if r.Method == http.MethodOptions {
+			w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.Method != http.MethodGet {
+			http.NotFound(w, r)
+			return
+		}
+		entries := s.orgs.PublicList()
+		active := s.orgs.ActiveID()
+		out := make([]map[string]any, 0, len(entries))
+		for _, e := range entries {
+			label := e.Label
+			if label == "" {
+				label = e.OrgID
+			}
+			out = append(out, map[string]any{
+				"org_id":    e.OrgID,
+				"label":     label,
+				"url":       e.URL,
+				"is_active": e.OrgID == active,
+			})
+		}
+		json.NewEncoder(w).Encode(out)
+	})
+
+	// /api/admin/orgs — owner-only CRUD for org registry.
+	// GET: full list (with tokens). POST: upsert {org_id, url, token, label}.
+	// DELETE: {org_id}. PATCH: {org_id, active:true} to set active.
+	mux.HandleFunc("/api/admin/orgs", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		if r.Method == http.MethodOptions {
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, PATCH, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Cookie")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		// owner-only
+		sess, err := auth.SessionFromRequest(r, s.authProv)
+		if err != nil || roles.Normalize(roles.Role(sess.Role)) != roles.Owner {
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]string{"error": "소유자 권한 필요"})
+			return
+		}
+
+		switch r.Method {
+		case http.MethodGet:
+			json.NewEncoder(w).Encode(map[string]any{
+				"active": s.orgs.ActiveID(),
+				"orgs":   s.orgs.List(),
+			})
+		case http.MethodPost:
+			var body orgstore.Entry
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			// 토큰 검증: 입력받은 URL+토큰 으로 실제 /org/{id}/v1/users 를 찔러서 200 이 오는지 확인.
+			testClient := orgserver.NewWithToken(body.URL, body.Token)
+			if _, probeErr := testClient.ListUsers(body.OrgID); probeErr != nil {
+				w.WriteHeader(http.StatusBadGateway)
+				json.NewEncoder(w).Encode(map[string]string{"error": "조직서버 접속 실패: " + probeErr.Error()})
+				return
+			}
+			if err := s.orgs.Upsert(body); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		case http.MethodDelete:
+			var body struct {
+				OrgID string `json:"org_id"`
+			}
+			json.NewDecoder(r.Body).Decode(&body)
+			if err := s.orgs.Remove(body.OrgID); err != nil {
+				w.WriteHeader(http.StatusNotFound)
+				json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		case http.MethodPatch:
+			var body struct {
+				OrgID  string `json:"org_id"`
+				Active bool   `json:"active"`
+			}
+			json.NewDecoder(r.Body).Decode(&body)
+			if body.Active {
+				if err := s.orgs.SetActive(body.OrgID); err != nil {
+					w.WriteHeader(http.StatusNotFound)
+					json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+					return
+				}
+			}
+			json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		default:
+			http.NotFound(w, r)
+		}
 	})
 
 	mux.HandleFunc("/api/auth/send-otp", func(w http.ResponseWriter, r *http.Request) {
@@ -2044,12 +2147,6 @@ func (s *Server) StartAdmin() {
 		// 가드레일/whitelist 검증) 를 빠르게 돌리기 위해 모든 등록된 사용자도 같이 우회.
 		// production 환경(s.cfg.TestMode == false)에서는 이 분기 자체가 실행 안 됨.
 		if s.cfg.TestMode {
-			// Per-user IP binding check (TEST MODE login)
-			if !isUserIPAllowed(body.Email, r) {
-				w.WriteHeader(http.StatusForbidden)
-				json.NewEncoder(w).Encode(map[string]string{"error": "등록된 IP에서만 로그인 가능합니다."})
-				return
-			}
 			isOwner := ownerMatch(body.Email)
 			loginType := "test_user"
 			if isOwner {
@@ -2064,6 +2161,12 @@ func (s *Server) StartAdmin() {
 			if !allowed {
 				w.WriteHeader(http.StatusForbidden)
 				json.NewEncoder(w).Encode(map[string]string{"error": pendingMsg})
+				return
+			}
+			// TOFU IP 검증 (GCP 중앙) — resolveLoginAccess 뒤에 실행해서 user 가 GCP 에 sync 된 뒤 체크.
+			if ok, msg := checkLoginIP(body.Email, orgID, r); !ok && msg != "" {
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(map[string]string{"error": msg})
 				return
 			}
 			if err := issueSession(w, body.Email, body.Email, roleVal, orgID); err != nil {
@@ -2136,17 +2239,6 @@ func (s *Server) StartAdmin() {
 			return
 		}
 
-		// Per-user IP binding check (OTP login)
-		if !isUserIPAllowed(body.Email, r) {
-			w.WriteHeader(http.StatusForbidden)
-			json.NewEncoder(w).Encode(map[string]string{"error": "등록된 IP에서만 로그인 가능합니다."})
-			return
-		}
-
-		roleVal := roles.User
-		orgID := defaultOrgID
-
-		roleVal = roles.User
 		roleVal, orgID, allowed, pendingMsg, err := resolveLoginAccess(body.Email, body.Email, "email_otp", "", r)
 		if err != nil {
 			w.WriteHeader(http.StatusBadGateway)
@@ -2156,6 +2248,13 @@ func (s *Server) StartAdmin() {
 		if !allowed {
 			w.WriteHeader(http.StatusForbidden)
 			json.NewEncoder(w).Encode(map[string]string{"error": pendingMsg})
+			return
+		}
+
+		// TOFU IP 검증 (GCP 중앙)
+		if ok, msg := checkLoginIP(body.Email, orgID, r); !ok && msg != "" {
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]string{"error": msg})
 			return
 		}
 
@@ -2245,7 +2344,7 @@ func (s *Server) StartAdmin() {
 			json.NewEncoder(w).Encode(map[string]string{"error": "회원가입 실패: " + err.Error()})
 			return
 		}
-		if err := s.orgServer.RegisterUserWithState(orgID, body.Email, body.Password, role, string(status), machineID, machineName); err != nil {
+		if err := s.orgs.ClientFor(orgID).RegisterUserWithState(orgID, body.Email, body.Password, role, string(status), machineID, machineName); err != nil {
 			_ = s.users.Delete(body.Email)
 			w.WriteHeader(http.StatusBadGateway)
 			json.NewEncoder(w).Encode(map[string]string{"error": "조직 서버 저장 실패: " + err.Error()})
@@ -2282,7 +2381,7 @@ func (s *Server) StartAdmin() {
 			if orgID == "" {
 				orgID = defaultOrgID
 			}
-			if remoteUsers, err := s.orgServer.ListUsers(orgID); err == nil {
+			if remoteUsers, err := s.orgs.ClientFor(orgID).ListUsers(orgID); err == nil {
 				seen := make(map[string]bool)
 				for _, u := range allUsers {
 					seen[strings.ToLower(u.Email)] = true
@@ -2322,6 +2421,7 @@ func (s *Server) StartAdmin() {
 				Status            string `json:"status"`
 				AccessLevel       string `json:"access_level"`
 				CreatedAt         string `json:"created_at"`
+				RegisteredIP      string `json:"registered_ip,omitempty"`
 				WorkstationStatus string `json:"workstation_status,omitempty"`
 				InstanceID        string `json:"instance_id,omitempty"`
 			}
@@ -2342,7 +2442,8 @@ func (s *Server) StartAdmin() {
 					OrgID:       u.OrgID,
 					Status:      string(u.Status),
 					AccessLevel: accessLevel,
-					CreatedAt:   u.CreatedAt.Format("2006-01-02 15:04"),
+					CreatedAt:    u.CreatedAt.Format("2006-01-02 15:04"),
+					RegisteredIP: u.RegisteredIP,
 					WorkstationStatus: func() string {
 						if u.Workstation == nil {
 							return ""
@@ -2393,7 +2494,7 @@ func (s *Server) StartAdmin() {
 					return
 				}
 				// Sync approved status to GCP org server
-				if err := s.orgServer.RegisterUserWithState(defaultOrgID, body.Email, "", string(roles.User), "approved", "", ""); err != nil {
+				if err := s.orgs.ClientFor(defaultOrgID).RegisterUserWithState(defaultOrgID, body.Email, "", string(roles.User), "approved", "", ""); err != nil {
 					log.Printf("[approve] org server sync failed for %s: %v", body.Email, err)
 				}
 				if _, err := ensureWorkstation(r.Context(), body.Email, defaultOrgID); err != nil {
@@ -2442,7 +2543,7 @@ func (s *Server) StartAdmin() {
 					workstation = toOrgWorkstation(ws)
 				}
 			}
-			if err := s.orgServer.UpdateUser(defaultOrgID, body.Email, role, status, body.AccessLevel, workstation, machineID, machineName); err != nil {
+			if err := s.orgs.ClientFor(defaultOrgID).UpdateUser(defaultOrgID, body.Email, role, status, body.AccessLevel, workstation, machineID, machineName); err != nil {
 				w.WriteHeader(http.StatusBadGateway)
 				json.NewEncoder(w).Encode(map[string]string{"error": "조직 서버 반영 실패: " + err.Error()})
 				return
@@ -2477,7 +2578,7 @@ func (s *Server) StartAdmin() {
 				return
 			}
 			// 3) org server 에서 제거
-			if err := s.orgServer.DeleteUser(defaultOrgID, body.Email); err != nil {
+			if err := s.orgs.ClientFor(defaultOrgID).DeleteUser(defaultOrgID, body.Email); err != nil {
 				w.WriteHeader(http.StatusBadGateway)
 				json.NewEncoder(w).Encode(map[string]string{"error": "조직 서버 삭제 실패: " + err.Error()})
 				return
@@ -2496,7 +2597,7 @@ func (s *Server) StartAdmin() {
 			http.NotFound(w, r)
 			return
 		}
-		proposal, err := s.orgServer.ProposeAmendment(defaultOrgID)
+		proposal, err := s.orgs.ClientFor(defaultOrgID).ProposeAmendment(defaultOrgID)
 		if err != nil {
 			w.WriteHeader(http.StatusBadGateway)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
@@ -2532,7 +2633,7 @@ func (s *Server) StartAdmin() {
 			http.NotFound(w, r)
 			return
 		}
-		proposal, err := s.orgServer.ProposeG1Amendment(defaultOrgID)
+		proposal, err := s.orgs.ClientFor(defaultOrgID).ProposeG1Amendment(defaultOrgID)
 		if err != nil {
 			w.WriteHeader(http.StatusBadGateway)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
@@ -3777,7 +3878,7 @@ func (s *Server) StartAdmin() {
 								go func() {
 									newConstitution := applyConstitutionDiff(diffText)
 									if newConstitution != "" {
-										s.orgServer.UpdatePolicy(orgID, map[string]any{
+										s.orgs.ClientFor(orgID).UpdatePolicy(orgID, map[string]any{
 											"guardrail": map[string]any{"constitution": newConstitution},
 										})
 										log.Printf("[amendment] G2 constitution applied from diff")
@@ -3799,7 +3900,7 @@ func (s *Server) StartAdmin() {
 			if status == "approved" {
 				decision = "approve"
 			}
-			go s.orgServer.AppendTrainingLog(orgID, map[string]any{
+			go s.orgs.ClientFor(orgID).AppendTrainingLog(orgID, map[string]any{
 				"text":           approvalText,
 				"mode":           approvalMode,
 				"flagged_reason": approvalReason,

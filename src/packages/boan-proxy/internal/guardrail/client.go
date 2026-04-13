@@ -12,6 +12,7 @@ import (
 
 type Client struct {
 	baseURL string
+	token   string
 	http    *http.Client
 }
 
@@ -33,11 +34,18 @@ type EvaluateResponse struct {
 }
 
 func New(baseURL string) *Client {
+	return NewWithToken(baseURL, "")
+}
+
+func NewWithToken(baseURL, token string) *Client {
 	return &Client{
 		baseURL: strings.TrimRight(strings.TrimSpace(baseURL), "/"),
+		token:   token,
 		http:    &http.Client{Timeout: 8 * time.Second},
 	}
 }
+
+func (c *Client) SetToken(t string) { c.token = t }
 
 func (c *Client) doPost(ctx context.Context, url string, req EvaluateRequest) (*EvaluateResponse, error) {
 	raw, err := json.Marshal(req)
@@ -49,6 +57,9 @@ func (c *Client) doPost(ctx context.Context, url string, req EvaluateRequest) (*
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	if c.token != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.token)
+	}
 
 	resp, err := c.http.Do(httpReq)
 	if err != nil {

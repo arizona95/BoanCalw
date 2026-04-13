@@ -2,3 +2,4 @@
 # Deployment-specific state files (written by install.sh/watcher, not source)
 .boanclaw-version
 .boanclaw-latest
+.env

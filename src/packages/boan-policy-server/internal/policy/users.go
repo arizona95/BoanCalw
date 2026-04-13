@@ -31,6 +31,9 @@ type OrgUser struct {
 	CreatedAt    time.Time    `json:"created_at"`
 	LastLoginAt  time.Time    `json:"last_login_at,omitempty"`
 	Workstation  *Workstation `json:"workstation,omitempty"`
+	// RegisteredIP: TOFU (Trust On First Use) — 첫 로그인 시 자동 캡처, 이후 이 IP 에서만 로그인 허용.
+	// owner/user 구분 없이 동일 패턴. GCP 중앙 저장 → 모든 배포에서 일관.
+	RegisteredIP string `json:"registered_ip,omitempty"`
 }
 
 type Workstation struct {
@@ -217,6 +220,57 @@ func (s *Store) DeleteUser(orgID, email string) error {
 		return ErrUserNotFound
 	}
 	return s.saveUsers(orgID, filtered)
+}
+
+// CheckOrCaptureLoginIP — TOFU IP 바인딩.
+// user 없으면 (allowed=false, "user_not_found").
+// user.RegisteredIP 비어있으면 clientIP 저장 후 allowed=true.
+// user.RegisteredIP == clientIP → allowed=true.
+// 아니면 allowed=false, "ip_mismatch".
+func (s *Store) CheckOrCaptureLoginIP(orgID, email, clientIP string) (bool, string, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	users, err := s.loadUsers(orgID)
+	if err != nil {
+		return false, "load_failed", "", err
+	}
+	email = strings.TrimSpace(strings.ToLower(email))
+	for _, u := range users {
+		if u.Email != email {
+			continue
+		}
+		if u.RegisteredIP == "" {
+			u.RegisteredIP = clientIP
+			if err := s.saveUsers(orgID, users); err != nil {
+				return false, "save_failed", "", err
+			}
+			return true, "captured", clientIP, nil
+		}
+		if u.RegisteredIP == clientIP {
+			return true, "match", u.RegisteredIP, nil
+		}
+		return false, "ip_mismatch", u.RegisteredIP, nil
+	}
+	return false, "user_not_found", "", nil
+}
+
+// ResetUserIP — 관리자가 IP 재설정 (예: 사용자가 PC 교체 시).
+func (s *Store) ResetUserIP(orgID, email string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	users, err := s.loadUsers(orgID)
+	if err != nil {
+		return err
+	}
+	email = strings.TrimSpace(strings.ToLower(email))
+	for _, u := range users {
+		if u.Email == email {
+			u.RegisteredIP = ""
+			return s.saveUsers(orgID, users)
+		}
+	}
+	return ErrUserNotFound
 }
 
 func (s *Store) ListUsers(orgID string) ([]*OrgUser, error) {

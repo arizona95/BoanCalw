@@ -97,13 +97,13 @@ function Shell() {
   type NavItem = { path: string; label: string; icon: string; separator?: boolean };
   const NAV_ITEMS: NavItem[] = canEdit
     ? [
+        { path: "/authorization", label: "Authorization", icon: "🔐" },
         { path: "/llm-registry", label: "LLM Registry", icon: "🤖" },
         { path: "/gateway", label: "Gateway Policies", icon: "🛡️" },
         { path: "/credentials", label: "Credentials", icon: "🔑" },
         { path: "/approvals", label: "Approvals", icon: "✅" },
         { path: "/observability", label: "Observability", icon: "🔭" },
         { path: "/wiki", label: "G3 Wiki", icon: "📚" },
-        { path: "/authorization", label: "Authorization", icon: "🔐" },
         { path: "/my-boanclaw", label: "BoanClaw", icon: "🦞", separator: true },
         { path: "/files", label: "File Manager", icon: "📂" },
         { path: "/my-gcp", label: "Personal Computer", icon: "🖥️" },

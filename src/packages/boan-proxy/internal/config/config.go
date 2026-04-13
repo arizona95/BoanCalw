@@ -14,6 +14,7 @@ type Config struct {
 	TestMode                  bool          `json:"test_mode"`
 	OrgID                     string        `json:"org_id"`
 	PolicyURL                 string        `json:"policy_url"`
+	OrgToken                  string        `json:"org_token"`
 	PolicyTTL                 time.Duration `json:"policy_ttl"`
 	AuditEndpoint             string        `json:"audit_endpoint"`
 	TLSCACert                 string        `json:"tls_ca_cert"`
@@ -75,6 +76,7 @@ func Load() (*Config, error) {
 		TestMode:                  envBool("TEST", false) || envBool("BOAN_TEST_MODE", false),
 		OrgID:                     env("BOAN_ORG_ID", ""),
 		PolicyURL:                 env("BOAN_POLICY_URL", ""),
+		OrgToken:                  env("BOAN_ORG_TOKEN", ""),
 		PolicyTTL:                 60 * time.Second,
 		AuditEndpoint:             env("BOAN_AUDIT_ENDPOINT", ""),
 		TLSCACert:                 env("BOAN_CA_CERT", "/etc/boan/ca.crt"),

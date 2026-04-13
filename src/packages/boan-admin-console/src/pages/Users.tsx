@@ -7,6 +7,7 @@ interface UserRow {
   status: string;
   access_level: string;
   created_at: string;
+  registered_ip?: string;
 }
 
 const ROLE_BADGE: Record<string, string> = {
@@ -90,6 +91,7 @@ export default function Users() {
                 <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500">권한</th>
                 <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500">조직</th>
                 <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500">상태</th>
+                <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500">등록 IP</th>
                 <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500">가입일</th>
                 <th className="text-right px-4 py-3 text-xs font-semibold text-gray-500">관리</th>
               </tr>
@@ -129,6 +131,9 @@ export default function Users() {
                         활성
                       </span>
                     )}
+                  </td>
+                  <td className="px-4 py-3 text-xs font-mono text-gray-500">
+                    {u.registered_ip || <span className="text-gray-300">-</span>}
                   </td>
                   <td className="px-4 py-3 text-xs text-gray-400">{u.created_at}</td>
                   <td className="px-4 py-3 text-right">

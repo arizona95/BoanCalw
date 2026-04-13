@@ -151,6 +151,7 @@ services:
       - BOAN_GCP_ORG_ID=${BOAN_GCP_ORG_ID:-}
       # 중앙 GCP 정책서버 — 소유자가 정책 변경 시 모든 배포에 자동 동기화
       - BOAN_POLICY_URL=https://boan-policy-server-sds-corp-3avhtf4kka-du.a.run.app
+      - BOAN_ORG_TOKEN=${BOAN_ORG_TOKEN:-}
       - BOAN_CREDENTIAL_FILTER_URL=http://boan-credential-filter:8082
       - BOAN_LLM_REGISTRY_URL=http://boan-llm-registry:8086
       - BOAN_OTEL_ENDPOINT=http://boan-audit-agent:8084
@@ -281,6 +282,7 @@ services:
       - BOAN_ADMIN_LISTEN=:18081
       # 중앙 GCP 정책서버 — 소유자가 정책 변경 시 모든 배포에 자동 동기화
       - BOAN_POLICY_URL=https://boan-policy-server-sds-corp-3avhtf4kka-du.a.run.app
+      - BOAN_ORG_TOKEN=${BOAN_ORG_TOKEN:-}
       - BOAN_AUDIT_ENDPOINT=http://boan-audit-agent:8084
       - BOAN_CREDENTIAL_FILTER_URL=http://boan-credential-filter:8082
       - BOAN_LLM_REGISTRY_URL=http://localhost:8086
@@ -305,10 +307,9 @@ services:
       - BOAN_VERSION_FILE=/app/.boanclaw-version
       - BOAN_LATEST_VERSION_FILE=/app/.boanclaw-latest
       - BOAN_UPDATE_TRIGGER_FILE=/app/triggers/update-requested
-      # 소유자 IP 제한 (fail-closed): 설정 안 하면 소유자 로그인 전부 차단.
-      # 소유자 PC 에서만:  export BOAN_OWNER_ALLOWED_IPS=127.0.0.1
-      # (일반 사용자 PC 는 설정하지 않음 → 소유자 계정으로 로그인해도 일반 사용자로 다운그레이드)
-      - BOAN_OWNER_ALLOWED_IPS=${BOAN_OWNER_ALLOWED_IPS:-}
+      # IP 바인딩은 GCP org-server 가 TOFU (Trust On First Use) 로 자동 관리.
+      # 첫 로그인 시 client IP 를 자동 캡처 → 이후 해당 IP 에서만 로그인 허용.
+      # 관리자가 리셋하려면: POST {policy-server}/org/{id}/v1/users/reset-ip
     ports:
       - "18789:18789"
     volumes:

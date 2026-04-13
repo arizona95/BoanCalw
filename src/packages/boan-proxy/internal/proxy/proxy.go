@@ -25,6 +25,7 @@ import (
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/network"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/orgserver"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/orgsettings"
+	"github.com/samsung-sds/boanclaw/boan-proxy/internal/orgstore"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/otp"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/promptguard"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/ratelimit"
@@ -49,6 +50,7 @@ type Server struct {
 	users        *userstore.Store
 	orgSettings  *orgsettings.Store
 	orgServer    *orgserver.Client
+	orgs         *orgstore.Store
 	otpStore     *otp.Store
 	workstations workstation.Provisioner
 	guac         *guac.Client
@@ -73,8 +75,9 @@ func New(cfg *config.Config) (*Server, error) {
 			return nil, fmt.Errorf("decode network policy pubkey: %w", err)
 		}
 		gate = network.NewGateWithKey(cfg.PolicyURL, cfg.OrgID, ed25519.PublicKey(pubKeyBytes))
+		gate.SetToken(cfg.OrgToken)
 	} else {
-		gate = network.NewGate(cfg.PolicyURL, cfg.OrgID)
+		gate = network.NewGateWithToken(cfg.PolicyURL, cfg.OrgID, cfg.OrgToken)
 	}
 
 	authProv := auth.New(auth.Config{
@@ -106,6 +109,23 @@ func New(cfg *config.Config) (*Server, error) {
 		}
 	}
 
+	// orgstore 레지스트리: 여러 조직 엔드포인트(URL+토큰) 를 저장.
+	// 첫 기동 시 env (BOAN_ORG_ID/BOAN_POLICY_URL/BOAN_ORG_TOKEN) 로 seed.
+	var seed *orgstore.Entry
+	if cfg.OrgID != "" && cfg.PolicyURL != "" && cfg.OrgToken != "" {
+		seed = &orgstore.Entry{
+			OrgID: cfg.OrgID,
+			URL:   cfg.PolicyURL,
+			Token: cfg.OrgToken,
+			Label: cfg.OrgID,
+		}
+	}
+	orgs, err := orgstore.New(userDataDir+"/orgs.json", seed)
+	if err != nil {
+		log.Printf("orgstore init warning: %v", err)
+		orgs, _ = orgstore.New(os.TempDir()+"/orgs.json", seed)
+	}
+
 	otpStore := otp.New(otp.SMTPConfig{
 		Host:     cfg.SMTPHost,
 		Port:     cfg.SMTPPort,
@@ -126,11 +146,12 @@ func New(cfg *config.Config) (*Server, error) {
 		authProv:     authProv,
 		users:        users,
 		orgSettings:  orgSettings,
-		orgServer:    orgserver.New(cfg.PolicyURL),
+		orgServer:    orgserver.NewWithToken(cfg.PolicyURL, cfg.OrgToken),
+		orgs:         orgs,
 		otpStore:     otpStore,
 		workstations: workstation.New(cfg),
 		guac:         guac.New(cfg),
-		guardrail:    guardrail.New(cfg.PolicyURL),
+		guardrail:    guardrail.NewWithToken(cfg.PolicyURL, cfg.OrgToken),
 		declinedFPs:  newDeclinedFingerprintStore(userDataDir),
 	}, nil
 }

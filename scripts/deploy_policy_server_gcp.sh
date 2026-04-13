@@ -150,6 +150,30 @@ echo "Applying terraform..."
   terraform apply -auto-approve
 )
 
+echo "Generating/loading org token..."
+TOKEN_FILE="$ROOT/deploy/config/${ORG_ID}.token"
+mkdir -p "$(dirname "$TOKEN_FILE")"
+if [[ -s "$TOKEN_FILE" ]]; then
+  ORG_TOKEN="$(cat "$TOKEN_FILE")"
+else
+  ORG_TOKEN="$(openssl rand -hex 32)"
+  echo "$ORG_TOKEN" > "$TOKEN_FILE"
+  chmod 600 "$TOKEN_FILE"
+fi
+
+POLICY_SERVICE_NAME="boan-policy-server-${ORG_ID}"
+echo "Injecting BOAN_ORG_TOKEN into Cloud Run service ${POLICY_SERVICE_NAME}..."
+gcloud run services update "${POLICY_SERVICE_NAME}" \
+  --project="$PROJECT_ID" --region="$REGION" \
+  --update-env-vars="BOAN_ORG_TOKEN=${ORG_TOKEN}" >/dev/null
+
+echo ""
+echo "========================================================"
+echo "  ORG:   ${ORG_ID}"
+echo "  TOKEN: ${ORG_TOKEN}"
+echo "  (saved to ${TOKEN_FILE} — hand to users during install)"
+echo "========================================================"
+echo ""
 echo "Deployment complete."
 echo "Cloud Run services:"
 gcloud run services list --project="$PROJECT_ID" --region="$REGION"
