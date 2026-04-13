@@ -195,19 +195,20 @@ function Shell() {
               </div>
               <div className="flex-1 min-w-0">
                 <p className="text-xs text-white truncate">{user.name ?? user.email}</p>
-                <span className={`text-xs px-1.5 py-0.5 rounded-full font-medium ${ROLE_COLOR[user.role] ?? ROLE_COLOR.user}`}>
-                  {user.role_label}
-                </span>
+                <div className="flex items-center gap-1.5">
+                  <span className={`text-xs px-1.5 py-0.5 rounded-full font-medium ${ROLE_COLOR[user.role] ?? ROLE_COLOR.user}`}>
+                    {user.role_label}
+                  </span>
+                  <button
+                    onClick={logout}
+                    title="로그아웃"
+                    className="text-xs text-white/40 hover:text-white/80 px-1.5 py-0.5 rounded hover:bg-white/10"
+                  >
+                    ↗ 로그아웃
+                  </button>
+                </div>
               </div>
             </div>
-            {user.enabled && (
-              <button
-                onClick={logout}
-                className="w-full text-xs text-white/40 hover:text-white/80 text-left"
-              >
-                로그아웃
-              </button>
-            )}
           </div>
         )}
       </aside>
