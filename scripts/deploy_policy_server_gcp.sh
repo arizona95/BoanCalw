@@ -173,6 +173,27 @@ echo "  ORG:   ${ORG_ID}"
 echo "  TOKEN: ${ORG_TOKEN}"
 echo "  (saved to ${TOKEN_FILE} — hand to users during install)"
 echo "========================================================"
+
+# Seed owner — 이 조직의 소유자 이메일을 policy-server users.json 에 role=owner 로 등록.
+# (email, org_id) 튜플이 org 별 고유 권한 key. 다른 org 에는 영향 없음.
+if [[ -n "${OWNER_EMAIL_VALUE:-}" ]]; then
+  SERVICE_URL="$(gcloud run services describe "${POLICY_SERVICE_NAME}" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)' 2>/dev/null || true)"
+  if [[ -n "$SERVICE_URL" ]]; then
+    echo "Seeding owner ${OWNER_EMAIL_VALUE} into ${ORG_ID}..."
+    # Cloud Run 새 revision 이 ready 될 때까지 최대 30초 대기
+    for i in 1 2 3 4 5 6; do
+      if curl -fsS -H "Authorization: Bearer ${ORG_TOKEN}" "${SERVICE_URL}/org/${ORG_ID}/v1/users" -o /dev/null 2>/dev/null; then
+        break
+      fi
+      sleep 5
+    done
+    curl -sS -X POST "${SERVICE_URL}/org/${ORG_ID}/v1/users/sso-sync" \
+      -H "Authorization: Bearer ${ORG_TOKEN}" \
+      -H "Content-Type: application/json" \
+      -d "{\"email\":\"${OWNER_EMAIL_VALUE}\",\"name\":\"${OWNER_EMAIL_VALUE}\",\"role\":\"owner\",\"provider\":\"deploy-seed\",\"status\":\"approved\"}" \
+      -w "\n[seed-owner] HTTP %{http_code}\n"
+  fi
+fi
 echo ""
 echo "Deployment complete."
 echo "Cloud Run services:"

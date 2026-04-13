@@ -560,42 +560,55 @@ func (s *Server) StartAdmin() {
 			orgID = wantOrgID
 		}
 
-		if ownerMatch(email) {
-			// IP 검증은 이 함수 밖의 checkLoginIP 에서 GCP 중앙 서버 경유로 수행됨 (TOFU).
-			// 여기서는 로컬/원격 user 레코드 생성만.
-			syncLocalUser(email, orgID, string(roles.Owner), userstore.StatusApproved)
-			if err := syncOrgUser(email, name, orgID, string(roles.Owner), provider, "approved"); err != nil {
-				return roles.User, orgID, false, "", err
-			}
-			return roles.Owner, orgID, true, "", nil
-		}
+		// 권한은 **해당 조직의 policy-server** 가 결정.
+		// 로컬 env BOAN_OWNER_EMAIL 은 "이 호스트의 로컬 관리자" 의미로만 쓰이고, 조직 owner 와 무관.
+		// key = (email, org_id). 한 이메일이 여러 조직에서 다른 역할을 가질 수 있음.
+		client := s.orgs.ClientFor(orgID)
 
-		if bound := readBoundUser(); bound != "" && bound != email {
-			return roles.User, orgID, false, deviceLockedMessage, nil
-		}
-
-		if users, err := s.orgs.ClientFor(orgID).ListUsers(orgID); err == nil {
+		// 먼저 org 에서 이 user 의 role 조회 — owner 는 device lock 도 우회해야 함.
+		var orgRole roles.Role
+		var orgStatus userstore.Status
+		var foundInOrg bool
+		if users, err := client.ListUsers(orgID); err == nil {
 			for _, u := range users {
 				if !strings.EqualFold(u.Email, email) {
 					continue
 				}
-				role := roles.User
-				if ownerMatch(email) {
-					role = roles.Owner
+				r := roles.Normalize(roles.Role(u.Role))
+				if r != roles.Owner {
+					r = roles.User
 				}
-				status := userstore.StatusPending
+				orgRole = r
+				orgStatus = userstore.StatusPending
 				if u.Status == string(userstore.StatusApproved) {
-					status = userstore.StatusApproved
+					orgStatus = userstore.StatusApproved
 				}
-				syncLocalUser(email, orgID, string(role), status)
-				if status == userstore.StatusApproved {
-					bindUserToPC(email)
-					return role, orgID, true, "", nil
-				}
-				return roles.User, orgID, false, requestApprovalMessage, nil
+				foundInOrg = true
+				break
 			}
 		}
 
+		// owner 가 아닌 일반 user 의 경우 device lock 적용 (한 PC 당 1명).
+		// owner 는 device lock 우회 (admin 용도).
+		if orgRole != roles.Owner {
+			if bound := readBoundUser(); bound != "" && bound != email {
+				return roles.User, orgID, false, deviceLockedMessage, nil
+			}
+		}
+
+		if foundInOrg {
+			syncLocalUser(email, orgID, string(orgRole), orgStatus)
+			if orgStatus == userstore.StatusApproved {
+				if orgRole != roles.Owner {
+					bindUserToPC(email)
+				}
+				return orgRole, orgID, true, "", nil
+			}
+			return roles.User, orgID, false, requestApprovalMessage, nil
+		}
+
+		// 해당 조직에 처음 들어오는 사람 — pending user 로 신청 접수.
+		// (조직 owner 는 deploy 시점에 seed 되므로 여기서 자동 owner 승격 없음.)
 		syncLocalUser(email, orgID, string(roles.User), userstore.StatusPending)
 		if err := syncOrgUser(email, name, orgID, string(roles.User), provider, "pending"); err != nil {
 			return roles.User, orgID, false, "", err
@@ -2085,15 +2098,55 @@ func (s *Server) StartAdmin() {
 			json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 		case http.MethodDelete:
 			var body struct {
-				OrgID string `json:"org_id"`
+				OrgID   string `json:"org_id"`
+				Cascade bool   `json:"cascade"`
 			}
 			json.NewDecoder(r.Body).Decode(&body)
+
+			// Cascade=true 면 조직 내 모든 사용자 + 워크스테이션 VM 을 먼저 제거.
+			// Policy-server (Cloud Run) 자체 삭제는 별도 gcloud 커맨드 필요 (proxy 에 권한 없음).
+			var purged []string
+			var failed []map[string]string
+			if body.Cascade {
+				client := s.orgs.ClientFor(body.OrgID)
+				users, err := client.ListUsers(body.OrgID)
+				if err != nil {
+					w.WriteHeader(http.StatusBadGateway)
+					json.NewEncoder(w).Encode(map[string]string{"error": "사용자 목록 조회 실패: " + err.Error()})
+					return
+				}
+				for _, u := range users {
+					// 1) VM 삭제 (best-effort)
+					if s.workstations != nil && u.Workstation != nil && u.Workstation.InstanceID != "" {
+						ws := &userstore.Workstation{
+							Provider:   u.Workstation.Provider,
+							Platform:   u.Workstation.Platform,
+							InstanceID: u.Workstation.InstanceID,
+							Region:     u.Workstation.Region,
+						}
+						if err := s.workstations.Delete(r.Context(), u.Email, body.OrgID, ws); err != nil {
+							failed = append(failed, map[string]string{"email": u.Email, "error": "vm: " + err.Error()})
+						}
+					}
+					// 2) policy-server 에서 user 레코드 삭제
+					if err := client.DeleteUser(body.OrgID, u.Email); err != nil {
+						failed = append(failed, map[string]string{"email": u.Email, "error": "remote: " + err.Error()})
+						continue
+					}
+					purged = append(purged, u.Email)
+				}
+			}
 			if err := s.orgs.Remove(body.OrgID); err != nil {
 				w.WriteHeader(http.StatusNotFound)
 				json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 				return
 			}
-			json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+			json.NewEncoder(w).Encode(map[string]any{
+				"status":       "ok",
+				"purged_users": purged,
+				"failed":       failed,
+				"cloud_run_note": "Cloud Run 서비스 (policy-server-" + body.OrgID + ") 는 별도 gcloud 명령으로 삭제 필요",
+			})
 		case http.MethodPatch:
 			var body struct {
 				OrgID  string `json:"org_id"`
