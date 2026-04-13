@@ -2,16 +2,17 @@ import { useState } from "react";
 import { useNavigate, Link } from "react-router-dom";
 
 // Register — 사용자 가입 UX (한 줄 설치 후 처음 보는 화면).
-// 입력: 조직 ID (소유자가 알려준) + 이메일 (SSO 용).
-// 비밀번호 / URL / 토큰 등은 사용자가 건드리지 않음.
-// 뒤에서 proxy 가 org_id → URL 을 pattern 으로 resolve 하고, 공개 register 엔드포인트 호출.
+// 입력 2개: 조직서버 URL (소유자가 알려준) + 본인 SSO 이메일.
+// Backend 가 URL 에서 org_id 를 자동 파싱 + 공개 register 엔드포인트 호출.
+// 사용자는 토큰/조직 ID 를 따로 볼 일 없음.
 export default function Register() {
   const navigate = useNavigate();
-  const [orgID, setOrgID] = useState("");
+  const [orgURL, setOrgURL] = useState("");
   const [email, setEmail] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState(false);
+  const [resultOrgID, setResultOrgID] = useState("");
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -21,13 +22,14 @@ export default function Register() {
       const res = await fetch("/api/auth/join-org", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, org_id: orgID }),
+        body: JSON.stringify({ email, url: orgURL }),
       });
       const data = await res.json();
       if (!res.ok) {
         setError(data.error ?? "가입 신청 실패");
         return;
       }
+      setResultOrgID(data.org_id ?? "");
       setDone(true);
     } catch {
       setError("서버 연결 실패");
@@ -43,8 +45,8 @@ export default function Register() {
           <div className="text-5xl">✅</div>
           <h2 className="text-xl font-bold text-gray-800">사용 요청 완료</h2>
           <p className="text-sm text-gray-500">
-            조직 <b className="font-mono">{orgID}</b> 의 소유자에게 사용 요청이 전달되었습니다.<br />
-            승인 후 이 화면에서 로그인할 수 있습니다.
+            조직 <b className="font-mono">{resultOrgID}</b> 의 소유자에게 요청이 전달되었습니다.<br />
+            승인 후 로그인 화면에서 접속할 수 있습니다.
           </p>
           <button
             onClick={() => navigate("/login")}
@@ -68,16 +70,16 @@ export default function Register() {
 
         <div className="bg-white rounded-2xl shadow-2xl p-8">
           <p className="text-center text-xs text-gray-500 mb-5">
-            조직 소유자에게 받은 조직 ID 와<br />본인 회사 이메일을 입력하세요.
+            소유자에게서 받은 조직서버 URL 과<br />본인 회사 이메일을 입력하세요.
           </p>
           <form onSubmit={handleSubmit} className="space-y-3">
             <div>
-              <label className="text-[11px] font-medium text-gray-500 ml-1">조직 ID</label>
+              <label className="text-[11px] font-medium text-gray-500 ml-1">조직서버 URL</label>
               <input
-                type="text"
-                placeholder="예: sds-corp"
-                value={orgID}
-                onChange={(e) => setOrgID(e.target.value)}
+                type="url"
+                placeholder="https://boan-policy-server-..."
+                value={orgURL}
+                onChange={(e) => setOrgURL(e.target.value)}
                 required
                 autoCapitalize="none"
                 autoComplete="off"
@@ -100,7 +102,7 @@ export default function Register() {
 
             <button
               type="submit"
-              disabled={loading || !orgID || !email}
+              disabled={loading || !orgURL || !email}
               className="w-full py-3 bg-boan-600 text-white rounded-xl text-sm font-medium hover:bg-boan-700 disabled:opacity-40 transition-colors"
             >
               {loading ? "요청 중..." : "사용 요청"}
