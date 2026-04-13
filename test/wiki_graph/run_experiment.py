@@ -113,27 +113,64 @@ def classify(text: str) -> str | None:
     return None
 
 
+USE_REAL_SKILL = os.environ.get("USE_REAL_SKILL", "1") == "1"  # 기본 ON — proxy 의 skill.wiki_edit 사용
+PROXY_URL = os.environ.get("PROXY_URL", "http://localhost:19080")  # local proxy
+PROXY_JAR = os.environ.get("PROXY_JAR", "/tmp/ssc.jar")  # 세션 쿠키 파일
+
+
+def call_real_skill(decision: dict) -> dict:
+    """proxy 의 /api/wiki-graph/skill/wiki_edit 호출 (LLM 경유)."""
+    import subprocess
+    body = {
+        "input": decision["input"],
+        "decision": decision["decision"],
+        "reason": decision.get("reason", ""),
+        "labeler": "experiment-runner",
+    }
+    # curl 사용 (cookie jar 공유). python urllib 는 cookie jar 지원이 번거로워서.
+    res = subprocess.run(
+        ["curl", "-s", "-X", "POST", f"{PROXY_URL}/api/wiki-graph/skill/wiki_edit",
+         "-b", PROXY_JAR, "-H", "Content-Type: application/json",
+         "-d", json.dumps(body, ensure_ascii=False)],
+        capture_output=True, text=True, timeout=90,
+    )
+    try:
+        return json.loads(res.stdout)
+    except Exception:
+        return {"error": f"parse: {res.stdout[:200]}"}
+
+
 def emulate_skill_wiki_edit(decision: dict, existing_nodes: list[dict]) -> tuple[list[dict], list[dict]]:
     """
     deny 결정마다:
-      - 카테고리 분류 → 기존 노드와 매칭하면 update (content append),
-        없으면 신규 생성.
-      - 노드가 5개 이상 같은 카테고리면 supports edge 로 'umbrella' 노드 추가.
+      - USE_REAL_SKILL=1 이면 proxy 의 LLM skill 호출.
+      - 아니면 휴리스틱 (키워드 매칭 기반).
     """
     new_nodes, new_edges = [], []
-    if decision["decision"] != "deny":
+
+    if USE_REAL_SKILL:
+        if decision["decision"] != "deny":
+            return new_nodes, new_edges
+        res = call_real_skill(decision)
+        if "error" in res:
+            print(f"    skill error: {res['error'][:100]}")
+            return new_nodes, new_edges
+        # res = {actions_planned, nodes_created: [ids], nodes_updated, edges_created, errors}
+        for nid in res.get("nodes_created") or []:
+            new_nodes.append({"id": nid, "definition": "(created by LLM)"})
+        for nid in res.get("nodes_updated") or []:
+            new_nodes.append({"id": nid, "definition": "(updated by LLM)"})
         return new_nodes, new_edges
 
+    # ─ 휴리스틱 fallback ─
+    if decision["decision"] != "deny":
+        return new_nodes, new_edges
     cat = classify(decision["input"])
     if not cat:
         return new_nodes, new_edges
-
     cat_def, _ = KEYWORD_GROUPS[cat]
-    # 기존 노드 중 같은 카테고리 정의 찾기.
     existing = [n for n in existing_nodes if n.get("definition", "").startswith(cat_def)]
-
     if not existing:
-        # 신규 노드.
         node = req("POST", "nodes", {
             "definition": cat_def[:30],
             "content": f"패턴: {cat_def}\n예시: {decision['input'][:200]}",
@@ -142,7 +179,6 @@ def emulate_skill_wiki_edit(decision: dict, existing_nodes: list[dict]) -> tuple
         })
         new_nodes.append(node)
     else:
-        # 기존 노드 content 에 예시 추가 (1000자 한도 내).
         n = existing[0]
         addition = f"\n- {decision['input'][:80]}"
         new_content = (n.get("content", "") + addition)[:980]
@@ -151,7 +187,6 @@ def emulate_skill_wiki_edit(decision: dict, existing_nodes: list[dict]) -> tuple
             "updated_by": "skill.wiki_edit (heuristic)",
         })
         new_nodes.append(updated)
-
     return new_nodes, new_edges
 
 

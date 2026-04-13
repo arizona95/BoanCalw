@@ -29,6 +29,7 @@ import (
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/auth"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/orgserver"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/orgstore"
+	"github.com/samsung-sds/boanclaw/boan-proxy/internal/wikiskills"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/roles"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/userstore"
 )
@@ -3295,9 +3296,41 @@ func (s *Server) StartAdmin() {
 		}
 	}
 
+	// lookupLLMByRole — registry 에서 주어진 role 의 첫 LLM 조회.
+	lookupLLMByRole := func(role string) (url, model string, found bool) {
+		if s.cfg.LLMRegistryURL == "" {
+			return
+		}
+		regURL := strings.TrimRight(s.cfg.LLMRegistryURL, "/") + "/llm/list"
+		resp, err := http.Get(regURL)
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+		var llms []struct {
+			Name     string   `json:"name"`
+			Endpoint string   `json:"endpoint"`
+			Roles    []string `json:"roles"`
+			Healthy  bool     `json:"healthy"`
+		}
+		if json.NewDecoder(resp.Body).Decode(&llms) != nil {
+			return
+		}
+		for _, l := range llms {
+			if l.Endpoint == "" {
+				continue
+			}
+			for _, rl := range l.Roles {
+				if rl == role {
+					return l.Endpoint + "/v1/chat/completions", l.Name, true
+				}
+			}
+		}
+		return
+	}
+
 	// ── Wiki Graph pass-through (Layer A primitive API) ──────────────
 	// /api/wiki-graph/* → policy-server 의 /org/{id}/v1/wiki-graph/*
-	// Owner 권한 필요 (admin session).
 	mux.HandleFunc("/api/wiki-graph/", func(w http.ResponseWriter, r *http.Request) {
 		if cors(w, r) {
 			return
@@ -3308,6 +3341,49 @@ func (s *Server) StartAdmin() {
 			orgURL = entry.URL
 		}
 		suffix := strings.TrimPrefix(r.URL.Path, "/api/wiki-graph/")
+
+		// skill/wiki_edit 은 LLM 호출이 필요한 composite endpoint — 별도 분기.
+		if suffix == "skill/wiki_edit" && r.Method == http.MethodPost {
+			var body wikiskills.Decision
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			// LLM 찾기 — registry 의 g3 role 재사용 (또는 wiki_edit role 도 매칭).
+			llmURL, llmModel, found := lookupLLMByRole("wiki_edit")
+			if !found {
+				llmURL, llmModel, found = lookupLLMByRole("g3")
+			}
+			if !found {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusPreconditionFailed)
+				json.NewEncoder(w).Encode(map[string]string{
+					"error": "LLM Registry 에 role=wiki_edit 또는 role=g3 로 바인딩된 LLM 없음",
+				})
+				return
+			}
+			// 로컬 token 확보.
+			var orgToken string
+			if entry, ok := s.orgs.Resolve(orgID); ok {
+				orgToken = entry.Token
+			}
+			gc := wikiskills.NewGraphClient(orgURL, orgID, orgToken)
+			res, err := wikiskills.RunWikiEdit(r.Context(), gc, wikiskills.LLMConfig{URL: llmURL, Model: llmModel}, body)
+			w.Header().Set("Content-Type", "application/json")
+			if err != nil {
+				w.WriteHeader(http.StatusBadGateway)
+				out := map[string]any{"error": err.Error()}
+				if res != nil {
+					out["partial_result"] = res
+				}
+				json.NewEncoder(w).Encode(out)
+				return
+			}
+			json.NewEncoder(w).Encode(res)
+			return
+		}
+
+		// 일반 primitive pass-through.
 		target := orgURL + "/org/" + orgID + "/v1/wiki-graph/" + suffix
 		if r.URL.RawQuery != "" {
 			target += "?" + r.URL.RawQuery
