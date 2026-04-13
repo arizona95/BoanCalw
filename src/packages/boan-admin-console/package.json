@@ -14,11 +14,14 @@
     "axios": "0.0.0-do-not-install"
   },
   "dependencies": {
+    "@xyflow/react": "^12.3.5",
+    "dagre": "^0.8.5",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-router-dom": "^6.26.0"
   },
   "devDependencies": {
+    "@types/dagre": "^0.7.52",
     "@types/react": "^18.3.0",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.0",

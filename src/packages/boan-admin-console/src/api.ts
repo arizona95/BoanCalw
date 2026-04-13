@@ -411,6 +411,69 @@ export const guardrailApi = {
   g1Defaults: () => request<G1DefaultsResponse>("/api/guardrail/g1-defaults"),
 };
 
+// ── Wiki Graph (LLM 이 편집하는 지식 그래프) ─────────────────
+export interface WikiNode {
+  id: string;
+  definition: string;  // <= 30자
+  content: string;     // <= 1000자
+  tags?: string[];
+  created_by?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface WikiEdge {
+  id: string;
+  from: string;
+  to: string;
+  relation: string;    // supports/contradicts/refines/example_of/depends_on/evolved_from/inline_ref
+  reason?: string;
+  weight?: number;
+}
+
+export interface WikiDecision {
+  id?: string;
+  input: string;
+  decision: "approve" | "deny";
+  reason?: string;
+  labeler?: string;
+  timestamp?: string;
+}
+
+export interface SkillWikiEditResult {
+  actions_planned: number;
+  nodes_created?: string[];
+  nodes_updated?: string[];
+  edges_created?: string[];
+  errors?: string[];
+  llm_raw?: string;
+}
+
+export const wikiGraphApi = {
+  listNodes: () => request<WikiNode[]>("/api/wiki-graph/nodes"),
+  getNode: (id: string) => request<WikiNode>(`/api/wiki-graph/nodes/${id}`),
+  createNode: (n: Partial<WikiNode>) =>
+    request<WikiNode>("/api/wiki-graph/nodes", { method: "POST", body: JSON.stringify(n) }),
+  updateNode: (id: string, patch: Partial<WikiNode> & { updated_by?: string }) =>
+    request<WikiNode>(`/api/wiki-graph/nodes/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
+  deleteNode: (id: string) =>
+    request<{ status: string }>(`/api/wiki-graph/nodes/${id}`, { method: "DELETE" }),
+  listEdges: () => request<WikiEdge[]>("/api/wiki-graph/edges"),
+  createEdge: (e: Partial<WikiEdge>) =>
+    request<WikiEdge>("/api/wiki-graph/edges", { method: "POST", body: JSON.stringify(e) }),
+  deleteEdge: (id: string) =>
+    request<{ status: string }>(`/api/wiki-graph/edges/${id}`, { method: "DELETE" }),
+  listDecisions: (limit = 50) =>
+    request<WikiDecision[]>(`/api/wiki-graph/decisions?limit=${limit}`),
+  appendDecision: (d: WikiDecision) =>
+    request<WikiDecision>("/api/wiki-graph/decisions", { method: "POST", body: JSON.stringify(d) }),
+  runWikiEdit: (d: WikiDecision) =>
+    request<SkillWikiEditResult>("/api/wiki-graph/skill/wiki_edit", {
+      method: "POST",
+      body: JSON.stringify(d),
+    }),
+};
+
 export const workstationApi = {
   me: () =>
     fetch("/api/workstation/me", { credentials: "include" }).then((r) => {
