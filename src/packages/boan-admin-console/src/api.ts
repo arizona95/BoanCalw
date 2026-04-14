@@ -493,6 +493,13 @@ export const wikiGraphApi = {
       method: "POST",
       body: JSON.stringify(d),
     }),
+  runFindAmbiguous: () =>
+    request<{
+      questions_found: number;
+      dialogs_created: string[];
+      errors?: string[];
+      llm_raw?: string;
+    }>("/api/wiki-graph/skill/find_ambiguous", { method: "POST", body: "{}" }),
 };
 
 export const workstationApi = {

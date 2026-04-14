@@ -15,7 +15,6 @@ import FileManager from "./pages/FileManager";
 import Observability from "./pages/Observability";
 import MyBoanClaw from "./pages/MyBoanClaw";
 import MyGCP from "./pages/MyGCP";
-import Wiki from "./pages/Wiki";
 import WikiGraph from "./pages/WikiGraph";
 
 const ROLE_COLOR: Record<string, string> = {
@@ -104,8 +103,7 @@ function Shell() {
         { path: "/credentials", label: "Credentials", icon: "🔑" },
         { path: "/approvals", label: "Approvals", icon: "✅" },
         { path: "/observability", label: "Observability", icon: "🔭" },
-        { path: "/wiki", label: "G3 Wiki", icon: "📚" },
-        { path: "/wiki-graph", label: "Wiki Graph", icon: "🕸️" },
+        { path: "/wiki-graph", label: "G3 Graph Wiki", icon: "🕸️" },
         { path: "/my-boanclaw", label: "BoanClaw", icon: "🦞", separator: true },
         { path: "/files", label: "File Manager", icon: "📂" },
         { path: "/my-gcp", label: "Personal Computer", icon: "🖥️" },
@@ -240,7 +238,7 @@ function Shell() {
               <Route path="/credentials" element={<Credentials />} />
               <Route path="/approvals" element={canEdit ? <Approvals /> : <ReadOnly />} />
               <Route path="/observability" element={canEdit ? <Observability /> : <ReadOnly />} />
-              <Route path="/wiki" element={canEdit ? <Wiki /> : <ReadOnly />} />
+              <Route path="/wiki" element={<Navigate to="/wiki-graph" replace />} />
               <Route path="/wiki-graph" element={canEdit ? <WikiGraph /> : <ReadOnly />} />
               {/* Authorization = Users + SSO 통합 */}
               <Route path="/authorization" element={canEdit ? <Authorization /> : <ReadOnly />} />

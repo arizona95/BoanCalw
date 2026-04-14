@@ -144,6 +144,32 @@ func (c *GraphClient) AppendDecision(ctx context.Context, d Decision) error {
 	return c.call(ctx, "POST", "decisions", d, nil)
 }
 
+// ── Dialog model ────────────────────────────────────────
+type DialogTurn struct {
+	Role     string   `json:"role"` // "llm" | "human"
+	Content  string   `json:"content"`
+	Examples []string `json:"examples,omitempty"`
+}
+type ClarificationDialog struct {
+	ID          string       `json:"id,omitempty"`
+	TopicNodeID string       `json:"topic_node_id,omitempty"`
+	Turns       []DialogTurn `json:"turns"`
+}
+
+func (c *GraphClient) ListDecisions(ctx context.Context, limit int) ([]Decision, error) {
+	var ds []Decision
+	err := c.call(ctx, "GET", fmt.Sprintf("decisions?limit=%d", limit), nil, &ds)
+	return ds, err
+}
+func (c *GraphClient) UpsertDialog(ctx context.Context, d ClarificationDialog) (*ClarificationDialog, error) {
+	var out ClarificationDialog
+	err := c.call(ctx, "POST", "dialogs", d, &out)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // ── LLM 호출 ─────────────────────────────────────────────
 
 type LLMConfig struct {
@@ -421,6 +447,121 @@ func RunWikiEdit(ctx context.Context, gc *GraphClient, llm LLMConfig, decision D
 		default:
 			res.Errors = append(res.Errors, fmt.Sprintf("[%d] unknown action type %q", i, a.Type))
 		}
+	}
+	return res, nil
+}
+
+// ── skill.find_ambiguous ─────────────────────────────────
+//
+// 입력: 최근 decisions 리스트 (approve + deny 혼합)
+// LLM 이 approve/deny 경계선 근처 애매한 패턴을 스스로 식별하고,
+// 사람에게 예시를 들어 질문을 생성한다.
+//
+// 출력: LLM 이 반환한 각 질문마다 ClarificationDialog 생성 (첫 turn=llm)
+// 이후 UI 에서 사람이 답하면 해당 dialog 에 turn 추가.
+
+const systemPromptFindAmbiguous = `You are reviewing recent HITL (human-in-the-loop) approve/deny decisions on a guardrail proxy. Your job: find cases where the approve/deny boundary is fuzzy and ask the human a clarifying question WITH EXAMPLES so future automated decisions can be confident.
+
+INPUT
+A list of past decisions: each has {input, decision(approve|deny), reason}.
+
+YOUR TASK
+1. Look for patterns where similar inputs got DIFFERENT decisions, OR where a decision seems borderline.
+2. For each ambiguous pattern, formulate ONE clarifying question for the human.
+3. Include 2-4 concrete EXAMPLES from the input list (short, quoted) to anchor the question.
+
+OUTPUT — strict JSON only, no prose, no markdown fence:
+{
+  "questions": [
+    {
+      "question": "<한국어 질문, 애매한 경계를 명확히 묻기>",
+      "examples": ["<실제 입력 인용 1> → approve", "<실제 입력 인용 2> → deny", "..."],
+      "why_ambiguous": "<왜 경계가 애매한지 1-2문장>"
+    }
+  ]
+}
+
+RULES
+- Only return questions for cases where the boundary is actually fuzzy. If all decisions are clear, return {"questions": []}.
+- Max 3 questions per call.
+- Examples MUST be real quotes from the input list (trim if too long, max 80 chars each).
+- Question must be concrete and answerable.`
+
+type FindAmbiguousResult struct {
+	QuestionsFound int      `json:"questions_found"`
+	DialogsCreated []string `json:"dialogs_created"`
+	Errors         []string `json:"errors,omitempty"`
+	LLMRaw         string   `json:"llm_raw,omitempty"`
+}
+
+// RunFindAmbiguous — 최근 decisions 를 보고 LLM 이 애매한 경계 질문을 생성.
+func RunFindAmbiguous(ctx context.Context, gc *GraphClient, llm LLMConfig, limit int) (*FindAmbiguousResult, error) {
+	res := &FindAmbiguousResult{}
+	if limit <= 0 {
+		limit = 50
+	}
+	decisions, err := gc.ListDecisions(ctx, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list decisions: %w", err)
+	}
+	if len(decisions) < 3 {
+		return res, fmt.Errorf("need at least 3 decisions to find ambiguity (got %d)", len(decisions))
+	}
+
+	var sb strings.Builder
+	for i, d := range decisions {
+		input := d.Input
+		if len([]rune(input)) > 120 {
+			r := []rune(input)
+			input = string(r[:120]) + "…"
+		}
+		sb.WriteString(fmt.Sprintf("%d. [%s] %q (reason: %s)\n", i+1, d.Decision, input, d.Reason))
+	}
+	userPrompt := "## Recent decisions\n" + sb.String()
+
+	raw, err := callLLM(ctx, llm, systemPromptFindAmbiguous, userPrompt)
+	if err != nil {
+		return nil, fmt.Errorf("llm call: %w", err)
+	}
+	res.LLMRaw = raw
+
+	jsonText := strings.TrimSpace(raw)
+	jsonText = strings.TrimPrefix(jsonText, "```json")
+	jsonText = strings.TrimPrefix(jsonText, "```")
+	jsonText = strings.TrimSuffix(jsonText, "```")
+	jsonText = strings.TrimSpace(jsonText)
+	var plan struct {
+		Questions []struct {
+			Question     string   `json:"question"`
+			Examples     []string `json:"examples"`
+			WhyAmbiguous string   `json:"why_ambiguous"`
+		} `json:"questions"`
+	}
+	if err := json.Unmarshal([]byte(jsonText), &plan); err != nil {
+		return res, fmt.Errorf("parse LLM JSON: %w (raw: %s)", err, raw)
+	}
+	res.QuestionsFound = len(plan.Questions)
+	if len(plan.Questions) > 3 {
+		plan.Questions = plan.Questions[:3]
+	}
+
+	for i, q := range plan.Questions {
+		content := q.Question
+		if q.WhyAmbiguous != "" {
+			content += "\n\n(애매한 이유: " + q.WhyAmbiguous + ")"
+		}
+		dlg, err := gc.UpsertDialog(ctx, ClarificationDialog{
+			Turns: []DialogTurn{{
+				Role:     "llm",
+				Content:  content,
+				Examples: q.Examples,
+			}},
+		})
+		if err != nil {
+			res.Errors = append(res.Errors, fmt.Sprintf("[%d] upsert dialog: %v", i, err))
+			continue
+		}
+		res.DialogsCreated = append(res.DialogsCreated, dlg.ID)
 	}
 	return res, nil
 }

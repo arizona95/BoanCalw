@@ -186,7 +186,6 @@ export default function WikiGraph() {
   const [dialogs, setDialogs] = useState<ClarificationDialog[]>([]);
   const [activeDialog, setActiveDialog] = useState<string | null>(null);
   const [userMsg, setUserMsg] = useState("");
-  const [newDialogTopic, setNewDialogTopic] = useState("");
 
   const loadRaw = useCallback(async () => {
     try {
@@ -329,14 +328,27 @@ export default function WikiGraph() {
     loadRaw();
   };
 
-  const createDialog = async () => {
-    const dlg = await wikiGraphApi.upsertDialog({
-      topic_node_id: newDialogTopic || undefined,
-      turns: [{ role: "human", content: "대화 시작" }],
-    });
-    setActiveDialog(dlg.id ?? null);
-    setNewDialogTopic("");
-    loadRaw();
+  const [finding, setFinding] = useState(false);
+  const findAmbiguous = async () => {
+    setFinding(true);
+    setErr(null);
+    setMsg(null);
+    try {
+      const res = await wikiGraphApi.runFindAmbiguous();
+      setMsg(
+        `LLM 이 애매한 경계 ${res.questions_found}개 발견, 대화 ${
+          res.dialogs_created?.length ?? 0
+        }개 생성${res.errors?.length ? ` (에러 ${res.errors.length})` : ""}`,
+      );
+      await loadRaw();
+      if ((res.dialogs_created?.length ?? 0) > 0) {
+        setActiveDialog(res.dialogs_created[0]);
+      }
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setFinding(false);
+    }
   };
 
   return (
@@ -345,9 +357,9 @@ export default function WikiGraph() {
       <div className="px-4 pt-3 pb-2 border-b border-gray-200 bg-white/60 backdrop-blur">
         <div className="flex items-center justify-between gap-4">
           <div className="min-w-0">
-            <h1 className="text-lg font-bold text-gray-800">G3 Wiki Graph</h1>
+            <h1 className="text-lg font-bold text-gray-800">G3 Graph Wiki</h1>
             <p className="text-[11px] text-gray-500 mt-0.5 truncate">
-              LLM 이 HITL 결정을 보고 자발적으로 편집하는 지식 그래프 + raw 데이터 + LLM↔사용자 대화
+              LLM 이 HITL 결정을 보고 스스로 편집/질문하는 지식 그래프 · Graph + Raw 결정 + LLM 주도 Q&A
             </p>
           </div>
           <div className="flex items-center gap-2">
@@ -617,24 +629,26 @@ export default function WikiGraph() {
       {tab === "dialog" && (
         <div className="flex-1 min-h-0 flex gap-3">
           {/* 좌측: 대화 목록 */}
-          <div className="w-72 bg-white border border-gray-200 rounded-xl flex flex-col overflow-hidden">
-            <div className="px-3 py-2 border-b border-gray-100 flex items-center gap-2">
-              <input
-                value={newDialogTopic}
-                onChange={(e) => setNewDialogTopic(e.target.value)}
-                placeholder="주제 노드 ID (선택)"
-                className="flex-1 text-xs border border-gray-200 rounded px-2 py-1 font-mono"
-              />
+          <div className="w-80 bg-white border border-gray-200 rounded-xl flex flex-col overflow-hidden">
+            <div className="px-3 py-2 border-b border-gray-100 flex flex-col gap-1.5">
               <button
-                onClick={createDialog}
-                className="text-xs px-2 py-1 bg-boan-600 text-white rounded hover:bg-boan-700"
+                onClick={findAmbiguous}
+                disabled={finding}
+                className="text-xs px-3 py-2 bg-boan-600 text-white rounded hover:bg-boan-700 disabled:opacity-40 font-medium"
               >
-                + 대화
+                {finding ? "🔍 LLM 분석 중..." : "🔍 LLM 이 애매한 경계 찾기"}
               </button>
+              <div className="text-[10px] text-gray-500 leading-tight">
+                최근 approve/deny 결정에서 경계가 애매한 케이스를 LLM 이 스스로 찾아 질문을 생성합니다.
+              </div>
             </div>
             <div className="flex-1 overflow-y-auto divide-y divide-gray-100">
               {dialogs.length === 0 ? (
-                <div className="p-4 text-center text-xs text-gray-400">대화 없음</div>
+                <div className="p-4 text-center text-xs text-gray-400">
+                  아직 질문 없음.<br />
+                  위 버튼을 눌러 LLM 이 최근 HITL 결정에서<br />
+                  애매한 경계를 찾도록 시키세요.
+                </div>
               ) : dialogs.map((d) => (
                 <button
                   key={d.id}
@@ -702,8 +716,9 @@ export default function WikiGraph() {
                 </div>
               </>;
             })() : (
-              <div className="flex-1 flex items-center justify-center text-sm text-gray-400">
-                좌측에서 대화를 선택하거나 "+ 대화" 로 새로 시작
+              <div className="flex-1 flex items-center justify-center text-sm text-gray-400 text-center px-6">
+                좌측에서 LLM 이 생성한 질문을 선택하세요.<br />
+                아직 질문이 없다면 "🔍 LLM 이 애매한 경계 찾기" 버튼으로 시작.
               </div>
             )}
           </div>

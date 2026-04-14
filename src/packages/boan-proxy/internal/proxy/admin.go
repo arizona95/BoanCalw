@@ -3402,6 +3402,40 @@ func (s *Server) StartAdmin() {
 			return
 		}
 
+		// skill/find_ambiguous — LLM 이 애매한 경계선 케이스 찾아서 질문 생성.
+		if suffix == "skill/find_ambiguous" && r.Method == http.MethodPost {
+			llmURL, llmModel, found := lookupLLMByRole("find_ambiguous")
+			if !found {
+				llmURL, llmModel, found = lookupLLMByRole("g3")
+			}
+			if !found {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusPreconditionFailed)
+				json.NewEncoder(w).Encode(map[string]string{
+					"error": "LLM Registry 에 role=find_ambiguous 또는 role=g3 로 바인딩된 LLM 없음",
+				})
+				return
+			}
+			var orgToken string
+			if entry, ok := s.orgs.Resolve(orgID); ok {
+				orgToken = entry.Token
+			}
+			gc := wikiskills.NewGraphClient(orgURL, orgID, orgToken)
+			res, err := wikiskills.RunFindAmbiguous(r.Context(), gc, wikiskills.LLMConfig{URL: llmURL, Model: llmModel}, 50)
+			w.Header().Set("Content-Type", "application/json")
+			if err != nil {
+				w.WriteHeader(http.StatusBadGateway)
+				out := map[string]any{"error": err.Error()}
+				if res != nil {
+					out["partial_result"] = res
+				}
+				json.NewEncoder(w).Encode(out)
+				return
+			}
+			json.NewEncoder(w).Encode(res)
+			return
+		}
+
 		// 일반 primitive pass-through.
 		target := orgURL + "/org/" + orgID + "/v1/wiki-graph/" + suffix
 		if r.URL.RawQuery != "" {
@@ -4220,6 +4254,32 @@ func (s *Server) StartAdmin() {
 				"source":         "human",
 				"decided_by":     approvalRequester,
 			})
+			// Wiki Graph Raw 결정 이력에도 동시 append (LLM 이 관찰하는 원시 데이터).
+			wikiDecision := "approve"
+			if status != "approved" {
+				wikiDecision = "deny"
+			}
+			go func(dec, input, reason, labeler string) {
+				var orgToken string
+				if entry, ok := s.orgs.Resolve(orgID); ok {
+					orgToken = entry.Token
+				}
+				orgURL := policyBase
+				if entry, ok := s.orgs.Resolve(orgID); ok && entry.URL != "" {
+					orgURL = entry.URL
+				}
+				gc := wikiskills.NewGraphClient(orgURL, orgID, orgToken)
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				if err := gc.AppendDecision(ctx, wikiskills.Decision{
+					Input:    input,
+					Decision: dec,
+					Reason:   reason,
+					Labeler:  labeler,
+				}); err != nil {
+					log.Printf("[wiki-graph] append decision failed: %v", err)
+				}
+			}(wikiDecision, approvalText, approvalReason, approvalRequester)
 		}
 
 		// Persist declined fingerprints outside the lock.
