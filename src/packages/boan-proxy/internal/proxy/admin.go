@@ -3299,8 +3299,11 @@ func (s *Server) StartAdmin() {
 	// lookupLLMByRole — registry 에서 주어진 role 의 첫 LLM 조회.
 	// 실제 model 이름은 registry 의 name 이 아니라 curl_template 안의 "model": "..."
 	// 값이 정답 — ollama 등 로컬 백엔드는 그 값으로 매칭.
+	// curl_template 에 {{CREDENTIAL:name}} 가 있으면 credential-filter 에서
+	// 실제 토큰을 가져와 key 로 반환.
 	modelRe := regexp.MustCompile(`"model"\s*:\s*"([^"]+)"`)
-	lookupLLMByRole := func(role string) (url, model string, found bool) {
+	credRe := regexp.MustCompile(`\{\{CREDENTIAL:([A-Za-z0-9_\-]+)\}\}`)
+	lookupLLMByRole := func(role string) (url, model, key string, found bool) {
 		if s.cfg.LLMRegistryURL == "" {
 			return
 		}
@@ -3337,12 +3340,30 @@ func (s *Server) StartAdmin() {
 				if m := modelRe.FindStringSubmatch(tmpl); len(m) > 1 {
 					modelID = m[1]
 				}
-				// endpoint 가 /v1/chat/completions 로 끝나지 않으면 덧붙임.
+				// {{CREDENTIAL:name}} → 실제 토큰 fetch.
+				resolvedKey := ""
+				if m := credRe.FindStringSubmatch(tmpl); len(m) > 1 && credBase != "" {
+					credName := m[1]
+					// resolveOrg defaults work; 여기선 default org 사용.
+					credURL := strings.TrimRight(credBase, "/") + "/credential/" + s.cfg.OrgID + "/" + credName
+					if cresp, err := http.Get(credURL); err == nil {
+						defer cresp.Body.Close()
+						if cresp.StatusCode < 300 {
+							var body struct {
+								Key string `json:"key"`
+							}
+							if err := json.NewDecoder(cresp.Body).Decode(&body); err == nil {
+								resolvedKey = body.Key
+							}
+						}
+					}
+				}
+				// endpoint 가 /v1/chat/completions 또는 /api/chat 로 끝나지 않으면 덧붙임.
 				ep := l.Endpoint
 				if !strings.Contains(ep, "/chat/completions") && !strings.HasSuffix(ep, "/chat") {
 					ep = strings.TrimRight(ep, "/") + "/v1/chat/completions"
 				}
-				return ep, modelID, true
+				return ep, modelID, resolvedKey, true
 			}
 		}
 		return
@@ -3369,9 +3390,9 @@ func (s *Server) StartAdmin() {
 				return
 			}
 			// LLM 찾기 — registry 의 g3 role 재사용 (또는 wiki_edit role 도 매칭).
-			llmURL, llmModel, found := lookupLLMByRole("wiki_edit")
+			llmURL, llmModel, llmKey, found := lookupLLMByRole("wiki_edit")
 			if !found {
-				llmURL, llmModel, found = lookupLLMByRole("g3")
+				llmURL, llmModel, llmKey, found = lookupLLMByRole("g3")
 			}
 			if !found {
 				w.Header().Set("Content-Type", "application/json")
@@ -3387,7 +3408,7 @@ func (s *Server) StartAdmin() {
 				orgToken = entry.Token
 			}
 			gc := wikiskills.NewGraphClient(orgURL, orgID, orgToken)
-			res, err := wikiskills.RunWikiEdit(r.Context(), gc, wikiskills.LLMConfig{URL: llmURL, Model: llmModel}, body)
+			res, err := wikiskills.RunWikiEdit(r.Context(), gc, wikiskills.LLMConfig{URL: llmURL, Model: llmModel, Key: llmKey}, body)
 			w.Header().Set("Content-Type", "application/json")
 			if err != nil {
 				w.WriteHeader(http.StatusBadGateway)
@@ -3408,9 +3429,9 @@ func (s *Server) StartAdmin() {
 				DialogID string `json:"dialog_id,omitempty"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
-			llmURL, llmModel, found := lookupLLMByRole("agentic_iterate")
+			llmURL, llmModel, llmKey, found := lookupLLMByRole("agentic_iterate")
 			if !found {
-				llmURL, llmModel, found = lookupLLMByRole("g3")
+				llmURL, llmModel, llmKey, found = lookupLLMByRole("g3")
 			}
 			if !found {
 				w.Header().Set("Content-Type", "application/json")
@@ -3425,7 +3446,7 @@ func (s *Server) StartAdmin() {
 				orgToken = entry.Token
 			}
 			gc := wikiskills.NewGraphClient(orgURL, orgID, orgToken)
-			res, err := wikiskills.RunAgenticIterate(r.Context(), gc, wikiskills.LLMConfig{URL: llmURL, Model: llmModel}, body.DialogID)
+			res, err := wikiskills.RunAgenticIterate(r.Context(), gc, wikiskills.LLMConfig{URL: llmURL, Model: llmModel, Key: llmKey}, body.DialogID)
 			w.Header().Set("Content-Type", "application/json")
 			if err != nil {
 				w.WriteHeader(http.StatusBadGateway)
@@ -3442,9 +3463,9 @@ func (s *Server) StartAdmin() {
 
 		// skill/find_ambiguous — LLM 이 애매한 경계선 케이스 찾아서 질문 생성.
 		if suffix == "skill/find_ambiguous" && r.Method == http.MethodPost {
-			llmURL, llmModel, found := lookupLLMByRole("find_ambiguous")
+			llmURL, llmModel, llmKey, found := lookupLLMByRole("find_ambiguous")
 			if !found {
-				llmURL, llmModel, found = lookupLLMByRole("g3")
+				llmURL, llmModel, llmKey, found = lookupLLMByRole("g3")
 			}
 			if !found {
 				w.Header().Set("Content-Type", "application/json")
@@ -3459,7 +3480,7 @@ func (s *Server) StartAdmin() {
 				orgToken = entry.Token
 			}
 			gc := wikiskills.NewGraphClient(orgURL, orgID, orgToken)
-			res, err := wikiskills.RunFindAmbiguous(r.Context(), gc, wikiskills.LLMConfig{URL: llmURL, Model: llmModel}, 50)
+			res, err := wikiskills.RunFindAmbiguous(r.Context(), gc, wikiskills.LLMConfig{URL: llmURL, Model: llmModel, Key: llmKey}, 20)
 			w.Header().Set("Content-Type", "application/json")
 			if err != nil {
 				w.WriteHeader(http.StatusBadGateway)

@@ -199,6 +199,12 @@ type chatRequest struct {
 	Temperature float32       `json:"temperature"`
 	Stream      bool          `json:"stream"`
 	MaxTokens   int           `json:"max_tokens,omitempty"`
+	// ollama 호환 필드 — thinking tokens 억제.
+	Think   bool `json:"think"`
+	Options struct {
+		NumPredict  int     `json:"num_predict,omitempty"`
+		Temperature float32 `json:"temperature,omitempty"`
+	} `json:"options,omitempty"`
 }
 
 type chatResponse struct {
@@ -225,10 +231,13 @@ func callLLM(ctx context.Context, cfg LLMConfig, system, user string) (string, e
 		Temperature: 0.2,
 		Stream:      false,
 		MaxTokens:   2048,
+		Think:       false,
 	}
+	reqBody.Options.NumPredict = 2048
+	reqBody.Options.Temperature = 0.2
 	raw, _ := json.Marshal(reqBody)
 	// HTTP_PROXY 무시.
-	httpClient := &http.Client{Timeout: 60 * time.Second, Transport: &http.Transport{Proxy: nil}}
+	httpClient := &http.Client{Timeout: 600 * time.Second, Transport: &http.Transport{Proxy: nil}}
 	req, _ := http.NewRequestWithContext(ctx, "POST", cfg.URL, bytes.NewReader(raw))
 	req.Header.Set("Content-Type", "application/json")
 	if cfg.Key != "" {
@@ -503,7 +512,7 @@ type FindAmbiguousResult struct {
 func RunFindAmbiguous(ctx context.Context, gc *GraphClient, llm LLMConfig, limit int) (*FindAmbiguousResult, error) {
 	res := &FindAmbiguousResult{}
 	if limit <= 0 {
-		limit = 50
+		limit = 20
 	}
 	decisions, err := gc.ListDecisions(ctx, limit)
 	if err != nil {
