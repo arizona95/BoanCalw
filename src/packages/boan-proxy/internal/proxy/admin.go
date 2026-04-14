@@ -3402,6 +3402,44 @@ func (s *Server) StartAdmin() {
 			return
 		}
 
+		// skill/agentic_iterate — LLM 이 wiki 전체 + (옵션)dialog 를 읽고 편집 1회.
+		if suffix == "skill/agentic_iterate" && r.Method == http.MethodPost {
+			var body struct {
+				DialogID string `json:"dialog_id,omitempty"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			llmURL, llmModel, found := lookupLLMByRole("agentic_iterate")
+			if !found {
+				llmURL, llmModel, found = lookupLLMByRole("g3")
+			}
+			if !found {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusPreconditionFailed)
+				json.NewEncoder(w).Encode(map[string]string{
+					"error": "LLM Registry 에 role=agentic_iterate 또는 role=g3 로 바인딩된 LLM 없음",
+				})
+				return
+			}
+			var orgToken string
+			if entry, ok := s.orgs.Resolve(orgID); ok {
+				orgToken = entry.Token
+			}
+			gc := wikiskills.NewGraphClient(orgURL, orgID, orgToken)
+			res, err := wikiskills.RunAgenticIterate(r.Context(), gc, wikiskills.LLMConfig{URL: llmURL, Model: llmModel}, body.DialogID)
+			w.Header().Set("Content-Type", "application/json")
+			if err != nil {
+				w.WriteHeader(http.StatusBadGateway)
+				out := map[string]any{"error": err.Error()}
+				if res != nil {
+					out["partial_result"] = res
+				}
+				json.NewEncoder(w).Encode(out)
+				return
+			}
+			json.NewEncoder(w).Encode(res)
+			return
+		}
+
 		// skill/find_ambiguous — LLM 이 애매한 경계선 케이스 찾아서 질문 생성.
 		if suffix == "skill/find_ambiguous" && r.Method == http.MethodPost {
 			llmURL, llmModel, found := lookupLLMByRole("find_ambiguous")

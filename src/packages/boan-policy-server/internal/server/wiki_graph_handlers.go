@@ -63,6 +63,7 @@ func (s *Server) wgUpdateNode(w http.ResponseWriter, r *http.Request, orgID, id 
 		return
 	}
 	var patch struct {
+		Path       *string   `json:"path,omitempty"`
 		Definition *string   `json:"definition,omitempty"`
 		Content    *string   `json:"content,omitempty"`
 		Tags       *[]string `json:"tags,omitempty"`
@@ -71,6 +72,9 @@ func (s *Server) wgUpdateNode(w http.ResponseWriter, r *http.Request, orgID, id 
 	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
+	}
+	if patch.Path != nil {
+		existing.Path = *patch.Path
 	}
 	if patch.Definition != nil {
 		existing.Definition = *patch.Definition

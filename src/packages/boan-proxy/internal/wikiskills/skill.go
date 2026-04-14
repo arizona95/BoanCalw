@@ -82,6 +82,7 @@ func (c *GraphClient) call(ctx context.Context, method, path string, body any, o
 
 type Node struct {
 	ID         string    `json:"id,omitempty"`
+	Path       string    `json:"path,omitempty"` // 폴더 경로 ("/security/credentials" 식)
 	Definition string    `json:"definition"`
 	Content    string    `json:"content"`
 	Tags       []string  `json:"tags,omitempty"`
@@ -143,6 +144,14 @@ func (c *GraphClient) CreateEdge(ctx context.Context, e Edge) (*Edge, error) {
 }
 func (c *GraphClient) AppendDecision(ctx context.Context, d Decision) error {
 	return c.call(ctx, "POST", "decisions", d, nil)
+}
+func (c *GraphClient) DeleteNode(ctx context.Context, id string) error {
+	return c.call(ctx, "DELETE", "nodes/"+id, nil, nil)
+}
+func (c *GraphClient) ListDialogsRaw(ctx context.Context, limit int) ([]ClarificationDialog, error) {
+	var ds []ClarificationDialog
+	err := c.call(ctx, "GET", fmt.Sprintf("dialogs?limit=%d", limit), nil, &ds)
+	return ds, err
 }
 
 // ── Dialog model ────────────────────────────────────────
@@ -643,6 +652,235 @@ func RunFindAmbiguous(ctx context.Context, gc *GraphClient, llm LLMConfig, limit
 			continue
 		}
 		res.DialogsCreated = append(res.DialogsCreated, dlg.ID)
+	}
+	return res, nil
+}
+
+// ── skill.agentic_iterate ────────────────────────────────
+//
+// Agentic loop — 한 번의 tick 동안 LLM 이 전체 wiki 와
+// (옵션) 특정 ClarificationDialog 를 읽고 편집 액션을 plan 한다.
+//
+// LLM 에게 주어지는 도구 (action types):
+//   create_node   — 새 skill 노드 생성 (path + definition + content)
+//   update_node   — 기존 노드 내용/경로 수정
+//   delete_node   — 불필요한 노드 제거
+//   move_node     — path 만 바꾸는 단축 (update_node 특수형)
+//
+// 주요 사용 케이스:
+//   1) 사용자가 ClarificationDialog 에 답변을 달면 → agentic_iterate(dialog_id)
+//      → LLM 이 답변을 내재화해 wiki 구조 편집
+//   2) 수동 "agentic loop 1회 실행" 버튼 → 최근 결정 + 전체 wiki 훑고 정리
+
+const systemPromptAgenticIterate = `당신은 Wiki 를 관리하는 agentic 편집자입니다. 각 노드는 하나의 "skill" (가이드라인/규칙/지식)이며, 폴더 경로로 계층화되어 있습니다.
+
+당신의 도구:
+- create_node: 새 skill 추가. {path, definition, content}. path 는 "/security/credentials" 같이 폴더.
+- update_node: 기존 skill 편집. {node_id, content?, definition?, path?}.
+- delete_node: 불필요/중복 skill 제거. {node_id, reason_text}.
+- move_node: 폴더 이동. {node_id, path}.
+
+한 turn 에 수행할 것 (순서대로 생각):
+1. 현재 wiki 구조 (path 기준 트리) 는 잘 정리되어 있나?
+2. 중복 노드 있는가? → delete_node 또는 merge (update_node 로 content 통합 + 나머지 delete).
+3. 각 노드의 content 가 충분히 구체적인가? 너무 추상적이면 구체 예시 추가.
+4. (선택) 사용자 답변이 있다면 → 그 통찰을 적절한 노드에 반영 (update/create).
+5. 계층이 어색하면 move_node 로 정리.
+
+출력 (JSON만):
+{
+  "reasoning": "이번 tick 에서 뭘 할지 한 줄 설명 (한국어)",
+  "actions": [
+    {"type":"create_node","path":"/security/credentials","definition":"공개 개인정보 처리 기준","content":"...","reason_text":"사용자 답변에서 새 기준이 나와 skill 로 승격"},
+    {"type":"update_node","node_id":"n_abc","content":"...","reason_text":"더 명확한 예시 추가"},
+    {"type":"delete_node","node_id":"n_xyz","reason_text":"상위 노드에 흡수됨"},
+    {"type":"move_node","node_id":"n_def","path":"/security/pii","reason_text":"더 적절한 폴더"}
+  ]
+}
+
+규칙:
+- 최대 5개 action.
+- 확실치 않으면 action 없이 {"actions":[]} 반환.
+- definition ≤ 30자, content ≤ 1000자.
+- JSON 만, markdown fence/설명 금지.`
+
+type AgenticIterateResult struct {
+	Reasoning      string   `json:"reasoning,omitempty"`
+	ActionsPlanned int      `json:"actions_planned"`
+	NodesCreated   []string `json:"nodes_created,omitempty"`
+	NodesUpdated   []string `json:"nodes_updated,omitempty"`
+	NodesDeleted   []string `json:"nodes_deleted,omitempty"`
+	NodesMoved     []string `json:"nodes_moved,omitempty"`
+	Errors         []string `json:"errors,omitempty"`
+	LLMRaw         string   `json:"llm_raw,omitempty"`
+}
+
+func summarizeWikiTree(nodes []Node) string {
+	if len(nodes) == 0 {
+		return "(wiki is empty)"
+	}
+	var sb strings.Builder
+	for _, n := range nodes {
+		p := n.Path
+		if p == "" {
+			p = "/"
+		}
+		// content preview
+		c := n.Content
+		if len([]rune(c)) > 80 {
+			c = string([]rune(c)[:80]) + "…"
+		}
+		c = strings.ReplaceAll(c, "\n", " ")
+		sb.WriteString(fmt.Sprintf("- [%s] path=%s definition=%q content=%q\n", n.ID, p, n.Definition, c))
+	}
+	return sb.String()
+}
+
+// RunAgenticIterate — agentic loop 한 turn.
+// dialogID 가 비어있지 않으면 그 dialog 의 내용을 prompt 에 포함.
+func RunAgenticIterate(ctx context.Context, gc *GraphClient, llm LLMConfig, dialogID string) (*AgenticIterateResult, error) {
+	res := &AgenticIterateResult{}
+
+	nodes, err := gc.ListNodes(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list nodes: %w", err)
+	}
+
+	var dialogSummary string
+	if dialogID != "" {
+		dlgs, err := gc.ListDialogsRaw(ctx, 100)
+		if err == nil {
+			for _, d := range dlgs {
+				if d.ID == dialogID {
+					var b strings.Builder
+					b.WriteString(fmt.Sprintf("## 관련 ClarificationDialog (id=%s)\n", d.ID))
+					for _, t := range d.Turns {
+						b.WriteString(fmt.Sprintf("[%s] %s\n", t.Role, t.Content))
+						for _, ex := range t.Examples {
+							b.WriteString("  예시: " + ex + "\n")
+						}
+					}
+					dialogSummary = b.String()
+					break
+				}
+			}
+		}
+	}
+
+	userPrompt := "## 현재 Wiki (skill 노드들)\n" + summarizeWikiTree(nodes)
+	if dialogSummary != "" {
+		userPrompt += "\n" + dialogSummary + "\n\n→ 위 대화에서 나온 통찰을 wiki 에 반영하세요."
+	}
+
+	raw, err := callLLM(ctx, llm, systemPromptAgenticIterate, userPrompt)
+	if err != nil {
+		return nil, fmt.Errorf("llm call: %w", err)
+	}
+	res.LLMRaw = raw
+
+	jsonText := strings.TrimSpace(raw)
+	jsonText = strings.TrimPrefix(jsonText, "```json")
+	jsonText = strings.TrimPrefix(jsonText, "```")
+	jsonText = strings.TrimSuffix(jsonText, "```")
+	jsonText = strings.TrimSpace(jsonText)
+	var plan struct {
+		Reasoning string `json:"reasoning"`
+		Actions   []struct {
+			Type          string `json:"type"`
+			NodeID        string `json:"node_id,omitempty"`
+			Path          string `json:"path,omitempty"`
+			Definition    string `json:"definition,omitempty"`
+			Content       string `json:"content,omitempty"`
+			ContentAppend string `json:"content_append,omitempty"`
+			ReasonText    string `json:"reason_text,omitempty"`
+		} `json:"actions"`
+	}
+	if err := json.Unmarshal([]byte(jsonText), &plan); err != nil {
+		return res, fmt.Errorf("parse LLM JSON: %w (raw: %s)", err, raw)
+	}
+	res.Reasoning = plan.Reasoning
+	res.ActionsPlanned = len(plan.Actions)
+	if len(plan.Actions) > 5 {
+		plan.Actions = plan.Actions[:5]
+	}
+
+	// existing 노드 조회 helper
+	existingByID := make(map[string]*Node, len(nodes))
+	for i := range nodes {
+		existingByID[nodes[i].ID] = &nodes[i]
+	}
+
+	for i, a := range plan.Actions {
+		switch a.Type {
+		case "create_node":
+			if a.Definition == "" {
+				res.Errors = append(res.Errors, fmt.Sprintf("[%d] create_node: definition missing", i))
+				continue
+			}
+			n, err := gc.CreateNode(ctx, Node{
+				Path: a.Path, Definition: a.Definition, Content: a.Content,
+				CreatedBy: "skill.agentic_iterate",
+			})
+			if err != nil {
+				res.Errors = append(res.Errors, fmt.Sprintf("[%d] create_node: %v", i, err))
+				continue
+			}
+			res.NodesCreated = append(res.NodesCreated, n.ID)
+		case "update_node":
+			if a.NodeID == "" {
+				res.Errors = append(res.Errors, fmt.Sprintf("[%d] update_node: node_id missing", i))
+				continue
+			}
+			patch := map[string]any{"updated_by": "skill.agentic_iterate"}
+			if a.Path != "" {
+				patch["path"] = a.Path
+			}
+			if a.Definition != "" {
+				patch["definition"] = a.Definition
+			}
+			if a.Content != "" {
+				patch["content"] = a.Content
+			} else if a.ContentAppend != "" {
+				if ex, ok := existingByID[a.NodeID]; ok {
+					newC := ex.Content
+					if newC != "" {
+						newC += "\n"
+					}
+					newC += a.ContentAppend
+					if len([]rune(newC)) > 1000 {
+						newC = string([]rune(newC)[:1000])
+					}
+					patch["content"] = newC
+				}
+			}
+			if _, err := gc.UpdateNode(ctx, a.NodeID, patch); err != nil {
+				res.Errors = append(res.Errors, fmt.Sprintf("[%d] update_node %s: %v", i, a.NodeID, err))
+				continue
+			}
+			res.NodesUpdated = append(res.NodesUpdated, a.NodeID)
+		case "move_node":
+			if a.NodeID == "" || a.Path == "" {
+				res.Errors = append(res.Errors, fmt.Sprintf("[%d] move_node: node_id+path required", i))
+				continue
+			}
+			if _, err := gc.UpdateNode(ctx, a.NodeID, map[string]any{"path": a.Path, "updated_by": "skill.agentic_iterate"}); err != nil {
+				res.Errors = append(res.Errors, fmt.Sprintf("[%d] move_node %s: %v", i, a.NodeID, err))
+				continue
+			}
+			res.NodesMoved = append(res.NodesMoved, a.NodeID)
+		case "delete_node":
+			if a.NodeID == "" {
+				res.Errors = append(res.Errors, fmt.Sprintf("[%d] delete_node: node_id missing", i))
+				continue
+			}
+			if err := gc.DeleteNode(ctx, a.NodeID); err != nil {
+				res.Errors = append(res.Errors, fmt.Sprintf("[%d] delete_node %s: %v", i, a.NodeID, err))
+				continue
+			}
+			res.NodesDeleted = append(res.NodesDeleted, a.NodeID)
+		default:
+			res.Errors = append(res.Errors, fmt.Sprintf("[%d] unknown action type %q", i, a.Type))
+		}
 	}
 	return res, nil
 }

@@ -103,7 +103,7 @@ function Shell() {
         { path: "/credentials", label: "Credentials", icon: "🔑" },
         { path: "/approvals", label: "Approvals", icon: "✅" },
         { path: "/observability", label: "Observability", icon: "🔭" },
-        { path: "/wiki-graph", label: "G3 Graph Wiki", icon: "🕸️" },
+        { path: "/wiki-graph", label: "G3 Folder Wiki", icon: "📂" },
         { path: "/my-boanclaw", label: "BoanClaw", icon: "🦞", separator: true },
         { path: "/files", label: "File Manager", icon: "📂" },
         { path: "/my-gcp", label: "Personal Computer", icon: "🖥️" },

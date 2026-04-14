@@ -414,8 +414,9 @@ export const guardrailApi = {
 // ── Wiki Graph (LLM 이 편집하는 지식 그래프) ─────────────────
 export interface WikiNode {
   id: string;
-  definition: string;  // <= 30자
-  content: string;     // <= 1000자
+  path?: string;       // 폴더 경로 (e.g. "/security/credentials")
+  definition: string;  // <= 30자 (skill 제목)
+  content: string;     // <= 1000자 (skill 본문)
   tags?: string[];
   created_by?: string;
   created_at?: string;
@@ -495,6 +496,20 @@ export const wikiGraphApi = {
     }),
   deleteDialog: (id: string) =>
     request<void>(`/api/wiki-graph/dialogs/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  runAgenticIterate: (dialog_id?: string) =>
+    request<{
+      reasoning?: string;
+      actions_planned: number;
+      nodes_created?: string[];
+      nodes_updated?: string[];
+      nodes_deleted?: string[];
+      nodes_moved?: string[];
+      errors?: string[];
+      llm_raw?: string;
+    }>("/api/wiki-graph/skill/agentic_iterate", {
+      method: "POST",
+      body: JSON.stringify({ dialog_id }),
+    }),
   runFindAmbiguous: () =>
     request<{
       questions_found: number;

@@ -30,6 +30,9 @@ import (
 //   Content    ≤ 1000자 (실제 생각 본문)
 type WikiNode struct {
 	ID         string    `json:"id"`
+	// Path — 폴더 경로 (예: "/security/credentials"). 빈 문자열 or "/" = 루트.
+	// 각 노드는 하나의 "skill" 을 나타내며, Path + Definition 으로 폴더 계층 구성.
+	Path       string    `json:"path,omitempty"`
 	Definition string    `json:"definition"`
 	Content    string    `json:"content"`
 	Tags       []string  `json:"tags,omitempty"`

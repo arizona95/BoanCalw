@@ -1,191 +1,290 @@
-// WikiGraph — LLM 이 편집하는 지식 그래프 시각화.
-// Notion 스타일 inline link [[id|reason]] 지원.
-// react-flow 방향 그래프 + dagre 자동 레이아웃.
+// G3 Folder Wiki — 각 노드=skill, 폴더 트리로 계층화.
+// LLM 이 agentic loop 로 read/write 하며 자기 memory 를 편집.
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  ReactFlow,
-  ReactFlowProvider,
-  Background,
-  Controls,
-  MiniMap,
-  useReactFlow,
-  type Node,
-  type Edge,
-  type NodeProps,
-  Handle,
-  Position,
-  MarkerType,
-} from "@xyflow/react";
-import "@xyflow/react/dist/style.css";
-import dagre from "dagre";
-import {
   wikiGraphApi,
   type WikiNode,
-  type WikiEdge,
   type WikiDecision,
   type ClarificationDialog,
   type DialogTurn,
 } from "../api";
 
-// ── relation 별 색상/스타일 ──────────────────────────────
-const RELATION_STYLES: Record<string, { stroke: string; label: string }> = {
-  supports:     { stroke: "#16a34a", label: "뒷받침" },
-  contradicts:  { stroke: "#dc2626", label: "모순" },
-  refines:      { stroke: "#0891b2", label: "정교화" },
-  example_of:   { stroke: "#ca8a04", label: "예시" },
-  depends_on:   { stroke: "#7c3aed", label: "전제" },
-  evolved_from: { stroke: "#4b5563", label: "진화" },
-  inline_ref:   { stroke: "#64748b", label: "본문링크" },
+type Tab = "folders" | "raw" | "dialog";
+
+// ── 폴더 트리 빌더 ────────────────────────────────────────
+type TreeNode = {
+  name: string;        // segment 이름 (e.g. "security")
+  fullPath: string;    // "/security"
+  children: TreeNode[];
+  skills: WikiNode[];  // 이 폴더 아래에 있는 leaf skill 노드들
 };
 
-function relStyle(r: string) {
-  return RELATION_STYLES[r] ?? { stroke: "#94a3b8", label: r };
+function normalizePath(p?: string): string {
+  if (!p || p === "/") return "/";
+  const trimmed = p.replace(/\/+$/, "");
+  return trimmed.startsWith("/") ? trimmed : "/" + trimmed;
 }
 
-// ── 자동 레이아웃 (dagre) ───────────────────────────────
-function layoutGraph(nodes: Node[], edges: Edge[], direction: "LR" | "TB" = "TB") {
-  const g = new dagre.graphlib.Graph();
-  g.setDefaultEdgeLabel(() => ({}));
-  g.setGraph({ rankdir: direction, nodesep: 60, ranksep: 80 });
-  nodes.forEach((n) => g.setNode(n.id, { width: 220, height: 100 }));
-  edges.forEach((e) => g.setEdge(e.source, e.target));
-  dagre.layout(g);
-  return nodes.map((n) => {
-    const pos = g.node(n.id);
-    return { ...n, position: { x: pos.x - 110, y: pos.y - 50 } };
-  });
+function buildTree(nodes: WikiNode[]): TreeNode {
+  const root: TreeNode = { name: "/", fullPath: "/", children: [], skills: [] };
+  const ensure = (path: string): TreeNode => {
+    if (path === "/") return root;
+    const segs = path.split("/").filter(Boolean);
+    let cur = root;
+    let cumulative = "";
+    for (const seg of segs) {
+      cumulative += "/" + seg;
+      let child = cur.children.find((c) => c.name === seg);
+      if (!child) {
+        child = { name: seg, fullPath: cumulative, children: [], skills: [] };
+        cur.children.push(child);
+      }
+      cur = child;
+    }
+    return cur;
+  };
+  for (const n of nodes) {
+    const folder = ensure(normalizePath(n.path));
+    folder.skills.push(n);
+  }
+  // 정렬
+  const sortTree = (t: TreeNode) => {
+    t.children.sort((a, b) => a.name.localeCompare(b.name));
+    t.skills.sort((a, b) => a.definition.localeCompare(b.definition));
+    t.children.forEach(sortTree);
+  };
+  sortTree(root);
+  return root;
 }
 
-// ── Custom 노드 컴포넌트 ─────────────────────────────────
-function WikiNodeView({ data }: NodeProps) {
-  const d = data as { definition: string; content: string; tags?: string[] };
+function FolderTree({
+  tree,
+  selectedId,
+  selectedPath,
+  onPickNode,
+  onPickFolder,
+  depth = 0,
+}: {
+  tree: TreeNode;
+  selectedId: string | null;
+  selectedPath: string;
+  onPickNode: (id: string) => void;
+  onPickFolder: (path: string) => void;
+  depth?: number;
+}) {
+  const [open, setOpen] = useState(depth < 2);
+  const isRoot = tree.fullPath === "/";
+  const label = isRoot ? "/" : tree.name;
+  const childCount = tree.children.length + tree.skills.length;
   return (
-    <div className="bg-white border border-gray-300 rounded-xl shadow-sm px-3 py-2 w-[220px] hover:shadow-md transition-shadow">
-      <Handle type="target" position={Position.Top} />
-      <div className="text-[11px] font-bold text-gray-800 truncate" title={d.definition}>
-        {d.definition || "(제목 없음)"}
-      </div>
-      <div className="text-[10px] text-gray-500 mt-1 line-clamp-2 leading-tight">
-        {(d.content || "").replace(/\[\[[^\]]+\]\]/g, "🔗")}
-      </div>
-      {d.tags && d.tags.length > 0 && (
-        <div className="flex flex-wrap gap-1 mt-1.5">
-          {d.tags.slice(0, 3).map((t) => (
-            <span
-              key={t}
-              className="text-[9px] px-1.5 py-0.5 bg-blue-50 text-blue-700 rounded-full"
-            >
-              {t}
-            </span>
-          ))}
-          {d.tags.length > 3 && (
-            <span className="text-[9px] text-gray-400">+{d.tags.length - 3}</span>
-          )}
-        </div>
+    <div>
+      {!isRoot && (
+        <button
+          onClick={() => { setOpen(!open); onPickFolder(tree.fullPath); }}
+          className={`w-full text-left px-2 py-1 rounded text-xs flex items-center gap-1 hover:bg-gray-100 ${
+            selectedPath === tree.fullPath ? "bg-boan-50 text-boan-800 font-medium" : "text-gray-700"
+          }`}
+          style={{ paddingLeft: 8 + depth * 12 }}
+        >
+          <span className="w-3 text-[10px] text-gray-400">{open ? "▼" : "▶"}</span>
+          <span>📂</span>
+          <span className="flex-1 truncate">{label}</span>
+          <span className="text-[10px] text-gray-400">{childCount}</span>
+        </button>
       )}
-      <Handle type="source" position={Position.Bottom} />
+      {isRoot && (
+        <button
+          onClick={() => onPickFolder("/")}
+          className={`w-full text-left px-2 py-1 rounded text-xs flex items-center gap-1 hover:bg-gray-100 ${
+            selectedPath === "/" ? "bg-boan-50 text-boan-800 font-medium" : "text-gray-700"
+          }`}
+        >
+          <span className="w-3" />
+          <span>📁</span>
+          <span className="flex-1">/ (루트)</span>
+          <span className="text-[10px] text-gray-400">{tree.skills.length}</span>
+        </button>
+      )}
+      {open && (
+        <>
+          {tree.skills.map((s) => (
+            <button
+              key={s.id}
+              onClick={() => onPickNode(s.id)}
+              className={`w-full text-left px-2 py-1 rounded text-xs flex items-center gap-1 hover:bg-gray-100 ${
+                selectedId === s.id ? "bg-boan-100 text-boan-900 font-medium" : "text-gray-600"
+              }`}
+              style={{ paddingLeft: 8 + (depth + 1) * 12 }}
+              title={s.definition}
+            >
+              <span className="w-3" />
+              <span>📄</span>
+              <span className="flex-1 truncate">{s.definition || "(제목 없음)"}</span>
+            </button>
+          ))}
+          {tree.children.map((c) => (
+            <FolderTree
+              key={c.fullPath}
+              tree={c}
+              selectedId={selectedId}
+              selectedPath={selectedPath}
+              onPickNode={onPickNode}
+              onPickFolder={onPickFolder}
+              depth={depth + 1}
+            />
+          ))}
+        </>
+      )}
     </div>
   );
 }
 
-const nodeTypes = { wiki: WikiNodeView };
-
-// ── 본문 inline link 렌더 ────────────────────────────────
-function renderContent(content: string, nodes: Map<string, WikiNode>, onClick: (id: string) => void) {
-  // [[id|reason]] 또는 [[id]] 를 찾아 클릭 가능한 span 으로.
-  const parts: React.ReactNode[] = [];
-  let i = 0;
-  const re = /\[\[([a-zA-Z0-9_\-]+)(?:\|([^\]]*))?\]\]/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(content)) !== null) {
-    if (m.index > i) parts.push(content.slice(i, m.index));
-    const id = m[1];
-    const reason = m[2] ?? "";
-    const target = nodes.get(id);
-    const label = target ? target.definition : id;
-    parts.push(
-      <button
-        key={`${m.index}_${id}`}
-        onClick={() => onClick(id)}
-        className={`inline-block px-1.5 py-0.5 mx-0.5 rounded text-[11px] font-medium ${
-          target
-            ? "bg-boan-50 text-boan-700 hover:bg-boan-100 border border-boan-200"
-            : "bg-red-50 text-red-600 border border-red-200 line-through"
-        }`}
-        title={reason || (target ? target.content.slice(0, 80) : "대상 노드 없음")}
-      >
-        🔗 {label}
-      </button>
-    );
-    i = m.index + m[0].length;
-  }
-  if (i < content.length) parts.push(content.slice(i));
-  return <>{parts}</>;
-}
-
-// 노드 변경 시 fitView 자동 호출하는 inner 컴포넌트.
-function GraphCanvas({ flowNodes, flowEdges, onNodeClick, onPaneClick }: {
-  flowNodes: Node[]; flowEdges: Edge[]; onNodeClick: (id: string) => void; onPaneClick: () => void;
+// ── Skill 편집 패널 ──────────────────────────────────────
+function SkillEditor({
+  node,
+  onSaved,
+  onDeleted,
+}: {
+  node: WikiNode;
+  onSaved: () => void;
+  onDeleted: () => void;
 }) {
-  const { fitView } = useReactFlow();
+  const [definition, setDefinition] = useState(node.definition);
+  const [content, setContent] = useState(node.content);
+  const [path, setPath] = useState(node.path ?? "/");
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
   useEffect(() => {
-    if (flowNodes.length > 0) {
-      // 두 번 호출 — 한 번은 즉시(레이아웃 후), 한 번은 이미지/엣지 계산 후.
-      const t1 = setTimeout(() => fitView({ padding: 0.15, duration: 0, maxZoom: 4 }), 100);
-      const t2 = setTimeout(() => fitView({ padding: 0.15, duration: 400, maxZoom: 4 }), 500);
-      return () => { clearTimeout(t1); clearTimeout(t2); };
+    setDefinition(node.definition);
+    setContent(node.content);
+    setPath(node.path ?? "/");
+    setErr(null);
+  }, [node.id]);
+
+  const save = async () => {
+    setSaving(true);
+    setErr(null);
+    try {
+      await wikiGraphApi.updateNode(node.id, {
+        definition,
+        content,
+        path: normalizePath(path),
+        updated_by: "human",
+      });
+      onSaved();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
     }
-  }, [flowNodes, fitView]);
+  };
+
+  const del = async () => {
+    if (!confirm(`"${node.definition}" skill 삭제?`)) return;
+    try {
+      await wikiGraphApi.deleteNode(node.id);
+      onDeleted();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    }
+  };
+
   return (
-    <ReactFlow
-      nodes={flowNodes}
-      edges={flowEdges}
-      nodeTypes={nodeTypes}
-      fitView
-      fitViewOptions={{ padding: 0.2 }}
-      minZoom={0.1}
-      maxZoom={3}
-      onNodeClick={(_, n) => onNodeClick(n.id)}
-      onPaneClick={onPaneClick}
-    >
-      <Background gap={16} />
-      <Controls />
-      <MiniMap pannable zoomable />
-    </ReactFlow>
+    <div className="flex-1 flex flex-col min-h-0 p-4 gap-3 overflow-y-auto">
+      <div className="flex items-center gap-2 text-[10px] text-gray-400">
+        <span className="font-mono">{node.id}</span>
+        {node.created_by && <span>· {node.created_by}</span>}
+        {node.updated_at && <span>· 수정 {new Date(node.updated_at).toLocaleString("ko-KR")}</span>}
+      </div>
+      <label className="text-xs text-gray-600">
+        폴더 경로
+        <input
+          value={path}
+          onChange={(e) => setPath(e.target.value)}
+          placeholder="/security/credentials"
+          className="mt-1 w-full text-xs font-mono border border-gray-300 rounded px-2 py-1"
+        />
+      </label>
+      <label className="text-xs text-gray-600">
+        Skill 제목 (≤30자)
+        <input
+          value={definition}
+          maxLength={30}
+          onChange={(e) => setDefinition(e.target.value)}
+          className="mt-1 w-full text-sm font-semibold border border-gray-300 rounded px-2 py-1"
+        />
+      </label>
+      <label className="text-xs text-gray-600 flex-1 flex flex-col">
+        Skill 본문 (≤1000자) — [[node_id|이유]] 로 인라인 링크
+        <textarea
+          value={content}
+          maxLength={1000}
+          onChange={(e) => setContent(e.target.value)}
+          className="mt-1 flex-1 min-h-[200px] text-xs font-mono border border-gray-300 rounded px-2 py-2 leading-relaxed"
+        />
+        <span className="text-[10px] text-gray-400 mt-1 self-end">{content.length}/1000</span>
+      </label>
+      {err && <div className="text-xs text-red-600 bg-red-50 border border-red-200 rounded px-2 py-1">{err}</div>}
+      <div className="flex gap-2">
+        <button
+          onClick={save}
+          disabled={saving}
+          className="text-xs px-4 py-1.5 bg-boan-600 text-white rounded hover:bg-boan-700 disabled:opacity-40"
+        >
+          {saving ? "저장 중..." : "💾 저장"}
+        </button>
+        <button
+          onClick={del}
+          className="text-xs px-4 py-1.5 border border-red-300 text-red-600 rounded hover:bg-red-50"
+        >
+          🗑 삭제
+        </button>
+      </div>
+    </div>
   );
 }
 
-// ── 메인 컴포넌트 ────────────────────────────────────────
+// ── 메인 ─────────────────────────────────────────────────
 export default function WikiGraph() {
   const [nodes, setNodes] = useState<WikiNode[]>([]);
-  const [edges, setEdges] = useState<WikiEdge[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [err, setErr] = useState<string | null>(null);
-  const [selected, setSelected] = useState<string | null>(null);
-
-  // Manual node create
-  const [showCreate, setShowCreate] = useState(false);
-  const [newDef, setNewDef] = useState("");
-  const [newContent, setNewContent] = useState("");
-  const [newTags, setNewTags] = useState("");
-  const [msg, setMsg] = useState<string | null>(null);
-
-  // Run skill.wiki_edit
-  const [skillInput, setSkillInput] = useState("");
-  const [skillDecision, setSkillDecision] = useState<"approve" | "deny">("deny");
-  const [skillRunning, setSkillRunning] = useState(false);
-
-  // Layout
-  const [direction, setDirection] = useState<"LR" | "TB">("LR");
-
-  // Tab + raw data + dialog
-  type Tab = "graph" | "raw" | "dialog";
-  const [tab, setTab] = useState<Tab>("graph");
   const [decisions, setDecisions] = useState<WikiDecision[]>([]);
   const [dialogs, setDialogs] = useState<ClarificationDialog[]>([]);
+  const [tab, setTab] = useState<Tab>("folders");
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState<string | null>(null);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  // Folder 탭 상태
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedPath, setSelectedPath] = useState<string>("/");
+  const [showCreate, setShowCreate] = useState(false);
+  const [newPath, setNewPath] = useState("/");
+  const [newDef, setNewDef] = useState("");
+  const [newContent, setNewContent] = useState("");
+
+  // Dialog 탭
   const [activeDialog, setActiveDialog] = useState<string | null>(null);
   const [userMsg, setUserMsg] = useState("");
+
+  // find_ambiguous
+  const [finding, setFinding] = useState(false);
+  // agentic_iterate
+  const [iterating, setIterating] = useState(false);
+
+  const loadNodes = useCallback(async () => {
+    setLoading(true);
+    setErr(null);
+    try {
+      const ns = await wikiGraphApi.listNodes();
+      setNodes(ns);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   const loadRaw = useCallback(async () => {
     try {
@@ -200,135 +299,67 @@ export default function WikiGraph() {
     }
   }, []);
 
+  useEffect(() => { loadNodes(); }, [loadNodes]);
   useEffect(() => {
     if (tab === "raw" || tab === "dialog") loadRaw();
   }, [tab, loadRaw]);
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    setErr(null);
-    try {
-      const [ns, es] = await Promise.all([
-        wikiGraphApi.listNodes(),
-        wikiGraphApi.listEdges(),
-      ]);
-      setNodes(ns);
-      setEdges(es);
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => { load(); }, [load]);
-
-  const nodeMap = useMemo(() => new Map(nodes.map((n) => [n.id, n])), [nodes]);
-
-  // react-flow 용 변환 + 레이아웃.
-  const flowNodes: Node[] = useMemo(() => {
-    const base = nodes.map((n) => ({
-      id: n.id,
-      type: "wiki",
-      position: { x: 0, y: 0 },
-      data: { definition: n.definition, content: n.content, tags: n.tags },
-    }));
-    return layoutGraph(
-      base,
-      edges.filter((e) => nodeMap.has(e.from) && nodeMap.has(e.to)).map((e) => ({
-        id: e.id, source: e.from, target: e.to,
-      })),
-      direction,
-    );
-  }, [nodes, edges, nodeMap, direction]);
-
-  const flowEdges: Edge[] = useMemo(
-    () =>
-      edges
-        .filter((e) => nodeMap.has(e.from) && nodeMap.has(e.to))
-        .map((e) => {
-          const s = relStyle(e.relation);
-          return {
-            id: e.id,
-            source: e.from,
-            target: e.to,
-            label: s.label + (e.reason ? ` · ${e.reason.slice(0, 10)}…` : ""),
-            labelStyle: { fontSize: 10, fill: s.stroke },
-            style: { stroke: s.stroke, strokeWidth: 1.5 },
-            markerEnd: { type: MarkerType.ArrowClosed, color: s.stroke },
-            animated: e.relation === "inline_ref",
-          };
-        }),
-    [edges, nodeMap],
+  const tree = useMemo(() => buildTree(nodes), [nodes]);
+  const selectedNode = useMemo(
+    () => nodes.find((n) => n.id === selectedId) ?? null,
+    [nodes, selectedId],
   );
-
-  const selectedNode = selected ? nodeMap.get(selected) : null;
-  const selectedEdges = selected
-    ? edges.filter((e) => e.from === selected || e.to === selected)
-    : [];
 
   const submitCreate = async (e: React.FormEvent) => {
     e.preventDefault();
-    setMsg(null);
+    setErr(null);
     try {
-      await wikiGraphApi.createNode({
-        definition: newDef.trim(),
+      const created = await wikiGraphApi.createNode({
+        path: normalizePath(newPath),
+        definition: newDef,
         content: newContent,
-        tags: newTags.split(",").map((s) => s.trim()).filter(Boolean),
         created_by: "human",
       });
-      setNewDef(""); setNewContent(""); setNewTags("");
+      setMsg(`✅ skill 생성: ${created.definition}`);
+      setNewDef("");
+      setNewContent("");
       setShowCreate(false);
-      setMsg("노드 추가됨");
-      load();
+      await loadNodes();
+      setSelectedId(created.id);
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
     }
   };
 
-  const runSkill = async () => {
-    if (!skillInput.trim()) return;
-    setSkillRunning(true);
+  const runAgenticIterate = async (dialogID?: string) => {
+    setIterating(true);
+    setErr(null);
     setMsg(null);
     try {
-      const res = await wikiGraphApi.runWikiEdit({
-        input: skillInput.trim(),
-        decision: skillDecision,
-        labeler: "manual",
-      });
-      setMsg(`skill.wiki_edit → +${res.nodes_created?.length ?? 0} node / +${res.edges_created?.length ?? 0} edge / ${res.errors?.length ?? 0} 에러`);
-      setSkillInput("");
-      load();
+      const res = await wikiGraphApi.runAgenticIterate(dialogID);
+      const summary = [
+        res.nodes_created?.length ? `+${res.nodes_created.length} 생성` : "",
+        res.nodes_updated?.length ? `${res.nodes_updated.length} 수정` : "",
+        res.nodes_deleted?.length ? `-${res.nodes_deleted.length} 삭제` : "",
+        res.nodes_moved?.length ? `${res.nodes_moved.length} 이동` : "",
+      ].filter(Boolean).join(", ");
+      const reasoning = res.reasoning ? `\n💭 "${res.reasoning}"` : "";
+      if (res.actions_planned === 0 && (res.errors?.length ?? 0) === 0) {
+        setMsg("🤖 Agentic loop: 편집할 것 없음 (현재 구조 OK)" + reasoning);
+      } else if (res.errors?.length) {
+        setErr(`agentic_iterate 일부 에러: ${res.errors.join(" | ")}`);
+      } else {
+        setMsg(`🤖 Agentic loop 완료: ${summary || "액션 없음"}${reasoning}`);
+      }
+      await loadNodes();
+      await loadRaw();
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
-      setSkillRunning(false);
+      setIterating(false);
     }
   };
 
-  const deleteNode = async (id: string) => {
-    if (!confirm("이 노드 + 연결 엣지를 삭제하시겠습니까?")) return;
-    try {
-      await wikiGraphApi.deleteNode(id);
-      setSelected(null);
-      load();
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
-    }
-  };
-
-  const appendTurn = async (dialogID: string, role: "human" | "llm", content: string) => {
-    const d = dialogs.find((x) => x.id === dialogID);
-    if (!d) return;
-    const next: ClarificationDialog = {
-      ...d,
-      turns: [...d.turns, { role, content }],
-    };
-    await wikiGraphApi.upsertDialog(next);
-    loadRaw();
-  };
-
-  const [finding, setFinding] = useState(false);
   const findAmbiguous = async () => {
     setFinding(true);
     setErr(null);
@@ -337,16 +368,14 @@ export default function WikiGraph() {
       const res = await wikiGraphApi.runFindAmbiguous();
       const created = res.dialogs_created?.length ?? 0;
       if (created > 0) {
-        setMsg(`LLM 이 ${res.questions_found}개 질문 생성 (대화 ${created}개)`);
+        setMsg(`🔍 LLM 이 ${res.questions_found}개 질문 생성 (대화 ${created}개)`);
         setActiveDialog(res.dialogs_created[0]);
       } else if (res.errors?.length) {
         setErr(
-          `LLM 응답이 유효하지 않아 폐기되었습니다. (모델 크기 한계 가능성). 상세: ${res.errors.join(
-            " | ",
-          )}`,
+          `LLM 응답 폐기 (모델 크기 한계 가능성). 상세: ${res.errors.join(" | ")}`,
         );
       } else {
-        setMsg("경계가 애매한 케이스를 찾지 못함 — 모든 결정이 명확해 보임");
+        setMsg("경계가 애매한 케이스 없음 — 모든 결정이 명확");
       }
       await loadRaw();
     } catch (e) {
@@ -356,50 +385,54 @@ export default function WikiGraph() {
     }
   };
 
+  const appendTurn = async (dialogID: string, role: "human" | "llm", content: string) => {
+    const d = dialogs.find((x) => x.id === dialogID);
+    if (!d) return;
+    await wikiGraphApi.upsertDialog({ ...d, turns: [...d.turns, { role, content }] });
+    await loadRaw();
+  };
+
   return (
     <div className="flex-1 h-full flex flex-col min-h-0 min-w-0">
-      {/* 상단 타이틀 + 탭 + 컨트롤 */}
+      {/* 헤더 */}
       <div className="px-4 pt-3 pb-2 border-b border-gray-200 bg-white/60 backdrop-blur">
         <div className="flex items-center justify-between gap-4">
           <div className="min-w-0">
-            <h1 className="text-lg font-bold text-gray-800">G3 Graph Wiki</h1>
+            <h1 className="text-lg font-bold text-gray-800">G3 Folder Wiki</h1>
             <p className="text-[11px] text-gray-500 mt-0.5 truncate">
-              LLM 이 HITL 결정을 보고 스스로 편집/질문하는 지식 그래프 · Graph + Raw 결정 + LLM 주도 Q&A
+              각 노드 = skill · 폴더로 계층화 · LLM 이 agentic loop 로 스스로 편집
             </p>
           </div>
           <div className="flex items-center gap-2">
-            {tab === "graph" && (
-              <>
-                <select
-                  value={direction}
-                  onChange={(e) => setDirection(e.target.value as "LR" | "TB")}
-                  className="text-xs border border-gray-300 rounded px-2 py-1"
-                >
-                  <option value="LR">가로 배치</option>
-                  <option value="TB">세로 배치</option>
-                </select>
-                <button
-                  onClick={() => setShowCreate(!showCreate)}
-                  className="text-xs px-3 py-1.5 border border-gray-300 rounded hover:bg-gray-50"
-                >
-                  {showCreate ? "취소" : "+ 노드"}
-                </button>
-              </>
+            <button
+              onClick={() => runAgenticIterate()}
+              disabled={iterating}
+              title="LLM 이 wiki 전체를 훑어 편집 1회"
+              className="text-xs px-3 py-1.5 bg-purple-600 text-white rounded hover:bg-purple-700 disabled:opacity-40 font-medium"
+            >
+              {iterating ? "🤖 Agentic loop 중..." : "🤖 Agentic loop 1회"}
+            </button>
+            {tab === "folders" && (
+              <button
+                onClick={() => setShowCreate(!showCreate)}
+                className="text-xs px-3 py-1.5 border border-gray-300 rounded hover:bg-gray-50"
+              >
+                {showCreate ? "취소" : "+ skill"}
+              </button>
             )}
             <button
-              onClick={() => { load(); loadRaw(); }}
+              onClick={() => { loadNodes(); loadRaw(); }}
               className="text-xs px-3 py-1.5 border border-gray-300 rounded hover:bg-gray-50"
             >
               ↻ 새로고침
             </button>
           </div>
         </div>
-        {/* 탭 */}
         <div className="flex gap-1 mt-2 -mb-2">
           {([
-            { id: "graph",  label: `🕸️ Graph (${nodes.length})` },
-            { id: "raw",    label: `📋 Raw 결정 (${decisions.length})` },
-            { id: "dialog", label: `💬 LLM 대화 (${dialogs.length})` },
+            { id: "folders", label: `📂 Skills (${nodes.length})` },
+            { id: "raw",     label: `📋 Raw 결정 (${decisions.length})` },
+            { id: "dialog",  label: `💬 LLM 대화 (${dialogs.length})` },
           ] as const).map((t) => (
             <button
               key={t.id}
@@ -416,343 +449,248 @@ export default function WikiGraph() {
         </div>
       </div>
 
-      {/* 이 아래는 탭 별 본문 wrapper */}
       <div className="flex-1 min-h-0 flex flex-col p-3 gap-3">
-      {tab === "graph" && (<>
-      {/* skill.wiki_edit 테스트 */}
-      <div className="bg-gradient-to-r from-purple-50 to-blue-50 border border-purple-200 rounded-lg p-3">
-        <div className="text-xs font-medium text-gray-700 mb-1.5">⚡ skill.wiki_edit 수동 실행 (LLM 이 그래프 편집)</div>
-        <div className="flex gap-2">
-          <select
-            value={skillDecision}
-            onChange={(e) => setSkillDecision(e.target.value as "approve" | "deny")}
-            className="text-xs border border-gray-300 rounded px-2 py-1 bg-white"
-          >
-            <option value="deny">deny (위험)</option>
-            <option value="approve">approve (안전)</option>
-          </select>
-          <input
-            value={skillInput}
-            onChange={(e) => setSkillInput(e.target.value)}
-            placeholder="입력 예시 — 예: 고객 개인정보 김철수 010-1234-5678 ..."
-            className="flex-1 text-xs border border-gray-300 rounded px-2 py-1 bg-white"
-          />
-          <button
-            onClick={runSkill}
-            disabled={skillRunning || !skillInput.trim()}
-            className="text-xs px-3 py-1 bg-boan-600 text-white rounded hover:bg-boan-700 disabled:opacity-40"
-          >
-            {skillRunning ? "LLM 호출중..." : "실행"}
-          </button>
-        </div>
-      </div>
+        {msg && <div className="text-xs text-green-700 bg-green-50 border border-green-200 rounded px-3 py-1.5 whitespace-pre-wrap">{msg}</div>}
+        {err && <div className="text-xs text-red-700 bg-red-50 border border-red-200 rounded px-3 py-1.5 whitespace-pre-wrap">{err}</div>}
 
-      {/* 노드 추가 폼 */}
-      {showCreate && (
-        <form onSubmit={submitCreate} className="mb-3 bg-white border border-gray-200 rounded-lg p-3 space-y-2">
-          <input
-            value={newDef}
-            onChange={(e) => setNewDef(e.target.value)}
-            placeholder="정의 (30자 이내)"
-            maxLength={30}
-            required
-            className="w-full text-xs border border-gray-300 rounded px-2 py-1"
-          />
-          <textarea
-            value={newContent}
-            onChange={(e) => setNewContent(e.target.value)}
-            placeholder="내용 (1000자 이내). 다른 노드 링크는 [[node_id|이유]] 문법 사용"
-            maxLength={1000}
-            rows={3}
-            required
-            className="w-full text-xs border border-gray-300 rounded px-2 py-1 font-mono"
-          />
-          <div className="flex gap-2">
-            <input
-              value={newTags}
-              onChange={(e) => setNewTags(e.target.value)}
-              placeholder="태그 (쉼표로 구분)"
-              className="flex-1 text-xs border border-gray-300 rounded px-2 py-1"
-            />
-            <button type="submit" className="text-xs px-3 py-1 bg-boan-600 text-white rounded hover:bg-boan-700">
-              추가
-            </button>
-          </div>
-        </form>
-      )}
-
-      {msg && <div className="mb-2 text-xs text-green-600 bg-green-50 border border-green-200 rounded px-2 py-1">{msg}</div>}
-      {err && <div className="mb-2 text-xs text-red-600 bg-red-50 border border-red-200 rounded px-2 py-1">{err}</div>}
-
-      {/* 그래프 + drawer — 남은 viewport 전부 채움 */}
-      <div className="flex gap-3 flex-1 min-h-0">
-        <div className="flex-1 bg-white border border-gray-200 rounded-xl overflow-hidden min-h-0">
-          {loading ? (
-            <div className="h-full flex items-center justify-center text-sm text-gray-400">로딩 중...</div>
-          ) : flowNodes.length === 0 ? (
-            <div className="h-full flex flex-col items-center justify-center text-sm text-gray-400 gap-2">
-              <div>아직 노드가 없습니다.</div>
-              <div className="text-xs">위 skill.wiki_edit 에 입력 넣고 실행하거나 "+ 노드" 로 수동 추가.</div>
-            </div>
-          ) : (
-            <ReactFlowProvider>
-              <GraphCanvas
-                flowNodes={flowNodes}
-                flowEdges={flowEdges}
-                onNodeClick={(id) => setSelected(id)}
-                onPaneClick={() => setSelected(null)}
-              />
-            </ReactFlowProvider>
-          )}
-        </div>
-
-        {/* drawer */}
-        {selectedNode && (
-          <div className="w-96 bg-white border border-gray-200 rounded-xl p-4 overflow-y-auto min-h-0">
-            <div className="flex items-start justify-between gap-2 mb-2">
-              <h2 className="text-sm font-bold text-gray-800">{selectedNode.definition}</h2>
-              <button
-                onClick={() => setSelected(null)}
-                className="text-gray-400 hover:text-gray-700 text-lg leading-none"
-              >
-                ×
-              </button>
-            </div>
-            <div className="text-[10px] text-gray-400 mb-3 font-mono">{selectedNode.id}</div>
-            <div className="text-xs text-gray-700 leading-relaxed whitespace-pre-wrap mb-3">
-              {renderContent(selectedNode.content, nodeMap, (id) => setSelected(id))}
-            </div>
-            {selectedNode.tags && selectedNode.tags.length > 0 && (
-              <div className="flex flex-wrap gap-1 mb-3">
-                {selectedNode.tags.map((t) => (
-                  <span key={t} className="text-[10px] px-2 py-0.5 bg-blue-50 text-blue-700 rounded-full">{t}</span>
-                ))}
+        {/* ── Folders 탭 ── */}
+        {tab === "folders" && (
+          <div className="flex-1 min-h-0 flex gap-3">
+            {/* 좌: 폴더 트리 */}
+            <div className="w-80 bg-white border border-gray-200 rounded-xl flex flex-col overflow-hidden">
+              <div className="px-3 py-2 border-b border-gray-100 text-xs text-gray-500">
+                📂 Skill 트리 ({nodes.length}개)
               </div>
-            )}
-            <div className="text-[10px] text-gray-400 mb-3">
-              by {selectedNode.created_by ?? "?"} · {selectedNode.updated_at?.slice(0, 19)}
+              <div className="flex-1 overflow-y-auto py-1">
+                {loading ? (
+                  <div className="p-4 text-xs text-gray-400 text-center">로딩 중...</div>
+                ) : nodes.length === 0 ? (
+                  <div className="p-4 text-xs text-gray-400 text-center">
+                    skill 없음.<br/>+ skill 로 추가하거나<br/>Agentic loop 실행.
+                  </div>
+                ) : (
+                  <FolderTree
+                    tree={tree}
+                    selectedId={selectedId}
+                    selectedPath={selectedPath}
+                    onPickNode={(id) => { setSelectedId(id); setSelectedPath(""); }}
+                    onPickFolder={(p) => { setSelectedPath(p); setSelectedId(null); }}
+                  />
+                )}
+              </div>
             </div>
-
-            {selectedEdges.length > 0 && (
-              <div className="border-t border-gray-100 pt-3">
-                <div className="text-[10px] font-semibold text-gray-500 mb-1.5">연결 ({selectedEdges.length})</div>
-                <div className="space-y-1">
-                  {selectedEdges.map((e) => {
-                    const s = relStyle(e.relation);
-                    const otherID = e.from === selected ? e.to : e.from;
-                    const other = nodeMap.get(otherID);
-                    const dir = e.from === selected ? "→" : "←";
-                    return (
-                      <button
-                        key={e.id}
-                        onClick={() => other && setSelected(otherID)}
-                        className="w-full text-left text-xs text-gray-700 px-2 py-1.5 rounded hover:bg-gray-50 border border-gray-100"
-                        disabled={!other}
-                      >
-                        <span style={{ color: s.stroke }} className="font-medium">{dir} {s.label}</span>
-                        <span className="text-gray-500"> · {other?.definition ?? `(${otherID} 없음)`}</span>
-                        {e.reason && <div className="text-[10px] text-gray-400 ml-4">{e.reason}</div>}
-                      </button>
-                    );
-                  })}
+            {/* 우: skill 내용 또는 폴더 요약 */}
+            <div className="flex-1 bg-white border border-gray-200 rounded-xl flex flex-col overflow-hidden min-h-0">
+              {showCreate ? (
+                <form onSubmit={submitCreate} className="p-4 space-y-2">
+                  <div className="text-sm font-semibold text-gray-700">➕ 새 Skill</div>
+                  <input
+                    value={newPath}
+                    onChange={(e) => setNewPath(e.target.value)}
+                    placeholder="폴더 경로: /security/credentials"
+                    className="w-full text-xs font-mono border border-gray-300 rounded px-2 py-1"
+                  />
+                  <input
+                    value={newDef}
+                    onChange={(e) => setNewDef(e.target.value)}
+                    maxLength={30}
+                    placeholder="Skill 제목 (≤30자)"
+                    required
+                    className="w-full text-sm border border-gray-300 rounded px-2 py-1"
+                  />
+                  <textarea
+                    value={newContent}
+                    onChange={(e) => setNewContent(e.target.value)}
+                    maxLength={1000}
+                    rows={6}
+                    placeholder="본문 (≤1000자). [[node_id|이유]] 인라인 링크 가능."
+                    required
+                    className="w-full text-xs font-mono border border-gray-300 rounded px-2 py-1"
+                  />
+                  <button type="submit" className="text-xs px-4 py-1.5 bg-boan-600 text-white rounded hover:bg-boan-700">
+                    추가
+                  </button>
+                </form>
+              ) : selectedNode ? (
+                <SkillEditor
+                  key={selectedNode.id}
+                  node={selectedNode}
+                  onSaved={() => { setMsg("저장됨"); loadNodes(); }}
+                  onDeleted={() => { setSelectedId(null); loadNodes(); }}
+                />
+              ) : (
+                <div className="flex-1 flex items-center justify-center text-sm text-gray-400 text-center px-6">
+                  좌측에서 📄 skill 을 선택하세요.<br/>
+                  또는 위 "+ skill" 버튼으로 추가.
+                  {selectedPath && selectedPath !== "/" && (
+                    <>
+                      <br/><br/>
+                      <span className="text-xs">현재 선택 폴더: <code className="bg-gray-100 px-1">{selectedPath}</code></span>
+                    </>
+                  )}
                 </div>
-              </div>
-            )}
-
-            <div className="border-t border-gray-100 pt-3 mt-3">
-              <button
-                onClick={() => deleteNode(selectedNode.id)}
-                className="w-full text-xs text-red-500 hover:text-red-700 py-1.5 border border-red-200 hover:bg-red-50 rounded"
-              >
-                노드 삭제
-              </button>
+              )}
             </div>
           </div>
         )}
-      </div>
 
-      {/* 범례 */}
-      <div className="flex flex-wrap gap-3 text-[10px] text-gray-500">
-        <span className="font-semibold">관계:</span>
-        {Object.entries(RELATION_STYLES).map(([k, v]) => (
-          <span key={k} className="flex items-center gap-1">
-            <span style={{ background: v.stroke, width: 12, height: 2, display: "inline-block" }} />
-            {v.label}
-          </span>
-        ))}
-      </div>
-      </>)}
-
-      {/* ── Raw 결정 탭 ── */}
-      {tab === "raw" && (
-        <div className="flex-1 min-h-0 bg-white border border-gray-200 rounded-xl overflow-hidden flex flex-col">
-          <div className="px-3 py-2 border-b border-gray-100 text-xs text-gray-500 flex-shrink-0">
-            HITL approve/deny 라벨 이력 (최근 200건) — LLM 이 관찰하는 원시 데이터
-          </div>
-          <div className="flex-1 overflow-y-auto">
-            <table className="w-full text-xs">
-              <thead className="bg-gray-50 border-b border-gray-200 sticky top-0">
-                <tr>
-                  <th className="text-left px-3 py-2 font-semibold text-gray-500 w-32">시각</th>
-                  <th className="text-left px-3 py-2 font-semibold text-gray-500 w-20">결정</th>
-                  <th className="text-left px-3 py-2 font-semibold text-gray-500 w-28">이유</th>
-                  <th className="text-left px-3 py-2 font-semibold text-gray-500">입력 원문</th>
-                  <th className="text-left px-3 py-2 font-semibold text-gray-500 w-24">라벨러</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-gray-100">
-                {decisions.length === 0 ? (
-                  <tr><td colSpan={5} className="text-center py-8 text-gray-400">아직 라벨링된 결정이 없습니다.</td></tr>
-                ) : decisions.map((d, i) => (
-                  <tr key={d.id ?? i} className={d.decision === "deny" ? "bg-red-50/30" : "bg-green-50/30"}>
-                    <td className="px-3 py-1.5 text-gray-400 font-mono whitespace-nowrap">
-                      {d.timestamp ? new Date(d.timestamp).toLocaleString("ko-KR", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "-"}
-                    </td>
-                    <td className="px-3 py-1.5">
-                      <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded ${
-                        d.decision === "approve" ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"
-                      }`}>
-                        {d.decision}
-                      </span>
-                    </td>
-                    <td className="px-3 py-1.5 text-gray-600 truncate max-w-[180px]" title={d.reason}>
-                      {d.reason || "-"}
-                    </td>
-                    <td className="px-3 py-1.5 text-gray-700 font-mono truncate max-w-[600px]" title={d.input}>
-                      {d.input}
-                    </td>
-                    <td className="px-3 py-1.5 text-gray-400">{d.labeler || "-"}</td>
+        {/* ── Raw 결정 탭 ── */}
+        {tab === "raw" && (
+          <div className="flex-1 min-h-0 bg-white border border-gray-200 rounded-xl overflow-hidden flex flex-col">
+            <div className="px-4 py-2 border-b border-gray-100 text-xs text-gray-500">
+              HITL approve/deny 라벨 이력 (최근 200건) — LLM 이 관찰하는 원시 데이터
+            </div>
+            <div className="flex-1 overflow-auto">
+              <table className="w-full text-xs">
+                <thead className="bg-gray-50 text-left text-gray-500 sticky top-0">
+                  <tr>
+                    <th className="px-3 py-2 font-medium w-32">시각</th>
+                    <th className="px-3 py-2 font-medium w-20">결정</th>
+                    <th className="px-3 py-2 font-medium w-40">이유</th>
+                    <th className="px-3 py-2 font-medium">입력 원문</th>
+                    <th className="px-3 py-2 font-medium w-24">라벨러</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
-
-      {/* ── LLM↔Human 대화 탭 ── */}
-      {tab === "dialog" && (
-        <div className="flex-1 min-h-0 flex gap-3">
-          {/* 좌측: 대화 목록 */}
-          <div className="w-80 bg-white border border-gray-200 rounded-xl flex flex-col overflow-hidden">
-            <div className="px-3 py-2 border-b border-gray-100 flex flex-col gap-1.5">
-              <button
-                onClick={findAmbiguous}
-                disabled={finding}
-                className="text-xs px-3 py-2 bg-boan-600 text-white rounded hover:bg-boan-700 disabled:opacity-40 font-medium"
-              >
-                {finding ? "🔍 LLM 분석 중..." : "🔍 LLM 이 애매한 경계 찾기"}
-              </button>
-              <div className="text-[10px] text-gray-500 leading-tight">
-                최근 approve/deny 결정에서 경계가 애매한 케이스를 LLM 이 스스로 찾아 질문을 생성합니다.
-              </div>
-            </div>
-            <div className="flex-1 overflow-y-auto divide-y divide-gray-100">
-              {dialogs.length === 0 ? (
-                <div className="p-4 text-center text-xs text-gray-400">
-                  아직 질문 없음.<br />
-                  위 버튼을 눌러 LLM 이 최근 HITL 결정에서<br />
-                  애매한 경계를 찾도록 시키세요.
-                </div>
-              ) : dialogs.map((d) => (
-                <div
-                  key={d.id}
-                  className={`group relative w-full flex ${
-                    activeDialog === d.id ? "bg-boan-50" : "hover:bg-gray-50"
-                  }`}
-                >
-                  <button
-                    onClick={() => setActiveDialog(d.id ?? null)}
-                    className="flex-1 text-left px-3 py-2 min-w-0"
-                  >
-                    <div className="text-xs font-medium text-gray-700 truncate">
-                      {d.turns[0]?.content.slice(0, 40) ?? "(비어있음)"}
-                    </div>
-                    <div className="text-[10px] text-gray-400 mt-0.5 flex justify-between">
-                      <span>{d.turns.length} 턴</span>
-                      <span>{d.started_at ? new Date(d.started_at).toLocaleString("ko-KR", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : ""}</span>
-                    </div>
-                    {d.topic_node_id && (
-                      <div className="text-[10px] text-boan-600 font-mono mt-0.5">🔗 {d.topic_node_id.slice(0, 24)}</div>
-                    )}
-                  </button>
-                  <button
-                    title="대화 삭제"
-                    onClick={async () => {
-                      if (!d.id) return;
-                      if (!confirm("이 대화를 삭제할까요?")) return;
-                      await wikiGraphApi.deleteDialog(d.id);
-                      if (activeDialog === d.id) setActiveDialog(null);
-                      await loadRaw();
-                    }}
-                    className="opacity-0 group-hover:opacity-100 px-2 text-xs text-gray-400 hover:text-red-600 transition-opacity"
-                  >
-                    🗑
-                  </button>
-                </div>
-              ))}
-            </div>
-          </div>
-          {/* 우측: 대화 본문 */}
-          <div className="flex-1 bg-white border border-gray-200 rounded-xl flex flex-col overflow-hidden">
-            {activeDialog ? (() => {
-              const d = dialogs.find((x) => x.id === activeDialog);
-              if (!d) return <div className="p-6 text-sm text-gray-400">대화를 찾을 수 없음</div>;
-              return <>
-                <div className="px-4 py-2 border-b border-gray-100 flex items-center justify-between">
-                  <div className="text-xs text-gray-500">
-                    {d.turns.length} 턴 · 시작 {d.started_at ? new Date(d.started_at).toLocaleString("ko-KR") : "-"}
-                  </div>
-                  {d.topic_node_id && (
-                    <button
-                      onClick={() => { setSelected(d.topic_node_id!); setTab("graph"); }}
-                      className="text-[11px] text-boan-600 hover:underline font-mono"
-                    >
-                      🔗 노드로 이동: {d.topic_node_id.slice(0, 20)}
-                    </button>
-                  )}
-                </div>
-                <div className="flex-1 overflow-y-auto p-4 space-y-3">
-                  {d.turns.map((t, i) => (
-                    <DialogTurnView key={i} turn={t} />
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  {decisions.length === 0 ? (
+                    <tr><td colSpan={5} className="text-center py-12 text-gray-400">아직 라벨링된 결정이 없습니다.</td></tr>
+                  ) : decisions.map((d) => (
+                    <tr key={d.id} className={d.decision === "approve" ? "" : "bg-red-50/30"}>
+                      <td className="px-3 py-2 text-[10px] text-gray-400 font-mono">
+                        {d.timestamp ? new Date(d.timestamp).toLocaleString("ko-KR", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "-"}
+                      </td>
+                      <td className="px-3 py-2">
+                        <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${
+                          d.decision === "approve" ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"
+                        }`}>{d.decision}</span>
+                      </td>
+                      <td className="px-3 py-2 text-gray-600 text-[11px]">{d.reason}</td>
+                      <td className="px-3 py-2 text-gray-800 font-mono text-[11px] break-all">{d.input}</td>
+                      <td className="px-3 py-2 text-gray-400 text-[10px]">{d.labeler}</td>
+                    </tr>
                   ))}
-                </div>
-                <div className="border-t border-gray-100 p-3 flex gap-2">
-                  <textarea
-                    value={userMsg}
-                    onChange={(e) => setUserMsg(e.target.value)}
-                    placeholder="사용자 답변을 여기에 입력..."
-                    rows={2}
-                    className="flex-1 text-xs border border-gray-200 rounded px-2 py-1 resize-none"
-                  />
-                  <button
-                    disabled={!userMsg.trim()}
-                    onClick={async () => {
-                      await appendTurn(d.id!, "human", userMsg.trim());
-                      setUserMsg("");
-                    }}
-                    className="text-xs px-4 py-1 bg-boan-600 text-white rounded hover:bg-boan-700 disabled:opacity-40 self-end"
-                  >
-                    답변
-                  </button>
-                </div>
-              </>;
-            })() : (
-              <div className="flex-1 flex items-center justify-center text-sm text-gray-400 text-center px-6">
-                좌측에서 LLM 이 생성한 질문을 선택하세요.<br />
-                아직 질문이 없다면 "🔍 LLM 이 애매한 경계 찾기" 버튼으로 시작.
-              </div>
-            )}
+                </tbody>
+              </table>
+            </div>
           </div>
-        </div>
-      )}
+        )}
 
+        {/* ── Dialog 탭 ── */}
+        {tab === "dialog" && (
+          <div className="flex-1 min-h-0 flex gap-3">
+            {/* 좌: 질문 목록 */}
+            <div className="w-80 bg-white border border-gray-200 rounded-xl flex flex-col overflow-hidden">
+              <div className="px-3 py-2 border-b border-gray-100 flex flex-col gap-1.5">
+                <button
+                  onClick={findAmbiguous}
+                  disabled={finding}
+                  className="text-xs px-3 py-2 bg-boan-600 text-white rounded hover:bg-boan-700 disabled:opacity-40 font-medium"
+                >
+                  {finding ? "🔍 LLM 분석 중..." : "🔍 LLM 이 애매한 경계 찾기"}
+                </button>
+                <div className="text-[10px] text-gray-500 leading-tight">
+                  최근 approve/deny 결정에서 경계가 애매한 케이스를 LLM 이 찾아 질문을 생성.
+                </div>
+              </div>
+              <div className="flex-1 overflow-y-auto divide-y divide-gray-100">
+                {dialogs.length === 0 ? (
+                  <div className="p-4 text-center text-xs text-gray-400">
+                    질문 없음. 위 버튼으로 LLM 을 실행하세요.
+                  </div>
+                ) : dialogs.map((d) => (
+                  <div
+                    key={d.id}
+                    className={`group relative w-full flex ${
+                      activeDialog === d.id ? "bg-boan-50" : "hover:bg-gray-50"
+                    }`}
+                  >
+                    <button
+                      onClick={() => setActiveDialog(d.id ?? null)}
+                      className="flex-1 text-left px-3 py-2 min-w-0"
+                    >
+                      <div className="text-xs font-medium text-gray-700 truncate">
+                        {d.turns[0]?.content.slice(0, 40) ?? "(비어있음)"}
+                      </div>
+                      <div className="text-[10px] text-gray-400 mt-0.5 flex justify-between">
+                        <span>{d.turns.length} 턴</span>
+                        <span>{d.started_at ? new Date(d.started_at).toLocaleString("ko-KR", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : ""}</span>
+                      </div>
+                    </button>
+                    <button
+                      title="대화 삭제"
+                      onClick={async () => {
+                        if (!d.id) return;
+                        if (!confirm("이 대화를 삭제할까요?")) return;
+                        await wikiGraphApi.deleteDialog(d.id);
+                        if (activeDialog === d.id) setActiveDialog(null);
+                        await loadRaw();
+                      }}
+                      className="opacity-0 group-hover:opacity-100 px-2 text-xs text-gray-400 hover:text-red-600 transition-opacity"
+                    >
+                      🗑
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+            {/* 우: 대화 본문 */}
+            <div className="flex-1 bg-white border border-gray-200 rounded-xl flex flex-col overflow-hidden min-h-0">
+              {activeDialog ? (() => {
+                const d = dialogs.find((x) => x.id === activeDialog);
+                if (!d) return <div className="p-6 text-sm text-gray-400">대화를 찾을 수 없음</div>;
+                return <>
+                  <div className="px-4 py-2 border-b border-gray-100 flex items-center justify-between">
+                    <div className="text-xs text-gray-500">
+                      {d.turns.length} 턴 · 시작 {d.started_at ? new Date(d.started_at).toLocaleString("ko-KR") : "-"}
+                    </div>
+                    <button
+                      onClick={() => runAgenticIterate(d.id!)}
+                      disabled={iterating}
+                      className="text-[11px] px-2.5 py-1 bg-purple-600 text-white rounded hover:bg-purple-700 disabled:opacity-40"
+                      title="이 대화를 LLM 이 읽고 wiki 편집"
+                    >
+                      🤖 이 답변 반영 (agentic)
+                    </button>
+                  </div>
+                  <div className="flex-1 overflow-y-auto p-4 space-y-3">
+                    {d.turns.map((t, i) => <DialogTurnView key={i} turn={t} />)}
+                  </div>
+                  <div className="border-t border-gray-100 p-3 flex gap-2">
+                    <textarea
+                      value={userMsg}
+                      onChange={(e) => setUserMsg(e.target.value)}
+                      placeholder="사용자 답변..."
+                      rows={2}
+                      className="flex-1 text-xs border border-gray-200 rounded px-2 py-1 resize-none"
+                    />
+                    <button
+                      disabled={!userMsg.trim()}
+                      onClick={async () => {
+                        const answer = userMsg.trim();
+                        await appendTurn(d.id!, "human", answer);
+                        setUserMsg("");
+                        // Auto-run agentic_iterate on this dialog
+                        runAgenticIterate(d.id!);
+                      }}
+                      className="text-xs px-4 py-1 bg-boan-600 text-white rounded hover:bg-boan-700 disabled:opacity-40 self-end"
+                    >
+                      답변 + 🤖
+                    </button>
+                  </div>
+                </>;
+              })() : (
+                <div className="flex-1 flex items-center justify-center text-sm text-gray-400 text-center px-6">
+                  좌측에서 질문을 선택하세요.
+                </div>
+              )}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
 }
 
-// ── DialogTurn 렌더 ────────────────────────────────────
 function DialogTurnView({ turn }: { turn: DialogTurn }) {
   const isLLM = turn.role === "llm";
   return (
