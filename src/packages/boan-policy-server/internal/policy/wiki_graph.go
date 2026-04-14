@@ -318,6 +318,19 @@ func (s *WikiGraphStore) ListDialogs(orgID string, limit int) ([]ClarificationDi
 	return out, nil
 }
 
+func (s *WikiGraphStore) DeleteDialog(orgID, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path := filepath.Join(s.orgDir(orgID), "dialogs", id+".json")
+	if err := os.Remove(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
 // ── Inline link 파싱 ────────────────────────────────────
 //
 // Notion 스타일 inline link:

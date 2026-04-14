@@ -244,6 +244,8 @@ func (s *Server) handleOrg(w http.ResponseWriter, r *http.Request) {
 		s.wgListDialogs(w, r, orgID)
 	case rest == "v1/wiki-graph/dialogs" && r.Method == http.MethodPost:
 		s.wgUpsertDialog(w, r, orgID)
+	case strings.HasPrefix(rest, "v1/wiki-graph/dialogs/") && r.Method == http.MethodDelete:
+		s.wgDeleteDialog(w, orgID, strings.TrimPrefix(rest, "v1/wiki-graph/dialogs/"))
 	case rest == "v1/users/reset-ip" && r.Method == http.MethodPost:
 		s.resetUserIP(w, r, orgID)
 	case rest == "v1/policy" && r.Method == http.MethodGet:

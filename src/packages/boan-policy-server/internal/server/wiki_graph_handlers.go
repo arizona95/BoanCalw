@@ -236,6 +236,14 @@ func (s *Server) wgUpsertDialog(w http.ResponseWriter, r *http.Request, orgID st
 	_ = json.NewEncoder(w).Encode(body)
 }
 
+func (s *Server) wgDeleteDialog(w http.ResponseWriter, orgID, id string) {
+	if err := s.wikiGraph.DeleteDialog(orgID, id); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) wgListDialogs(w http.ResponseWriter, r *http.Request, orgID string) {
 	limit := 0
 	if q := r.URL.Query().Get("limit"); q != "" {

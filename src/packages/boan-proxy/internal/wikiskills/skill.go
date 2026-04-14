@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -460,32 +461,27 @@ func RunWikiEdit(ctx context.Context, gc *GraphClient, llm LLMConfig, decision D
 // 출력: LLM 이 반환한 각 질문마다 ClarificationDialog 생성 (첫 turn=llm)
 // 이후 UI 에서 사람이 답하면 해당 dialog 에 turn 추가.
 
-const systemPromptFindAmbiguous = `You are reviewing recent HITL (human-in-the-loop) approve/deny decisions on a guardrail proxy. Your job: find cases where the approve/deny boundary is fuzzy and ask the human a clarifying question WITH EXAMPLES so future automated decisions can be confident.
+const systemPromptFindAmbiguous = `당신은 HITL approve/deny 결정 로그를 훑어보는 동료 분석가입니다.
+사용자가 방금 보여주는 "## Recent decisions" 리스트 안에서 **실제로 애매한 경계**를 찾고, 친구에게 말하듯 대화체 한국어로 질문을 던지세요.
 
-INPUT
-A list of past decisions: each has {input, decision(approve|deny), reason}.
-
-YOUR TASK
-1. Look for patterns where similar inputs got DIFFERENT decisions, OR where a decision seems borderline.
-2. For each ambiguous pattern, formulate ONE clarifying question for the human.
-3. Include 2-4 concrete EXAMPLES from the input list (short, quoted) to anchor the question.
-
-OUTPUT — strict JSON only, no prose, no markdown fence:
+## 출력 JSON 스키마 (ONLY)
 {
   "questions": [
     {
-      "question": "<한국어 질문, 애매한 경계를 명확히 묻기>",
-      "examples": ["<실제 입력 인용 1> → approve", "<실제 입력 인용 2> → deny", "..."],
-      "why_ambiguous": "<왜 경계가 애매한지 1-2문장>"
+      "question": "친구한테 말하듯 대화체 질문. '~~일 때는 ~했는데 ~~일 때는 ~했어요, 어떻게 기준을 잡으면 될까요?' 식으로 구체적으로.",
+      "examples": ["로그에서 그대로 가져온 실제 문장 일부 → approve", "로그에서 가져온 다른 실제 문장 → deny"],
+      "why_ambiguous": "한두 문장으로 왜 이 경계가 애매한지."
     }
   ]
 }
 
-RULES
-- Only return questions for cases where the boundary is actually fuzzy. If all decisions are clear, return {"questions": []}.
-- Max 3 questions per call.
-- Examples MUST be real quotes from the input list (trim if too long, max 80 chars each).
-- Question must be concrete and answerable.`
+## 절대 규칙 (어기면 출력 전체 폐기)
+1. examples 에 들어가는 각 문장은 방금 받은 "## Recent decisions" 의 **input 문자열에 실제로 존재하는 부분**이어야 합니다. 예시를 지어내지 마세요.
+2. 꺾쇠 < > 로 둘러싼 플레이스홀더(예: <실제 입력 인용>, <한국어 질문>) 를 그대로 출력하지 마세요. 진짜 문장으로 바꿔서 쓰세요.
+3. question 은 반드시 한국어 대화체 (존댓말 OK). 기술 문서 투 금지.
+4. 로그의 decision 이 진짜로 일관되게 명확하면 {"questions": []} 를 반환하세요.
+5. 최대 3개 질문.
+6. JSON 만 출력. markdown fence (` + "```" + `) 금지, 설명 문장 금지.`
 
 type FindAmbiguousResult struct {
 	QuestionsFound int      `json:"questions_found"`
@@ -539,6 +535,91 @@ func RunFindAmbiguous(ctx context.Context, gc *GraphClient, llm LLMConfig, limit
 	}
 	if err := json.Unmarshal([]byte(jsonText), &plan); err != nil {
 		return res, fmt.Errorf("parse LLM JSON: %w (raw: %s)", err, raw)
+	}
+	// Validator 1 — 꺾쇠 플레이스홀더 echo 거르기.
+	looksLikePlaceholder := func(s string) bool {
+		if s == "" {
+			return true
+		}
+		if strings.Contains(s, "<") && strings.Contains(s, ">") {
+			re := regexp.MustCompile(`<[^<>]{1,40}>`)
+			if re.MatchString(s) {
+				return true
+			}
+		}
+		return false
+	}
+	// Validator 2 — example 문자열이 실제 decisions 에 등장하는지.
+	// LLM 이 프롬프트 few-shot 을 regurgitate 하는 경우 방어.
+	decisionCorpus := strings.Builder{}
+	for _, d := range decisions {
+		decisionCorpus.WriteString(d.Input)
+		decisionCorpus.WriteString("\n")
+	}
+	corpusStr := decisionCorpus.String()
+	// example 에서 "→ approve/deny" 부분 제거 + 특수문자 제거 후 substring 매치.
+	stripMeta := func(s string) string {
+		s = strings.TrimSpace(s)
+		// "... → approve" / "... -> deny" 등 꼬리 제거
+		for _, sep := range []string{"→", "->", "=>", ":: ", " : "} {
+			if i := strings.LastIndex(s, sep); i >= 0 {
+				s = strings.TrimSpace(s[:i])
+			}
+		}
+		s = strings.Trim(s, " '\"`")
+		return s
+	}
+	exampleIsReal := func(ex string) bool {
+		needle := stripMeta(ex)
+		if len([]rune(needle)) < 6 {
+			return false // 너무 짧으면 신뢰 불가
+		}
+		// 전체 매치, 또는 6자 이상 연속 substring 매치 허용.
+		if strings.Contains(corpusStr, needle) {
+			return true
+		}
+		// 앞 20자 정도만 매치되어도 OK (LLM 이 잘라냈을 수 있음).
+		r := []rune(needle)
+		if len(r) > 20 && strings.Contains(corpusStr, string(r[:20])) {
+			return true
+		}
+		return false
+	}
+
+	filtered := plan.Questions[:0]
+	skipped := 0
+	skippedReasons := []string{}
+	for i, q := range plan.Questions {
+		if looksLikePlaceholder(q.Question) || looksLikePlaceholder(q.WhyAmbiguous) {
+			skipped++
+			skippedReasons = append(skippedReasons, fmt.Sprintf("q[%d] placeholder echo", i))
+			continue
+		}
+		badExample := ""
+		for _, ex := range q.Examples {
+			if looksLikePlaceholder(ex) {
+				badExample = "placeholder"
+				break
+			}
+			if !exampleIsReal(ex) {
+				badExample = ex
+				break
+			}
+		}
+		if badExample != "" {
+			skipped++
+			snippet := badExample
+			if len([]rune(snippet)) > 30 {
+				snippet = string([]rune(snippet)[:30]) + "…"
+			}
+			skippedReasons = append(skippedReasons, fmt.Sprintf("q[%d] fabricated example: %q", i, snippet))
+			continue
+		}
+		filtered = append(filtered, q)
+	}
+	plan.Questions = filtered
+	if skipped > 0 {
+		res.Errors = append(res.Errors, fmt.Sprintf("LLM %d questions 폐기: %s", skipped, strings.Join(skippedReasons, "; ")))
 	}
 	res.QuestionsFound = len(plan.Questions)
 	if len(plan.Questions) > 3 {

@@ -493,6 +493,8 @@ export const wikiGraphApi = {
       method: "POST",
       body: JSON.stringify(d),
     }),
+  deleteDialog: (id: string) =>
+    request<void>(`/api/wiki-graph/dialogs/${encodeURIComponent(id)}`, { method: "DELETE" }),
   runFindAmbiguous: () =>
     request<{
       questions_found: number;

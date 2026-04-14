@@ -335,15 +335,20 @@ export default function WikiGraph() {
     setMsg(null);
     try {
       const res = await wikiGraphApi.runFindAmbiguous();
-      setMsg(
-        `LLM 이 애매한 경계 ${res.questions_found}개 발견, 대화 ${
-          res.dialogs_created?.length ?? 0
-        }개 생성${res.errors?.length ? ` (에러 ${res.errors.length})` : ""}`,
-      );
-      await loadRaw();
-      if ((res.dialogs_created?.length ?? 0) > 0) {
+      const created = res.dialogs_created?.length ?? 0;
+      if (created > 0) {
+        setMsg(`LLM 이 ${res.questions_found}개 질문 생성 (대화 ${created}개)`);
         setActiveDialog(res.dialogs_created[0]);
+      } else if (res.errors?.length) {
+        setErr(
+          `LLM 응답이 유효하지 않아 폐기되었습니다. (모델 크기 한계 가능성). 상세: ${res.errors.join(
+            " | ",
+          )}`,
+        );
+      } else {
+        setMsg("경계가 애매한 케이스를 찾지 못함 — 모든 결정이 명확해 보임");
       }
+      await loadRaw();
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
@@ -650,24 +655,41 @@ export default function WikiGraph() {
                   애매한 경계를 찾도록 시키세요.
                 </div>
               ) : dialogs.map((d) => (
-                <button
+                <div
                   key={d.id}
-                  onClick={() => setActiveDialog(d.id ?? null)}
-                  className={`w-full text-left px-3 py-2 hover:bg-gray-50 ${
-                    activeDialog === d.id ? "bg-boan-50" : ""
+                  className={`group relative w-full flex ${
+                    activeDialog === d.id ? "bg-boan-50" : "hover:bg-gray-50"
                   }`}
                 >
-                  <div className="text-xs font-medium text-gray-700 truncate">
-                    {d.turns[0]?.content.slice(0, 40) ?? "(비어있음)"}
-                  </div>
-                  <div className="text-[10px] text-gray-400 mt-0.5 flex justify-between">
-                    <span>{d.turns.length} 턴</span>
-                    <span>{d.started_at ? new Date(d.started_at).toLocaleString("ko-KR", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : ""}</span>
-                  </div>
-                  {d.topic_node_id && (
-                    <div className="text-[10px] text-boan-600 font-mono mt-0.5">🔗 {d.topic_node_id.slice(0, 24)}</div>
-                  )}
-                </button>
+                  <button
+                    onClick={() => setActiveDialog(d.id ?? null)}
+                    className="flex-1 text-left px-3 py-2 min-w-0"
+                  >
+                    <div className="text-xs font-medium text-gray-700 truncate">
+                      {d.turns[0]?.content.slice(0, 40) ?? "(비어있음)"}
+                    </div>
+                    <div className="text-[10px] text-gray-400 mt-0.5 flex justify-between">
+                      <span>{d.turns.length} 턴</span>
+                      <span>{d.started_at ? new Date(d.started_at).toLocaleString("ko-KR", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : ""}</span>
+                    </div>
+                    {d.topic_node_id && (
+                      <div className="text-[10px] text-boan-600 font-mono mt-0.5">🔗 {d.topic_node_id.slice(0, 24)}</div>
+                    )}
+                  </button>
+                  <button
+                    title="대화 삭제"
+                    onClick={async () => {
+                      if (!d.id) return;
+                      if (!confirm("이 대화를 삭제할까요?")) return;
+                      await wikiGraphApi.deleteDialog(d.id);
+                      if (activeDialog === d.id) setActiveDialog(null);
+                      await loadRaw();
+                    }}
+                    className="opacity-0 group-hover:opacity-100 px-2 text-xs text-gray-400 hover:text-red-600 transition-opacity"
+                  >
+                    🗑
+                  </button>
+                </div>
               ))}
             </div>
           </div>
