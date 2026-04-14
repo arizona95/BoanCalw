@@ -120,6 +120,9 @@ func (c *Client) GetConstitution(ctx context.Context, orgID string) (string, err
 	}
 	url := fmt.Sprintf("%s/org/%s/v1/policy", c.baseURL, orgID)
 	httpReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if c.token != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.token)
+	}
 	resp, err := c.http.Do(httpReq)
 	if err != nil {
 		return "", err
@@ -159,6 +162,9 @@ func (c *Client) GetGuardrailRules(ctx context.Context, orgID string) (*Guardrai
 	}
 	url := fmt.Sprintf("%s/org/%s/v1/policy", c.baseURL, orgID)
 	httpReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if c.token != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.token)
+	}
 	resp, err := c.http.Do(httpReq)
 	if err != nil {
 		return &GuardrailRules{}, nil

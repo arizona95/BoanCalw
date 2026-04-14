@@ -1148,8 +1148,8 @@ func (s *Server) forwardSelectedLLM(ctx context.Context, orgID, prompt string, o
 	if req.Header.Get("Content-Type") == "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	// Chat LLM (cloud 대형 모델 + thinking tokens 고려 10분)
-	resp, err := noProxyHTTPClient(600 * time.Second).Do(req)
+	// Chat LLM (cloud 대형 모델 지원 위해 3분)
+	resp, err := noProxyHTTPClient(180 * time.Second).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -1216,8 +1216,8 @@ func (s *Server) forwardActionLLM(ctx context.Context, orgID, systemPrompt, user
 		req.Header.Set("Content-Type", "application/json")
 	}
 	log.Printf("[computer-use/agent] action LLM request: model=%s endpoint=%s bodyLen=%d", entry.Name, endpoint, len(body))
-	// Action LLM (computer-use 전용) — cloud 모델 + thinking tokens 감안 10분
-	resp, err := noProxyHTTPClient(600 * time.Second).Do(req)
+	// Action LLM (computer-use 전용) — cloud 모델 지연 감안 3분
+	resp, err := noProxyHTTPClient(180 * time.Second).Do(req)
 	if err != nil {
 		return nil, err
 	}
