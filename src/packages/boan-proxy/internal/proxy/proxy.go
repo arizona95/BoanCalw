@@ -19,6 +19,7 @@ import (
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/auth"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/config"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/credential"
+	"github.com/samsung-sds/boanclaw/boan-proxy/internal/devicekey"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/dlp"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/guardrail"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/guac"
@@ -56,6 +57,7 @@ type Server struct {
 	guac         *guac.Client
 	guardrail    *guardrail.Client
 	declinedFPs  *declinedFingerprintStore
+	device       *devicekey.Identity
 }
 
 func New(cfg *config.Config) (*Server, error) {
@@ -134,6 +136,15 @@ func New(cfg *config.Config) (*Server, error) {
 		From:     cfg.SMTPFrom,
 	})
 
+	// Device identity (Ed25519 keypair) for signing JWTs to cloud services.
+	// First boot generates + persists; subsequent boots reload.
+	device, err := devicekey.Load(cfg.DeviceKeyPath)
+	if err != nil {
+		log.Printf("device key load warning: %v (JWT signing disabled)", err)
+	} else {
+		log.Printf("device identity loaded: id=%s pub_b64=%s...", device.DeviceID, device.PublicKeyBase64()[:32])
+	}
+
 	return &Server{
 		cfg:          cfg,
 		ca:           ca,
@@ -153,6 +164,7 @@ func New(cfg *config.Config) (*Server, error) {
 		guac:         guac.New(cfg),
 		guardrail:    guardrail.NewWithToken(cfg.PolicyURL, cfg.OrgToken),
 		declinedFPs:  newDeclinedFingerprintStore(userDataDir),
+		device:       device,
 	}, nil
 }
 

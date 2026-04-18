@@ -319,6 +319,8 @@ services:
       - BOAN_ORG_LLM_PROXY_URL=${BOAN_ORG_LLM_PROXY_URL:-https://boan-org-llm-proxy-sds-corp-3avhtf4kka-du.a.run.app}
       - BOAN_ORG_LLM_PROXY_AUTH_TOKEN=${BOAN_ORG_LLM_PROXY_AUTH_TOKEN:-boan-org-llm-proxy-local}
       - BOAN_ORG_LLM_PROXY_BYPASS_HOSTS=boan-grounding,localhost,127.0.0.1,boan-llm-registry,boan-credential-filter,boan-policy-server,boan-guacamole,boan-computer-use,boan-sandbox,boan-proxy,boan-audit-agent,boan-agent
+      # P3: device identity (Ed25519 keypair). 최초 기동 시 /etc/boan-device/identity.json 자동 생성.
+      - BOAN_DEVICE_KEY_PATH=/data/boan-device/identity.json
       - BOAN_USER_DATA_DIR=/data/users
       - BOAN_CREDENTIAL_DATA_DIR=/tmp/boan/credentials
       - BOAN_GUACAMOLE_URL=http://boan-guacamole:8080
@@ -351,6 +353,8 @@ services:
       - boan-user-data:/data/users
       - boan-registry-data:/data/registry
       - boan-rdp-transfer:/data/rdp-transfer
+      # P3: device identity (Ed25519) — 최초 기동 시 생성, 재시작 시 재사용.
+      - boan-device-key:/data/boan-device
       # auto-update: version files (ro) + trigger file (rw)
       - ${BOAN_INSTALL_DIR:-.}/.boanclaw-version:/app/.boanclaw-version:ro
       - ${BOAN_INSTALL_DIR:-.}/.boanclaw-latest:/app/.boanclaw-latest:ro
@@ -367,4 +371,5 @@ volumes:
   boan-registry-data:
   boan-user-data:
   boan-rdp-transfer:
+  boan-device-key:  # P3: Ed25519 device identity (private key)
   boan-hf-cache:    # vLLM 의 HuggingFace 모델 캐시 (재시작 시 재다운로드 회피)

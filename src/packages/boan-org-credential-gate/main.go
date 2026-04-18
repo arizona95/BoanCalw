@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -11,8 +12,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/samsung-sds/boanclaw/boan-org-credential-gate/internal/devicejwt"
 	"github.com/samsung-sds/boanclaw/boan-org-credential-gate/internal/store"
 )
+
+const deviceJWTAudience = "boan-org-cloud"
 
 type registerRequest struct {
 	Role      string `json:"role"`
@@ -57,6 +61,17 @@ func main() {
 	}
 	defer st.Close()
 
+	allowedPubs, err := devicejwt.ParseAllowedPubs(os.Getenv("BOAN_DEVICE_PUBKEYS"))
+	if err != nil {
+		log.Fatalf("BOAN_DEVICE_PUBKEYS parse: %v", err)
+	}
+	jwtRequired := len(allowedPubs) > 0
+	if jwtRequired {
+		log.Printf("device-JWT gate ENABLED: %d trusted pubkey(s)", len(allowedPubs))
+	} else {
+		log.Printf("device-JWT gate DISABLED (bearer-only). Set BOAN_DEVICE_PUBKEYS to enable.")
+	}
+
 	mux := http.NewServeMux()
 
 	// POST /v1/credentials/{org_id}   body: {role, key}
@@ -66,6 +81,10 @@ func main() {
 	mux.HandleFunc("/v1/credentials/", func(w http.ResponseWriter, r *http.Request) {
 		if !authOK(r, authToken) {
 			writeErr(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		if jwtRequired && !verifyDeviceJWT(r, allowedPubs) {
+			writeErr(w, http.StatusUnauthorized, "device JWT required")
 			return
 		}
 		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/v1/credentials/"), "/")
@@ -146,6 +165,10 @@ func main() {
 			writeErr(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
+		if jwtRequired && !verifyDeviceJWT(r, allowedPubs) {
+			writeErr(w, http.StatusUnauthorized, "device JWT required")
+			return
+		}
 		var req resolveRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
@@ -188,6 +211,22 @@ func authOK(r *http.Request, expected string) bool {
 	}
 	tok := strings.TrimSpace(h[len("Bearer "):])
 	return subtle.ConstantTimeCompare([]byte(tok), []byte(expected)) == 1
+}
+
+func verifyDeviceJWT(r *http.Request, allowed []ed25519.PublicKey) bool {
+	jwt := strings.TrimSpace(r.Header.Get("X-Boan-Device-JWT"))
+	if jwt == "" {
+		return false
+	}
+	claims, err := devicejwt.Verify(jwt, allowed, deviceJWTAudience, 60*time.Second)
+	if err != nil {
+		log.Printf("device JWT verify failed: %v", err)
+		return false
+	}
+	if sub, ok := claims["sub"].(string); ok && sub != "" {
+		r.Header.Set("X-Boan-Verified-Device", sub)
+	}
+	return true
 }
 
 func writeErr(w http.ResponseWriter, code int, msg string) {

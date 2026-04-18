@@ -22,6 +22,11 @@ variable "credential_gate_auth_token" {
   default     = ""
 }
 
+variable "device_pubkeys" {
+  description = "Comma-separated base64 Ed25519 public keys of trusted local devices. Empty disables device-JWT gate (bearer-only)."
+  default     = ""
+}
+
 resource "google_service_account" "org_llm_proxy" {
   account_id   = "boan-org-llm-proxy"
   display_name = "BoanClaw Org LLM Proxy"
@@ -74,6 +79,10 @@ resource "google_cloud_run_v2_service" "org_llm_proxy" {
       env {
         name  = "BOAN_ORG_CREDENTIAL_GATE_AUTH_TOKEN"
         value = var.credential_gate_auth_token
+      }
+      env {
+        name  = "BOAN_DEVICE_PUBKEYS"
+        value = var.device_pubkeys
       }
     }
   }

@@ -11,8 +11,11 @@ import (
 	"time"
 
 	"github.com/samsung-sds/boanclaw/boan-org-llm-proxy/internal/credresolver"
+	"github.com/samsung-sds/boanclaw/boan-org-llm-proxy/internal/devicejwt"
 	"github.com/samsung-sds/boanclaw/boan-org-llm-proxy/internal/forwarder"
 )
+
+const deviceJWTAudience = "boan-org-cloud"
 
 func main() {
 	listen := env("BOAN_LISTEN", ":8091")
@@ -47,6 +50,21 @@ func main() {
 
 	fwd := forwarder.New(allowed, deny, defaultTimeout, maxTimeout, resolver)
 
+	// Device JWT gate: when BOAN_DEVICE_PUBKEYS is set, every /v1/forward
+	// call must carry X-Boan-Device-JWT signed by one of the allowed
+	// per-device Ed25519 keys (in addition to the shared bearer token).
+	// Empty list = JWT disabled (bearer-only during migration window).
+	allowedPubs, err := devicejwt.ParseAllowedPubs(os.Getenv("BOAN_DEVICE_PUBKEYS"))
+	if err != nil {
+		log.Fatalf("BOAN_DEVICE_PUBKEYS parse: %v", err)
+	}
+	jwtRequired := len(allowedPubs) > 0
+	if jwtRequired {
+		log.Printf("device-JWT gate ENABLED: %d trusted pubkey(s)", len(allowedPubs))
+	} else {
+		log.Printf("device-JWT gate DISABLED (bearer-only). Set BOAN_DEVICE_PUBKEYS to enable.")
+	}
+
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/v1/forward", func(w http.ResponseWriter, r *http.Request) {
@@ -57,6 +75,22 @@ func main() {
 		if !authOK(r, authToken) {
 			forwarder.EncodeError(w, http.StatusUnauthorized, "unauthorized")
 			return
+		}
+		if jwtRequired {
+			jwt := strings.TrimSpace(r.Header.Get("X-Boan-Device-JWT"))
+			if jwt == "" {
+				forwarder.EncodeError(w, http.StatusUnauthorized, "device JWT required")
+				return
+			}
+			claims, err := devicejwt.Verify(jwt, allowedPubs, deviceJWTAudience, 60*time.Second)
+			if err != nil {
+				log.Printf("device JWT verify failed: %v", err)
+				forwarder.EncodeError(w, http.StatusUnauthorized, "device JWT invalid: "+err.Error())
+				return
+			}
+			if sub, ok := claims["sub"].(string); ok {
+				r.Header.Set("X-Boan-Verified-Device", sub)
+			}
 		}
 
 		var req forwarder.ForwardRequest

@@ -37,6 +37,7 @@ type Config struct {
 	OrgLLMProxyURL            string        `json:"org_llm_proxy_url"`
 	OrgLLMProxyToken          string        `json:"org_llm_proxy_token"`
 	OrgLLMProxyBypassHosts    string        `json:"org_llm_proxy_bypass_hosts"`
+	DeviceKeyPath             string        `json:"device_key_path"`
 	OAuthClientID             string        `json:"oauth_client_id"`
 	OAuthClientSecret         string        `json:"oauth_client_secret"`
 	OAuthRedirectURL          string        `json:"oauth_redirect_url"`
@@ -103,6 +104,7 @@ func Load() (*Config, error) {
 		OrgLLMProxyURL:            env("BOAN_ORG_LLM_PROXY_URL", "http://boan-org-llm-proxy:8091"),
 		OrgLLMProxyToken:          env("BOAN_ORG_LLM_PROXY_AUTH_TOKEN", ""),
 		OrgLLMProxyBypassHosts:    env("BOAN_ORG_LLM_PROXY_BYPASS_HOSTS", "boan-grounding,localhost,127.0.0.1,boan-llm-registry,boan-credential-filter,boan-policy-server,boan-guacamole,boan-computer-use,boan-sandbox,boan-proxy"),
+		DeviceKeyPath:             env("BOAN_DEVICE_KEY_PATH", "/data/boan-device/identity.json"),
 		OAuthClientID:             env("BOAN_OAUTH_CLIENT_ID", ""),
 		OAuthClientSecret:         env("BOAN_OAUTH_CLIENT_SECRET", ""),
 		OAuthRedirectURL:          env("BOAN_OAUTH_REDIRECT_URL", ""),

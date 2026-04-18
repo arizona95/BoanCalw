@@ -62,6 +62,7 @@ module "org_llm_proxy" {
   allowed_hosts              = var.org_llm_proxy_allowed_hosts
   credential_gate_url        = module.credential_gate.credential_gate_url
   credential_gate_auth_token = var.credential_gate_auth_token
+  device_pubkeys             = var.device_pubkeys
 }
 
 module "credential_gate" {

@@ -21,7 +21,16 @@ import (
 	"time"
 
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/credential"
+	"github.com/samsung-sds/boanclaw/boan-proxy/internal/devicekey"
 )
+
+// deviceJWTAudience — value the receiver validates against the JWT aud claim.
+// Kept here (not in a shared constants package) to keep the dispatch path
+// self-contained.
+const deviceJWTAudience = "boan-org-cloud"
+const deviceJWTTTL = 5 * time.Minute
+
+var _ = devicekey.Identity{}
 
 type registryLLM struct {
 	Name              string `json:"name"`
@@ -1262,7 +1271,21 @@ func (s *Server) dispatchLLMRequest(ctx context.Context, endpoint string, header
 	if bypass {
 		return directHTTPCall(ctx, endpoint, headers, body, timeout)
 	}
-	return forwardViaOrgProxy(ctx, proxyURL, proxyToken, s.cfg.OrgID, endpoint, headers, body, timeout)
+
+	// Sign a short-lived device JWT so the Cloud Run service can verify
+	// both the shared bearer token AND that this specific device is
+	// allowed. Missing identity is non-fatal — server may still accept
+	// bearer-only (during P3 rollout) but will refuse once the JWT gate
+	// is enabled in cloud env.
+	var deviceJWT string
+	if s.device != nil {
+		if tok, err := s.device.SignJWT(deviceJWTAudience, s.cfg.OrgID, deviceJWTTTL); err == nil {
+			deviceJWT = tok
+		} else {
+			log.Printf("device JWT sign failed (continuing bearer-only): %v", err)
+		}
+	}
+	return forwardViaOrgProxy(ctx, proxyURL, proxyToken, s.cfg.OrgID, deviceJWT, endpoint, headers, body, timeout)
 }
 
 func hostInBypassList(host, csv string) bool {
@@ -1317,7 +1340,7 @@ type orgProxyForwardResponse struct {
 	BodyB64 string            `json:"body_b64"`
 }
 
-func forwardViaOrgProxy(ctx context.Context, proxyURL, proxyToken, orgID, endpoint string, headers map[string]string, body []byte, timeout time.Duration) ([]byte, int, error) {
+func forwardViaOrgProxy(ctx context.Context, proxyURL, proxyToken, orgID, deviceJWT, endpoint string, headers map[string]string, body []byte, timeout time.Duration) ([]byte, int, error) {
 	envelope := orgProxyForwardRequest{
 		OrgID:     orgID,
 		CallerID:  "boan-proxy",
@@ -1342,6 +1365,9 @@ func forwardViaOrgProxy(ctx context.Context, proxyURL, proxyToken, orgID, endpoi
 	}
 	req.Header.Set("Authorization", "Bearer "+proxyToken)
 	req.Header.Set("Content-Type", "application/json")
+	if deviceJWT != "" {
+		req.Header.Set("X-Boan-Device-JWT", deviceJWT)
+	}
 
 	resp, err := noProxyHTTPClient(clientTimeout).Do(req)
 	if err != nil {

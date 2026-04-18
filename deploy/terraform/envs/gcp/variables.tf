@@ -65,6 +65,12 @@ variable "credential_gate_auth_token" {
   default     = ""
 }
 
+variable "device_pubkeys" {
+  description = "Comma-separated base64 Ed25519 public keys of trusted local BoanClaw devices. Required for org-llm-proxy to accept /v1/forward calls once P3 is active."
+  type        = string
+  default     = ""
+}
+
 variable "enable_firebase_hosting" {
   description = "Enable Firebase Hosting resources for admin console"
   type        = bool
