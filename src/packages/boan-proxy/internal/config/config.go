@@ -34,6 +34,9 @@ type Config struct {
 	NetworkPolicyPubKey       string        `json:"network_policy_pubkey"`
 	LLMRegistryURL            string        `json:"llm_registry_url"`
 	CredentialFilterURL       string        `json:"credential_filter_url"`
+	OrgLLMProxyURL            string        `json:"org_llm_proxy_url"`
+	OrgLLMProxyToken          string        `json:"org_llm_proxy_token"`
+	OrgLLMProxyBypassHosts    string        `json:"org_llm_proxy_bypass_hosts"`
 	OAuthClientID             string        `json:"oauth_client_id"`
 	OAuthClientSecret         string        `json:"oauth_client_secret"`
 	OAuthRedirectURL          string        `json:"oauth_redirect_url"`
@@ -97,6 +100,9 @@ func Load() (*Config, error) {
 		NetworkPolicyPubKey:       env("BOAN_NETWORK_POLICY_PUBKEY", ""),
 		LLMRegistryURL:            env("BOAN_LLM_REGISTRY_URL", "http://boan-llm-registry:8086"),
 		CredentialFilterURL:       env("BOAN_CREDENTIAL_FILTER_URL", "http://boan-credential-filter:8082"),
+		OrgLLMProxyURL:            env("BOAN_ORG_LLM_PROXY_URL", "http://boan-org-llm-proxy:8091"),
+		OrgLLMProxyToken:          env("BOAN_ORG_LLM_PROXY_AUTH_TOKEN", ""),
+		OrgLLMProxyBypassHosts:    env("BOAN_ORG_LLM_PROXY_BYPASS_HOSTS", "boan-grounding,localhost,127.0.0.1,boan-llm-registry,boan-credential-filter,boan-policy-server,boan-guacamole,boan-computer-use,boan-sandbox,boan-proxy"),
 		OAuthClientID:             env("BOAN_OAUTH_CLIENT_ID", ""),
 		OAuthClientSecret:         env("BOAN_OAUTH_CLIENT_SECRET", ""),
 		OAuthRedirectURL:          env("BOAN_OAUTH_REDIRECT_URL", ""),

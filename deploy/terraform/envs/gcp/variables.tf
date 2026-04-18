@@ -33,6 +33,25 @@ variable "admin_api_image" {
   default     = "gcr.io/ai-security-test-473701/boan-proxy:latest"
 }
 
+variable "org_llm_proxy_image" {
+  description = "Container image for boan-org-llm-proxy (single egress point for all external LLM upstream calls)"
+  type        = string
+  default     = "gcr.io/ai-security-test-473701/boan-org-llm-proxy:latest"
+}
+
+variable "org_llm_proxy_auth_token" {
+  description = "Bearer token that boan-proxy presents when calling the org-llm-proxy"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "org_llm_proxy_allowed_hosts" {
+  description = "Comma-separated upstream host allowlist for the org-llm-proxy"
+  type        = string
+  default     = "ollama.com,api.anthropic.com,api.openai.com,generativelanguage.googleapis.com"
+}
+
 variable "enable_firebase_hosting" {
   description = "Enable Firebase Hosting resources for admin console"
   type        = bool

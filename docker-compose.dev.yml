@@ -93,6 +93,27 @@ services:
       timeout: 5s
       retries: 3
 
+  # boan-org-llm-proxy — 모든 외부 LLM upstream 호출의 단일 egress 포인트.
+  # 로컬 호스트는 외부 LLM 으로 직접 나가지 않고 반드시 이 서비스를 경유한다.
+  # 로컬 dev 에서는 같은 compose network 에서 뜨고, 프로덕션에서는 Cloud Run 으로
+  # 분리 배포해서 실제 외부 egress 주체가 조직 서버가 된다.
+  boan-org-llm-proxy:
+    build:
+      context: src/packages/boan-org-llm-proxy
+    environment:
+      - BOAN_LISTEN=:8091
+      - BOAN_ORG_LLM_PROXY_AUTH_TOKEN=${BOAN_ORG_LLM_PROXY_AUTH_TOKEN:-boan-org-llm-proxy-local}
+      - BOAN_ORG_LLM_PROXY_ALLOWED_HOSTS=${BOAN_ORG_LLM_PROXY_ALLOWED_HOSTS:-ollama.com,api.anthropic.com,api.openai.com,generativelanguage.googleapis.com,anthropic.com}
+      - BOAN_ORG_LLM_PROXY_DENY_HOSTS=169.254.169.254,metadata.google.internal,localhost,127.0.0.1
+    ports:
+      - "8091:8091"
+    networks: [boanclaw]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8091/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
   boan-whitelist-proxy:
     profiles: ["legacy-host"]
     build:
@@ -154,6 +175,9 @@ services:
       - BOAN_ORG_TOKEN=${BOAN_ORG_TOKEN:-}
       - BOAN_CREDENTIAL_FILTER_URL=http://boan-credential-filter:8082
       - BOAN_LLM_REGISTRY_URL=http://boan-llm-registry:8086
+      - BOAN_ORG_LLM_PROXY_URL=http://boan-org-llm-proxy:8091
+      - BOAN_ORG_LLM_PROXY_AUTH_TOKEN=${BOAN_ORG_LLM_PROXY_AUTH_TOKEN:-boan-org-llm-proxy-local}
+      - BOAN_ORG_LLM_PROXY_BYPASS_HOSTS=boan-grounding,localhost,127.0.0.1,boan-llm-registry,boan-credential-filter,boan-policy-server,boan-guacamole,boan-computer-use,boan-sandbox,boan-proxy,boan-audit-agent,boan-agent
       - BOAN_OTEL_ENDPOINT=http://boan-audit-agent:8084
       - BOAN_USER_DATA_DIR=/data/users
       - BOAN_MOUNT_ROOT=/home/boan/Desktop/boanclaw
@@ -171,7 +195,7 @@ services:
       - "18080:18080"
       - "18081:18081"
     networks: [boanclaw]
-    depends_on: [boan-policy-server, boan-credential-filter, boan-audit-agent, boan-guacamole, boan-llm-registry]
+    depends_on: [boan-policy-server, boan-credential-filter, boan-audit-agent, boan-guacamole, boan-llm-registry, boan-org-llm-proxy]
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:18081/healthz"]
       interval: 10s
@@ -268,8 +292,8 @@ services:
       - TEST=true
       - HTTP_PROXY=http://localhost:18080
       - HTTPS_PROXY=http://localhost:18080
-      - NO_PROXY=localhost,127.0.0.1,boan-proxy,boan-policy-server,boan-guacamole,boan-audit-agent,boan-credential-filter,boan-llm-registry,boan-whitelist-proxy,boan-computer-use,.run.app
-      - no_proxy=localhost,127.0.0.1,boan-proxy,boan-policy-server,boan-guacamole,boan-audit-agent,boan-credential-filter,boan-llm-registry,boan-whitelist-proxy,boan-computer-use,.run.app
+      - NO_PROXY=localhost,127.0.0.1,boan-proxy,boan-policy-server,boan-guacamole,boan-audit-agent,boan-credential-filter,boan-llm-registry,boan-whitelist-proxy,boan-computer-use,boan-org-llm-proxy,boan-grounding,.run.app
+      - no_proxy=localhost,127.0.0.1,boan-proxy,boan-policy-server,boan-guacamole,boan-audit-agent,boan-credential-filter,boan-llm-registry,boan-whitelist-proxy,boan-computer-use,boan-org-llm-proxy,boan-grounding,.run.app
       - BOAN_PROXY_ADMIN=http://localhost:18081
       - BOAN_SESSION_ID=dev-session-001
       - BOAN_ONECLI_CRED_FILTER_URL=http://boan-credential-filter:8082
@@ -286,6 +310,11 @@ services:
       - BOAN_AUDIT_ENDPOINT=http://boan-audit-agent:8084
       - BOAN_CREDENTIAL_FILTER_URL=http://boan-credential-filter:8082
       - BOAN_LLM_REGISTRY_URL=http://localhost:8086
+      # 프로덕션 기본값: GCP Cloud Run org-llm-proxy. 로컬 개발용 컨테이너로 돌리고
+      # 싶으면 host env 에서 BOAN_ORG_LLM_PROXY_URL=http://boan-org-llm-proxy:8091 로 override.
+      - BOAN_ORG_LLM_PROXY_URL=${BOAN_ORG_LLM_PROXY_URL:-https://boan-org-llm-proxy-sds-corp-3avhtf4kka-du.a.run.app}
+      - BOAN_ORG_LLM_PROXY_AUTH_TOKEN=${BOAN_ORG_LLM_PROXY_AUTH_TOKEN:-boan-org-llm-proxy-local}
+      - BOAN_ORG_LLM_PROXY_BYPASS_HOSTS=boan-grounding,localhost,127.0.0.1,boan-llm-registry,boan-credential-filter,boan-policy-server,boan-guacamole,boan-computer-use,boan-sandbox,boan-proxy,boan-audit-agent,boan-agent
       - BOAN_USER_DATA_DIR=/data/users
       - BOAN_CREDENTIAL_DATA_DIR=/tmp/boan/credentials
       - BOAN_GUACAMOLE_URL=http://boan-guacamole:8080
@@ -323,7 +352,7 @@ services:
       - ${BOAN_INSTALL_DIR:-.}/.boanclaw-latest:/app/.boanclaw-latest:ro
       - /tmp/boanclaw-triggers:/app/triggers
     networks: [boanclaw]
-    depends_on: [boan-policy-server, boan-audit-agent, boan-guacamole, boan-computer-use, boan-credential-filter]
+    depends_on: [boan-policy-server, boan-audit-agent, boan-guacamole, boan-computer-use, boan-credential-filter, boan-org-llm-proxy]
 
 volumes:
   boan-guac-db:

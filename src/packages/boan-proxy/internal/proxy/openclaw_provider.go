@@ -13,6 +13,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	neturl "net/url"
 	"regexp"
 	"sort"
 	"strconv"
@@ -736,26 +737,20 @@ func (s *Server) forwardVisionLLM(ctx context.Context, entry *registryLLM, scree
 	}
 
 	raw, _ := json.Marshal(payload)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(raw))
-	if err != nil {
-		return "", err
+	if headers == nil {
+		headers = map[string]string{}
 	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	if req.Header.Get("Content-Type") == "" {
-		req.Header.Set("Content-Type", "application/json")
+	if headers["Content-Type"] == "" {
+		headers["Content-Type"] = "application/json"
 	}
 	// Vision LLM은 크기가 큰 이미지 + 대형 모델(235B 등) 추론으로 60초는 부족.
 	// 5분으로 넉넉히. 상위 http.Server write timeout 도 확인 필요.
-	resp, err := noProxyHTTPClient(300 * time.Second).Do(req)
+	respRaw, status, err := s.dispatchLLMRequest(ctx, endpoint, headers, raw, 300*time.Second)
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
-	respRaw, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 300 {
-		return "", fmt.Errorf("vision llm returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respRaw)))
+	if status >= 300 {
+		return "", fmt.Errorf("vision llm returned %d: %s", status, strings.TrimSpace(string(respRaw)))
 	}
 	out, err := translateUpstreamToOpenAI(entry.Name, respRaw)
 	if err != nil {
@@ -1067,25 +1062,19 @@ func (s *Server) callRegistryLLM(ctx context.Context, entry *registryLLM, system
 		body = string(raw)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewBufferString(body))
-	if err != nil {
-		return nil, err
+	if headers == nil {
+		headers = map[string]string{}
 	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	if req.Header.Get("Content-Type") == "" {
-		req.Header.Set("Content-Type", "application/json")
+	if headers["Content-Type"] == "" {
+		headers["Content-Type"] = "application/json"
 	}
 	// G2/G3 가드레일 호출 — 구름 모델(gemma4:31b-cloud 등) 지연 감안 90초
-	resp, err := noProxyHTTPClient(90 * time.Second).Do(req)
+	respRaw, status, err := s.dispatchLLMRequest(ctx, endpoint, headers, []byte(body), 90*time.Second)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	respRaw, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("upstream %d: %s", resp.StatusCode, string(respRaw[:min(200, len(respRaw))]))
+	if status >= 300 {
+		return nil, fmt.Errorf("upstream %d: %s", status, string(respRaw[:min(200, len(respRaw))]))
 	}
 	return translateUpstreamToOpenAI(entry.Name, respRaw)
 }
@@ -1138,25 +1127,19 @@ func (s *Server) forwardSelectedLLM(ctx context.Context, orgID, prompt string, o
 		headers[key] = resolved
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewBufferString(body))
-	if err != nil {
-		return nil, err
+	if headers == nil {
+		headers = map[string]string{}
 	}
-	for key, value := range headers {
-		req.Header.Set(key, value)
-	}
-	if req.Header.Get("Content-Type") == "" {
-		req.Header.Set("Content-Type", "application/json")
+	if headers["Content-Type"] == "" {
+		headers["Content-Type"] = "application/json"
 	}
 	// Chat LLM (cloud 대형 모델 지원 위해 3분)
-	resp, err := noProxyHTTPClient(180 * time.Second).Do(req)
+	raw, status, err := s.dispatchLLMRequest(ctx, endpoint, headers, []byte(body), 180*time.Second)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("upstream returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	if status >= 300 {
+		return nil, fmt.Errorf("upstream returned %d: %s", status, strings.TrimSpace(string(raw)))
 	}
 	out, err := translateUpstreamToOpenAI(entry.Name, raw)
 	if err != nil {
@@ -1205,30 +1188,24 @@ func (s *Server) forwardActionLLM(ctx context.Context, orgID, systemPrompt, user
 		}
 		headers[key] = resolved
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewBufferString(body))
-	if err != nil {
-		return nil, err
+	if headers == nil {
+		headers = map[string]string{}
 	}
-	for key, value := range headers {
-		req.Header.Set(key, value)
-	}
-	if req.Header.Get("Content-Type") == "" {
-		req.Header.Set("Content-Type", "application/json")
+	if headers["Content-Type"] == "" {
+		headers["Content-Type"] = "application/json"
 	}
 	log.Printf("[computer-use/agent] action LLM request: model=%s endpoint=%s bodyLen=%d", entry.Name, endpoint, len(body))
 	// Action LLM (computer-use 전용) — cloud 모델 지연 감안 3분
-	resp, err := noProxyHTTPClient(180 * time.Second).Do(req)
+	raw, status, err := s.dispatchLLMRequest(ctx, endpoint, headers, []byte(body), 180*time.Second)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-	log.Printf("[computer-use/agent] action LLM response: status=%d bodyLen=%d body=%s", resp.StatusCode, len(raw), func() string {
+	log.Printf("[computer-use/agent] action LLM response: status=%d bodyLen=%d body=%s", status, len(raw), func() string {
 		if len(raw) > 500 { return string(raw[:500]) + "..." }
 		return string(raw)
 	}())
-	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("upstream returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	if status >= 300 {
+		return nil, fmt.Errorf("upstream returned %d: %s", status, strings.TrimSpace(string(raw)))
 	}
 	out, err := translateUpstreamToOpenAI(entry.Name, raw)
 	if err != nil {
@@ -1253,6 +1230,125 @@ func noProxyHTTPClient(timeout time.Duration) *http.Client {
 			ExpectContinueTimeout: 1 * time.Second,
 		},
 	}
+}
+
+// dispatchLLMRequest is the single egress point for every LLM upstream call.
+// External hosts are tunneled through boan-org-llm-proxy so that this host
+// never makes direct outbound connections to LLM providers. Local/internal
+// hosts listed in OrgLLMProxyBypassHosts (e.g. boan-grounding) bypass the
+// proxy and are called directly on the docker network.
+//
+// Returns (body, status, error). status is the upstream status code.
+func (s *Server) dispatchLLMRequest(ctx context.Context, endpoint string, headers map[string]string, body []byte, timeout time.Duration) ([]byte, int, error) {
+	proxyURL := strings.TrimRight(s.cfg.OrgLLMProxyURL, "/")
+	proxyToken := strings.TrimSpace(s.cfg.OrgLLMProxyToken)
+
+	parsed, err := neturl.Parse(endpoint)
+	if err != nil {
+		return nil, 0, fmt.Errorf("invalid endpoint url: %w", err)
+	}
+	host := strings.ToLower(parsed.Hostname())
+
+	bypass := proxyURL == "" || proxyToken == "" || hostInBypassList(host, s.cfg.OrgLLMProxyBypassHosts)
+
+	if bypass {
+		return directHTTPCall(ctx, endpoint, headers, body, timeout)
+	}
+	return forwardViaOrgProxy(ctx, proxyURL, proxyToken, endpoint, headers, body, timeout)
+}
+
+func hostInBypassList(host, csv string) bool {
+	if host == "" {
+		return true
+	}
+	for _, item := range strings.Split(csv, ",") {
+		item = strings.TrimSpace(strings.ToLower(item))
+		if item == "" {
+			continue
+		}
+		if host == item || strings.HasSuffix(host, "."+item) {
+			return true
+		}
+	}
+	return false
+}
+
+func directHTTPCall(ctx context.Context, endpoint string, headers map[string]string, body []byte, timeout time.Duration) ([]byte, int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, 0, err
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	if req.Header.Get("Content-Type") == "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := noProxyHTTPClient(timeout).Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	return raw, resp.StatusCode, nil
+}
+
+type orgProxyForwardRequest struct {
+	Target    string            `json:"target"`
+	Method    string            `json:"method"`
+	Headers   map[string]string `json:"headers"`
+	BodyB64   string            `json:"body_b64"`
+	TimeoutMs int               `json:"timeout_ms"`
+}
+
+type orgProxyForwardResponse struct {
+	Status  int               `json:"status"`
+	Headers map[string]string `json:"headers"`
+	BodyB64 string            `json:"body_b64"`
+}
+
+func forwardViaOrgProxy(ctx context.Context, proxyURL, proxyToken, endpoint string, headers map[string]string, body []byte, timeout time.Duration) ([]byte, int, error) {
+	envelope := orgProxyForwardRequest{
+		Target:    endpoint,
+		Method:    http.MethodPost,
+		Headers:   headers,
+		BodyB64:   base64.StdEncoding.EncodeToString(body),
+		TimeoutMs: int(timeout / time.Millisecond),
+	}
+	envRaw, err := json.Marshal(envelope)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// Client timeout must exceed upstream timeout to give the proxy time to
+	// round-trip (add a 30s buffer for upstream + proxy overhead).
+	clientTimeout := timeout + 30*time.Second
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, proxyURL+"/v1/forward", bytes.NewReader(envRaw))
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+proxyToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := noProxyHTTPClient(clientTimeout).Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("org-llm-proxy call failed: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return nil, resp.StatusCode, fmt.Errorf("org-llm-proxy returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	var out orgProxyForwardResponse
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, 0, fmt.Errorf("org-llm-proxy response parse: %w", err)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(out.BodyB64)
+	if err != nil {
+		return nil, 0, fmt.Errorf("org-llm-proxy body_b64 decode: %w", err)
+	}
+	return decoded, out.Status, nil
 }
 
 func renderTemplateBody(body, prompt string) (string, error) {
