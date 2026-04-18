@@ -37,10 +37,16 @@ const IMMEDIATE_KEYS = new Set([
   "F12",
 ]);
 
-export default function MyGCP() {
+type MyGCPProps = {
+  // 사용모드처럼 경로와 무관하게 항상 활성화해야 할 때 true.
+  // 기본은 path === "/my-gcp" 일 때만 활성화.
+  alwaysActive?: boolean;
+};
+
+export default function MyGCP({ alwaysActive = false }: MyGCPProps = {}) {
   const location = useLocation();
   const { user } = useAuth();
-  const isActive = location.pathname === "/my-gcp";
+  const isActive = alwaysActive || location.pathname === "/my-gcp";
   const [workstation, setWorkstation] = useState<PersonalWorkstation | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
