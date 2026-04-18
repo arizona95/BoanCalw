@@ -13,12 +13,18 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/samsung-sds/boanclaw/boan-org-llm-proxy/internal/credresolver"
 )
 
 // ForwardRequest is the envelope sent by boan-proxy to this service.
 // The caller fills in the exact HTTP request to make upstream; this
 // service is the sole egress point for external LLM calls.
+// Credential placeholders {{CREDENTIAL:role}} in headers/body are resolved
+// here using the caller's OrgID; boan-proxy never sees plaintext secrets.
 type ForwardRequest struct {
+	OrgID     string            `json:"org_id,omitempty"`
+	CallerID  string            `json:"caller_id,omitempty"`
 	Target    string            `json:"target"`
 	Method    string            `json:"method"`
 	Headers   map[string]string `json:"headers"`
@@ -37,15 +43,17 @@ type Forwarder struct {
 	DenyHostSuffixes    []string
 	DefaultTimeout      time.Duration
 	MaxTimeout          time.Duration
+	Resolver            *credresolver.Resolver
 	client              *http.Client
 }
 
-func New(allowed, deny []string, defaultTimeout, maxTimeout time.Duration) *Forwarder {
+func New(allowed, deny []string, defaultTimeout, maxTimeout time.Duration, resolver *credresolver.Resolver) *Forwarder {
 	return &Forwarder{
 		AllowedHostSuffixes: allowed,
 		DenyHostSuffixes:    deny,
 		DefaultTimeout:      defaultTimeout,
 		MaxTimeout:          maxTimeout,
+		Resolver:            resolver,
 		client: &http.Client{
 			Transport: &http.Transport{
 				Proxy: nil,
@@ -95,6 +103,25 @@ func (f *Forwarder) Forward(ctx context.Context, req *ForwardRequest) (*ForwardR
 		}
 	}
 
+	// Resolve {{CREDENTIAL:role}} placeholders via credential-gate.
+	// This is the ONLY point where plaintext credentials exist inside
+	// this service. They are immediately applied to the outbound request
+	// and (via ScrubEchoes) stripped from the response before we return.
+	headers := req.Headers
+	if headers == nil {
+		headers = map[string]string{}
+	}
+	var plaintexts []string
+	if f.Resolver != nil && strings.TrimSpace(req.OrgID) != "" {
+		resolvedHeaders, resolvedBody, pts, resolveErr := f.Resolver.ResolveAll(ctx, req.OrgID, req.CallerID, host, headers, body)
+		if resolveErr != nil {
+			return nil, fmt.Errorf("credential resolution failed: %w", resolveErr)
+		}
+		headers = resolvedHeaders
+		body = resolvedBody
+		plaintexts = pts
+	}
+
 	timeout := f.DefaultTimeout
 	if req.TimeoutMs > 0 {
 		timeout = time.Duration(req.TimeoutMs) * time.Millisecond
@@ -110,7 +137,7 @@ func (f *Forwarder) Forward(ctx context.Context, req *ForwardRequest) (*ForwardR
 	if err != nil {
 		return nil, err
 	}
-	for k, v := range req.Headers {
+	for k, v := range headers {
 		httpReq.Header.Set(k, v)
 	}
 	if httpReq.Header.Get("Content-Type") == "" && len(body) > 0 {
@@ -128,16 +155,22 @@ func (f *Forwarder) Forward(ctx context.Context, req *ForwardRequest) (*ForwardR
 		return nil, err
 	}
 
-	headers := make(map[string]string, len(resp.Header))
+	// Strip any credential echoes in the upstream response before returning
+	// to the caller (boan-proxy on an untrusted host).
+	if f.Resolver != nil && len(plaintexts) > 0 {
+		respBody = f.Resolver.ScrubEchoes(respBody, plaintexts)
+	}
+
+	respHeaders := make(map[string]string, len(resp.Header))
 	for k, vs := range resp.Header {
 		if len(vs) > 0 {
-			headers[k] = vs[0]
+			respHeaders[k] = vs[0]
 		}
 	}
 
 	return &ForwardResponse{
 		Status:  resp.StatusCode,
-		Headers: headers,
+		Headers: respHeaders,
 		BodyB64: base64.StdEncoding.EncodeToString(respBody),
 	}, nil
 }

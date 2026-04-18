@@ -52,6 +52,19 @@ variable "org_llm_proxy_allowed_hosts" {
   default     = "ollama.com,api.anthropic.com,api.openai.com,generativelanguage.googleapis.com"
 }
 
+variable "credential_gate_image" {
+  description = "Container image for boan-org-credential-gate (Secret Manager-backed credential vault)"
+  type        = string
+  default     = "gcr.io/ai-security-test-473701/boan-org-credential-gate:latest"
+}
+
+variable "credential_gate_auth_token" {
+  description = "Bearer token that org-llm-proxy + local credential-filter present when calling the credential-gate"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
 variable "enable_firebase_hosting" {
   description = "Enable Firebase Hosting resources for admin console"
   type        = bool

@@ -81,6 +81,10 @@ services:
     environment:
       - BOAN_LISTEN=:8082
       - BOAN_KMS_KEY=/etc/boan-cred/aes.key
+      # P2: cloud-forwarding mode. If set, register/get/list/revoke 전부
+      # boan-org-credential-gate (Cloud Run) 로 proxy. 로컬 평문 저장 제거.
+      - BOAN_ORG_CREDENTIAL_GATE_URL=${BOAN_ORG_CREDENTIAL_GATE_URL:-https://boan-org-credential-gate-sds-corp-3avhtf4kka-du.a.run.app}
+      - BOAN_ORG_CREDENTIAL_GATE_AUTH_TOKEN=${BOAN_ORG_CREDENTIAL_GATE_AUTH_TOKEN:-}
     volumes:
       - boan-cred-keys:/etc/boan-cred
       - boan-cred-data:/data/credentials

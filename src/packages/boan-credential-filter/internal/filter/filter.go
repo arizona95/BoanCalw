@@ -1,6 +1,7 @@
 package filter
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -48,6 +49,11 @@ type Store struct {
 	creds map[string]*Credential
 	enc   *kms.LocalKMS
 	path  string
+	// gate, when non-nil, makes this store a thin forwarder: all
+	// register/get/list/revoke ops proxy to the cloud credential-gate and
+	// NOTHING is persisted on this host. Local legacy storage is used only
+	// when gate is nil.
+	gate *GateClient
 }
 
 type persistedCredential struct {
@@ -70,11 +76,34 @@ func NewStore(enc *kms.LocalKMS, dataDir string) *Store {
 	return s
 }
 
+// WithGate switches the store into cloud-forwarding mode. All future
+// register/get/list/revoke calls hit the remote boan-org-credential-gate;
+// local plaintext/ciphertext never persists. Existing local entries remain
+// readable as fallback (for migration).
+func (s *Store) WithGate(gate *GateClient) *Store {
+	s.gate = gate
+	return s
+}
+
 func credKey(orgID, role string) string {
 	return orgID + "/" + role
 }
 
 func (s *Store) Get(orgID, role string) (*CredentialResponse, error) {
+	if s.gate != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		plain, err := s.gate.Resolve(ctx, orgID, role)
+		if err != nil {
+			return nil, err
+		}
+		if plain == "" {
+			// fall through to legacy local lookup during migration window
+		} else {
+			return &CredentialResponse{Key: plain, Status: StatusOK}, nil
+		}
+	}
+
 	s.mu.RLock()
 	c, ok := s.creds[credKey(orgID, role)]
 	s.mu.RUnlock()
@@ -117,6 +146,13 @@ func (s *Store) Register(orgID string, req *RegisterRequest) error {
 		req.TTLHours = 24
 	}
 
+	if s.gate != nil {
+		// Cloud-forwarding mode: write-through to credential-gate, NOTHING on disk.
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return s.gate.Put(ctx, orgID, req.Role, req.Key)
+	}
+
 	encrypted, err := s.enc.Encrypt([]byte(req.Key))
 	if err != nil {
 		return err
@@ -141,6 +177,26 @@ type CredentialMeta struct {
 }
 
 func (s *Store) List(orgID string) []CredentialMeta {
+	if s.gate != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		remote, err := s.gate.List(ctx, orgID)
+		if err == nil {
+			out := make([]CredentialMeta, 0, len(remote))
+			for _, m := range remote {
+				out = append(out, CredentialMeta{
+					Role:      m.Role,
+					OrgID:     m.OrgID,
+					Status:    StatusOK,
+					ExpiresAt: "", // gate is version-based; no TTL
+				})
+			}
+			sort.SliceStable(out, func(i, j int) bool { return out[i].Role < out[j].Role })
+			return out
+		}
+		// On gate error, fall through to local list (migration fallback).
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]CredentialMeta, 0)
@@ -165,6 +221,14 @@ func (s *Store) List(orgID string) []CredentialMeta {
 }
 
 func (s *Store) Revoke(orgID, role string) bool {
+	if s.gate != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := s.gate.Delete(ctx, orgID, role); err == nil {
+			return true
+		}
+		// Fall through to local delete on gate error.
+	}
 	s.mu.Lock()
 	k := credKey(orgID, role)
 	if _, ok := s.creds[k]; ok {

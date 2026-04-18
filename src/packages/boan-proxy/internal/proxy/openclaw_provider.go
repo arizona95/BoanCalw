@@ -862,6 +862,14 @@ func extractLastLine(s string) string {
 }
 
 func (s *Server) resolveTemplateCredentials(ctx context.Context, text string) (string, error) {
+	// When the org-llm-proxy is configured, credential resolution moves to
+	// the cloud. Pass {{CREDENTIAL:*}} placeholders through unchanged so that
+	// the cloud proxy (via boan-org-credential-gate) substitutes them right
+	// before the upstream call. Plaintext never touches this host.
+	if strings.TrimSpace(s.cfg.OrgLLMProxyURL) != "" && strings.TrimSpace(s.cfg.OrgLLMProxyToken) != "" {
+		return text, nil
+	}
+
 	var firstErr error
 	out := credRefRe.ReplaceAllStringFunc(text, func(match string) string {
 		nameMatch := credRefRe.FindStringSubmatch(match)
@@ -1254,7 +1262,7 @@ func (s *Server) dispatchLLMRequest(ctx context.Context, endpoint string, header
 	if bypass {
 		return directHTTPCall(ctx, endpoint, headers, body, timeout)
 	}
-	return forwardViaOrgProxy(ctx, proxyURL, proxyToken, endpoint, headers, body, timeout)
+	return forwardViaOrgProxy(ctx, proxyURL, proxyToken, s.cfg.OrgID, endpoint, headers, body, timeout)
 }
 
 func hostInBypassList(host, csv string) bool {
@@ -1294,6 +1302,8 @@ func directHTTPCall(ctx context.Context, endpoint string, headers map[string]str
 }
 
 type orgProxyForwardRequest struct {
+	OrgID     string            `json:"org_id,omitempty"`
+	CallerID  string            `json:"caller_id,omitempty"`
 	Target    string            `json:"target"`
 	Method    string            `json:"method"`
 	Headers   map[string]string `json:"headers"`
@@ -1307,8 +1317,10 @@ type orgProxyForwardResponse struct {
 	BodyB64 string            `json:"body_b64"`
 }
 
-func forwardViaOrgProxy(ctx context.Context, proxyURL, proxyToken, endpoint string, headers map[string]string, body []byte, timeout time.Duration) ([]byte, int, error) {
+func forwardViaOrgProxy(ctx context.Context, proxyURL, proxyToken, orgID, endpoint string, headers map[string]string, body []byte, timeout time.Duration) ([]byte, int, error) {
 	envelope := orgProxyForwardRequest{
+		OrgID:     orgID,
+		CallerID:  "boan-proxy",
 		Target:    endpoint,
 		Method:    http.MethodPost,
 		Headers:   headers,

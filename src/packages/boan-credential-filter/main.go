@@ -25,6 +25,19 @@ func main() {
 
 	store := filter.NewStore(enc, dataDir)
 
+	// If BOAN_ORG_CREDENTIAL_GATE_URL + _TOKEN are set, switch to
+	// cloud-forwarding mode — local disk no longer receives plaintext or
+	// ciphertext for new credentials. Legacy local entries remain readable
+	// as fallback until they are migrated.
+	gateURL := strings.TrimSpace(os.Getenv("BOAN_ORG_CREDENTIAL_GATE_URL"))
+	gateToken := strings.TrimSpace(os.Getenv("BOAN_ORG_CREDENTIAL_GATE_AUTH_TOKEN"))
+	if gateURL != "" && gateToken != "" {
+		store = store.WithGate(filter.NewGateClient(gateURL, gateToken))
+		log.Printf("boan-credential-filter: gate mode ENABLED → %s", gateURL)
+	} else {
+		log.Printf("boan-credential-filter: legacy local-only mode (no gate configured)")
+	}
+
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/credential/", func(w http.ResponseWriter, r *http.Request) {

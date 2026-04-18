@@ -53,13 +53,24 @@ module "policy_server" {
 }
 
 module "org_llm_proxy" {
-  source        = "../../modules/boan-org-llm-proxy"
-  project_id    = var.project_id
-  region        = var.region
-  org_id        = var.org_id
-  image         = var.org_llm_proxy_image
-  auth_token    = var.org_llm_proxy_auth_token
-  allowed_hosts = var.org_llm_proxy_allowed_hosts
+  source                     = "../../modules/boan-org-llm-proxy"
+  project_id                 = var.project_id
+  region                     = var.region
+  org_id                     = var.org_id
+  image                      = var.org_llm_proxy_image
+  auth_token                 = var.org_llm_proxy_auth_token
+  allowed_hosts              = var.org_llm_proxy_allowed_hosts
+  credential_gate_url        = module.credential_gate.credential_gate_url
+  credential_gate_auth_token = var.credential_gate_auth_token
+}
+
+module "credential_gate" {
+  source     = "../../modules/boan-org-credential-gate"
+  project_id = var.project_id
+  region     = var.region
+  org_id     = var.org_id
+  image      = var.credential_gate_image
+  auth_token = var.credential_gate_auth_token
 }
 
 module "admin_console" {

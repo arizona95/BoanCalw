@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/samsung-sds/boanclaw/boan-org-llm-proxy/internal/credresolver"
 	"github.com/samsung-sds/boanclaw/boan-org-llm-proxy/internal/forwarder"
 )
 
@@ -26,7 +27,25 @@ func main() {
 	defaultTimeout := envDuration("BOAN_ORG_LLM_PROXY_DEFAULT_TIMEOUT_MS", 180000) * time.Millisecond
 	maxTimeout := envDuration("BOAN_ORG_LLM_PROXY_MAX_TIMEOUT_MS", 600000) * time.Millisecond
 
-	fwd := forwarder.New(allowed, deny, defaultTimeout, maxTimeout)
+	var resolver *credresolver.Resolver
+	gateURL := strings.TrimSpace(os.Getenv("BOAN_ORG_CREDENTIAL_GATE_URL"))
+	gateToken := strings.TrimSpace(os.Getenv("BOAN_ORG_CREDENTIAL_GATE_AUTH_TOKEN"))
+	if gateURL != "" && gateToken != "" {
+		resolver = credresolver.New(gateURL, gateToken)
+		log.Printf("credential-gate resolver enabled: %s", gateURL)
+		// periodic cache pruning
+		go func() {
+			tick := time.NewTicker(60 * time.Second)
+			defer tick.Stop()
+			for range tick.C {
+				resolver.Prune()
+			}
+		}()
+	} else {
+		log.Printf("credential-gate resolver DISABLED (no BOAN_ORG_CREDENTIAL_GATE_URL/TOKEN set) — {{CREDENTIAL:*}} placeholders will pass through unresolved")
+	}
+
+	fwd := forwarder.New(allowed, deny, defaultTimeout, maxTimeout, resolver)
 
 	mux := http.NewServeMux()
 
