@@ -7,6 +7,16 @@ variable "auth_token" {
   sensitive   = true
 }
 
+variable "device_pubkeys" {
+  description = "Comma-separated base64 Ed25519 public keys. Empty disables device-JWT gate (bearer-only for internal cloud-to-cloud)."
+  default     = ""
+}
+
+variable "revoked_devices" {
+  description = "Comma-separated device IDs to block even if pubkey is trusted."
+  default     = ""
+}
+
 resource "google_service_account" "credential_gate" {
   account_id   = "boan-org-cred-gate"
   display_name = "BoanClaw Org Credential Gate"
@@ -55,6 +65,14 @@ resource "google_cloud_run_v2_service" "credential_gate" {
       env {
         name  = "BOAN_ORG_CREDENTIAL_GATE_AUTH_TOKEN"
         value = var.auth_token
+      }
+      env {
+        name  = "BOAN_DEVICE_PUBKEYS"
+        value = var.device_pubkeys
+      }
+      env {
+        name  = "BOAN_REVOKED_DEVICES"
+        value = var.revoked_devices
       }
     }
   }

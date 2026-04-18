@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/samsung-sds/boanclaw/boan-org-credential-gate/internal/auditlog"
 	"github.com/samsung-sds/boanclaw/boan-org-credential-gate/internal/devicejwt"
 	"github.com/samsung-sds/boanclaw/boan-org-credential-gate/internal/store"
 )
@@ -44,6 +45,8 @@ type resolveResponse struct {
 }
 
 func main() {
+	auditlog.SetService("boan-org-credential-gate")
+
 	listen := env("BOAN_LISTEN", ":8092")
 	projectID := env("BOAN_GCP_PROJECT_ID", "")
 	if projectID == "" {
@@ -66,11 +69,8 @@ func main() {
 		log.Fatalf("BOAN_DEVICE_PUBKEYS parse: %v", err)
 	}
 	jwtRequired := len(allowedPubs) > 0
-	if jwtRequired {
-		log.Printf("device-JWT gate ENABLED: %d trusted pubkey(s)", len(allowedPubs))
-	} else {
-		log.Printf("device-JWT gate DISABLED (bearer-only). Set BOAN_DEVICE_PUBKEYS to enable.")
-	}
+	revoked := parseRevokedSet(os.Getenv("BOAN_REVOKED_DEVICES"))
+	log.Printf("init: jwt=%v revoked_devices=%d", jwtRequired, len(revoked))
 
 	mux := http.NewServeMux()
 
@@ -80,18 +80,29 @@ func main() {
 	// DELETE /v1/credentials/{org_id}/{role}
 	mux.HandleFunc("/v1/credentials/", func(w http.ResponseWriter, r *http.Request) {
 		if !authOK(r, authToken) {
+			auditlog.Emit(auditlog.Event{EventType: "auth_reject", Severity: "WARNING", Reason: "bearer missing/invalid", Status: 401})
 			writeErr(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
-		if jwtRequired && !verifyDeviceJWT(r, allowedPubs) {
-			writeErr(w, http.StatusUnauthorized, "device JWT required")
-			return
+		deviceID := ""
+		if jwtRequired {
+			ok, id := verifyAndExtract(r, allowedPubs)
+			if !ok {
+				auditlog.Emit(auditlog.Event{EventType: "auth_reject", Severity: "WARNING", Reason: "device JWT", Status: 401})
+				writeErr(w, http.StatusUnauthorized, "device JWT required")
+				return
+			}
+			deviceID = id
+			if _, blocked := revoked[deviceID]; blocked {
+				auditlog.Emit(auditlog.Event{EventType: "auth_reject", Severity: "WARNING", Reason: "device revoked", Status: 403, DeviceID: deviceID})
+				writeErr(w, http.StatusForbidden, "device revoked")
+				return
+			}
 		}
 		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/v1/credentials/"), "/")
 		for i := range parts {
 			parts[i] = strings.TrimSpace(parts[i])
 		}
-		// strip trailing empty segment from trailing slash
 		if len(parts) > 0 && parts[len(parts)-1] == "" {
 			parts = parts[:len(parts)-1]
 		}
@@ -103,6 +114,7 @@ func main() {
 				writeErr(w, http.StatusInternalServerError, err.Error())
 				return
 			}
+			auditlog.Emit(auditlog.Event{EventType: "credential_list", OrgID: parts[0], DeviceID: deviceID, Status: 200, Bytes: len(list)})
 			writeJSON(w, http.StatusOK, list)
 
 		case r.Method == http.MethodGet && len(parts) == 2:
@@ -115,6 +127,7 @@ func main() {
 				writeErr(w, http.StatusInternalServerError, err.Error())
 				return
 			}
+			auditlog.Emit(auditlog.Event{EventType: "credential_head", OrgID: parts[0], Role: parts[1], DeviceID: deviceID, Status: 200})
 			writeJSON(w, http.StatusOK, md)
 
 		case r.Method == http.MethodPost && len(parts) == 1:
@@ -129,13 +142,25 @@ func main() {
 			}
 			md, err := st.Put(r.Context(), parts[0], req.Role, req.Key)
 			if err != nil {
+				auditlog.Emit(auditlog.Event{EventType: "credential_put_error", Severity: "ERROR", OrgID: parts[0], Role: req.Role, DeviceID: deviceID, Reason: err.Error()})
 				writeErr(w, http.StatusInternalServerError, err.Error())
 				return
 			}
+			auditlog.Emit(auditlog.Event{EventType: "credential_put", OrgID: md.OrgID, Role: md.Role, DeviceID: deviceID, Status: 201})
 			writeJSON(w, http.StatusCreated, registerResponse{
 				Role: md.Role, OrgID: md.OrgID, Status: "ok",
 				CreatedAt: md.CreatedAt, UpdatedAt: md.UpdatedAt,
 			})
+
+		case r.Method == http.MethodPost && len(parts) == 3 && parts[2] == "revoke":
+			// POST /v1/credentials/{org}/{role}/revoke
+			if err := st.Delete(r.Context(), parts[0], parts[1]); err != nil && !errors.Is(err, store.ErrNotFound) {
+				auditlog.Emit(auditlog.Event{EventType: "credential_revoke_error", Severity: "ERROR", OrgID: parts[0], Role: parts[1], DeviceID: deviceID, Reason: err.Error()})
+				writeErr(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			auditlog.Emit(auditlog.Event{EventType: "credential_revoke", Severity: "NOTICE", OrgID: parts[0], Role: parts[1], DeviceID: deviceID, Status: 200})
+			writeJSON(w, http.StatusOK, map[string]any{"org_id": parts[0], "role": parts[1], "revoked": true, "ts": time.Now().UTC().Format(time.RFC3339)})
 
 		case r.Method == http.MethodDelete && len(parts) == 2:
 			if err := st.Delete(r.Context(), parts[0], parts[1]); err != nil {
@@ -146,6 +171,7 @@ func main() {
 				writeErr(w, http.StatusInternalServerError, err.Error())
 				return
 			}
+			auditlog.Emit(auditlog.Event{EventType: "credential_delete", OrgID: parts[0], Role: parts[1], DeviceID: deviceID, Status: 204})
 			w.WriteHeader(http.StatusNoContent)
 
 		default:
@@ -157,17 +183,30 @@ func main() {
 	// Returns plaintext. Logs the caller + target for audit. Plaintext never
 	// persisted. Intended caller: org-llm-proxy only.
 	mux.HandleFunc("/v1/resolve", func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
 		if r.Method != http.MethodPost {
 			writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		if !authOK(r, authToken) {
+			auditlog.Emit(auditlog.Event{EventType: "auth_reject", Severity: "WARNING", Reason: "bearer missing/invalid", Status: 401})
 			writeErr(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
-		if jwtRequired && !verifyDeviceJWT(r, allowedPubs) {
-			writeErr(w, http.StatusUnauthorized, "device JWT required")
-			return
+		deviceID := ""
+		if jwtRequired {
+			ok, id := verifyAndExtract(r, allowedPubs)
+			if !ok {
+				auditlog.Emit(auditlog.Event{EventType: "auth_reject", Severity: "WARNING", Reason: "device JWT", Status: 401})
+				writeErr(w, http.StatusUnauthorized, "device JWT required")
+				return
+			}
+			deviceID = id
+			if _, blocked := revoked[deviceID]; blocked {
+				auditlog.Emit(auditlog.Event{EventType: "auth_reject", Severity: "WARNING", Reason: "device revoked", Status: 403, DeviceID: deviceID})
+				writeErr(w, http.StatusForbidden, "device revoked")
+				return
+			}
 		}
 		var req resolveRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -181,13 +220,21 @@ func main() {
 		plaintext, err := st.Get(r.Context(), req.OrgID, req.Role)
 		if err != nil {
 			if errors.Is(err, store.ErrNotFound) {
+				auditlog.Emit(auditlog.Event{EventType: "resolve_not_found", Severity: "WARNING", OrgID: req.OrgID, Role: req.Role, CallerID: req.CallerID, TargetHost: req.TargetHost, DeviceID: deviceID, Status: 404})
 				writeErr(w, http.StatusNotFound, "credential not found")
 				return
 			}
+			auditlog.Emit(auditlog.Event{EventType: "resolve_error", Severity: "ERROR", OrgID: req.OrgID, Role: req.Role, CallerID: req.CallerID, TargetHost: req.TargetHost, DeviceID: deviceID, Reason: err.Error()})
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		log.Printf("resolve ok org=%s role=%s caller=%s target=%s", req.OrgID, req.Role, req.CallerID, req.TargetHost)
+		auditlog.Emit(auditlog.Event{
+			EventType: "resolve_ok",
+			OrgID:     req.OrgID, Role: req.Role,
+			CallerID: req.CallerID, TargetHost: req.TargetHost,
+			DeviceID: deviceID, Status: 200,
+			DurationMs: time.Since(start).Milliseconds(),
+		})
 		writeJSON(w, http.StatusOK, resolveResponse{Plaintext: plaintext})
 	})
 
@@ -214,19 +261,37 @@ func authOK(r *http.Request, expected string) bool {
 }
 
 func verifyDeviceJWT(r *http.Request, allowed []ed25519.PublicKey) bool {
+	ok, _ := verifyAndExtract(r, allowed)
+	return ok
+}
+
+// verifyAndExtract validates the JWT and returns (true, device_id) on success.
+func verifyAndExtract(r *http.Request, allowed []ed25519.PublicKey) (bool, string) {
 	jwt := strings.TrimSpace(r.Header.Get("X-Boan-Device-JWT"))
 	if jwt == "" {
-		return false
+		return false, ""
 	}
 	claims, err := devicejwt.Verify(jwt, allowed, deviceJWTAudience, 60*time.Second)
 	if err != nil {
 		log.Printf("device JWT verify failed: %v", err)
-		return false
+		return false, ""
 	}
-	if sub, ok := claims["sub"].(string); ok && sub != "" {
+	sub, _ := claims["sub"].(string)
+	if sub != "" {
 		r.Header.Set("X-Boan-Verified-Device", sub)
 	}
-	return true
+	return true, sub
+}
+
+func parseRevokedSet(csv string) map[string]struct{} {
+	out := map[string]struct{}{}
+	for _, p := range strings.Split(csv, ",") {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out[p] = struct{}{}
+		}
+	}
+	return out
 }
 
 func writeErr(w http.ResponseWriter, code int, msg string) {

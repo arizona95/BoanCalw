@@ -71,6 +71,18 @@ variable "device_pubkeys" {
   default     = ""
 }
 
+variable "revoked_devices" {
+  description = "Comma-separated device IDs to emergency-revoke without removing their pubkey from device_pubkeys."
+  type        = string
+  default     = ""
+}
+
+variable "org_llm_proxy_rpm" {
+  description = "Per-device rate limit in requests per minute for org-llm-proxy /v1/forward."
+  type        = string
+  default     = "120"
+}
+
 variable "enable_firebase_hosting" {
   description = "Enable Firebase Hosting resources for admin console"
   type        = bool

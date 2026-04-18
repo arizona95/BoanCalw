@@ -63,15 +63,19 @@ module "org_llm_proxy" {
   credential_gate_url        = module.credential_gate.credential_gate_url
   credential_gate_auth_token = var.credential_gate_auth_token
   device_pubkeys             = var.device_pubkeys
+  revoked_devices            = var.revoked_devices
+  rate_limit_rpm             = var.org_llm_proxy_rpm
 }
 
 module "credential_gate" {
-  source     = "../../modules/boan-org-credential-gate"
-  project_id = var.project_id
-  region     = var.region
-  org_id     = var.org_id
-  image      = var.credential_gate_image
-  auth_token = var.credential_gate_auth_token
+  source          = "../../modules/boan-org-credential-gate"
+  project_id      = var.project_id
+  region          = var.region
+  org_id          = var.org_id
+  image           = var.credential_gate_image
+  auth_token      = var.credential_gate_auth_token
+  device_pubkeys  = ""
+  revoked_devices = var.revoked_devices
 }
 
 module "admin_console" {

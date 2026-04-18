@@ -10,10 +10,14 @@
 | **Phase 2** | **`boan-org-llm-proxy` (Cloud Run) 단일 egress** | ✅ 완료 (org-per-Cloud-Run, bearer 인증) |
 | **Phase 2** | **`boan-org-credential-gate` (Cloud Run + Secret Manager) 로 credential 이관** | ✅ 완료 (로컬 평문/AES 키 제거) |
 | **Phase 2** | **로컬 `credential-filter` → thin forwarder 모드** | ✅ 완료 (`BOAN_ORG_CREDENTIAL_GATE_URL` 설정 시) |
-| Phase 3 | mTLS + device-signed JWT (로컬 디바이스 attestation) | ⏳ 설계 중 |
-| Phase 3 | sandbox egress iptables lockdown (Cloud Run 만 허용) | ⏳ |
-| Phase 4 | MCP SSE/WebSocket 터널 through credential-gate | ⏳ |
-| Phase 4 | Audit log append-only + per-credential revoke | ⏳ |
+| **Phase 3** | **device-signed Ed25519 JWT (디바이스 attestation)** | ✅ 완료 |
+| Phase 3 | sandbox egress iptables lockdown (Cloud Run 만 허용) | ⏸ Phase 5+ 연기 (docker 네트워크 재설계 필요) |
+| **Phase 4** | **structured audit logging (Cloud Logging 통합)** | ✅ 완료 |
+| **Phase 4** | **per-credential revoke + device blocklist** | ✅ 완료 |
+| **Phase 4** | **per-device rate limit (sliding window)** | ✅ 완료 |
+| Phase 4 | MCP SSE/WebSocket 터널 through credential-gate | ⏸ 사용 사례 없음 (향후 재검토) |
+| Phase 5 | TPM sealed device key (host root 탈취에도 키 읽기 불가) | ⏳ |
+| Phase 5 | Cloud Load Balancer mTLS (native client cert 검증) | ⏳ |
 
 Phase 2 로 원래 계획하던 "GCP Cloud KMS envelope encryption (DEK+KEK)" 는 **폐기**. 대신 credential 평문을 아예 로컬 호스트에 두지 않는 "cloud-native 스토어 (Secret Manager) 로의 이관" 방식을 선택함. Managed Agent (Anthropic) 가 제시한 credential vault + proxy pattern 과 동일 방향.
 
