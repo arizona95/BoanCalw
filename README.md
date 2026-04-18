@@ -92,12 +92,13 @@ with open('$HOME/.docker/config.json', 'w') as f: json.dump(c, f, indent=2)
 
 ## 🧱 BoanClaw 가 뭘 하는가
 
-OpenClaw 같은 코딩 에이전트는 강력하지만 그대로 쓰면 **자격증명·소스코드·고객 데이터**가 외부 LLM / 임의 외부 서버로 새기 쉽다. BoanClaw 는 OpenClaw 를 그대로 둔 채 그 주위에 다음 4개 구조를 두른다:
+OpenClaw 같은 코딩 에이전트는 강력하지만 그대로 쓰면 **자격증명·소스코드·고객 데이터**가 외부 LLM / 임의 외부 서버로 새기 쉽다. BoanClaw 는 OpenClaw 를 그대로 둔 채 그 주위에 다음 5개 구조를 두른다:
 
 1. **S1–S4 영역 분리** — 데이터·실행·정책·외부 4 단계 신뢰 영역. 영역 간 이동에는 항상 게이트 통과.
 2. **G1/G2/G3 가드레일** — 정규식 → 헌법 LLM → 자기진화 Wiki LLM 의 3 단 검사.
-3. **Credential / Network Gateway** — 자격증명은 S4 vault 에 격리, 외부 통신은 fail-closed 화이트리스트.
-4. **OpenClaw 무결성 검증** — supply-chain 공격 차단. 핀된 버전 + 바이너리 sha256 을 매 컨테이너 시작 시 검증.
+3. **Cloud Credential Gate** — credential 평문은 GCP Secret Manager (Cloud Run `boan-org-credential-gate`) 에만 존재. 로컬 호스트는 `{{CREDENTIAL:role}}` placeholder 만 소유. Anthropic Managed Agent 가 제시한 vault+proxy 패턴과 동일 방향.
+4. **Single Egress (org-llm-proxy)** — 모든 외부 LLM 호출은 Cloud Run `boan-org-llm-proxy` 를 통과. 로컬 호스트는 ollama/anthropic/openai 에 직접 egress 안 함. LLM 호출 직전 cloud 에서 credential substitute + response 에서 credential echo scrubbing.
+5. **OpenClaw 무결성 검증** — supply-chain 공격 차단. 핀된 버전 + 바이너리 sha256 을 매 컨테이너 시작 시 검증.
 
 자세한 아키텍처는 [`docs/03_구성도.md`](docs/03_구성도.md) 참고.
 
@@ -107,10 +108,13 @@ OpenClaw 같은 코딩 에이전트는 강력하지만 그대로 쓰면 **자격
 
 | 영역 | 정의 | 대표 컴포넌트 | 호스트 경로 |
 |---|---|---|---|
-| **S4** | Credential 격리 — AES 키, 암호화된 vault, 정책 서명 키 | `boan-credential-filter`, `boan-policy-server`, `boan-audit-agent` | named volumes (`/etc/boan-cred`, `/data/credentials`) — sandbox 마운트 금지 |
+| **S5** | Cloud credential vault + LLM egress broker (조직 레벨) | `boan-org-credential-gate` (Cloud Run + Secret Manager), `boan-org-llm-proxy` (Cloud Run) | 로컬 호스트 외부 (GCP asia-northeast3) |
+| **S4** | Credential forwarder (thin) + 정책 서명 키 | `boan-credential-filter` (gate 모드에선 로컬 저장 skip), `boan-policy-server`, `boan-audit-agent` | named volumes — sandbox 마운트 금지. credential 평문은 S5 에만 존재. |
 | **S3** | Control plane — 호스트 PC, 관리 콘솔, 프록시 | `boan-admin-console`, `boan-proxy`, `boan-llm-registry`, `boan-whitelist-proxy`, `boan-guacamole` | `~/Desktop/boanclaw` ↔ S2 bind mount |
 | **S2** | Sandbox 실행 영역 — OpenClaw, 에이전트, 코드 실행 | `boan-sandbox` (내장: openclaw, boan-agent, 내장 proxy, onecli) | `/home/boan/Desktop/boanclaw` (= S3 bind mount) |
 | **S1** | 외부 — GCP Windows workstation, 외부 LLM API, 인터넷 | GCP RDP (Guacamole 경유), Anthropic/OpenAI API, `boan-computer-use` | `/data/rdp-transfer/<email>` (RDP 가상 드라이브 staging) |
+
+외부 LLM 으로의 모든 egress 는 S3/S2 에서 직접 나가지 않고 **반드시 S5 (Cloud Run org-llm-proxy) 경유**. 로컬 호스트가 root 탈취돼도 credential 평문을 볼 수 없는 구조.
 
 기본 mount 구조:
 
@@ -179,10 +183,16 @@ open http://localhost:19080
 | `18080` | boan-proxy MITM (HTTP_PROXY 용) |
 | `18081` | boan-proxy admin API |
 | `8081` | policy-server |
-| `8082` | credential-filter (S4) |
+| `8082` | credential-filter (S4, gate 모드에서 thin forwarder) |
 | `8084` | audit-agent |
 | `8086` | llm-registry |
 | `8090` | computer-use |
+| `8091` | boan-org-llm-proxy (로컬 dev 용; 프로덕션은 Cloud Run) |
+| `8092` | boan-org-credential-gate (로컬 dev 용; 프로덕션은 Cloud Run) |
+
+프로덕션 배포 시 `8091`/`8092` 로컬 컨테이너 대신 Cloud Run 서비스 호출:
+- `https://boan-org-llm-proxy-{org}-*.a.run.app/v1/forward`
+- `https://boan-org-credential-gate-{org}-*.a.run.app/v1/credentials/{org}`, `/v1/resolve`
 
 ---
 
@@ -210,6 +220,11 @@ open http://localhost:19080
 | `BOAN_UID` / `BOAN_GID` | 호스트 사용자 | sandbox `boan` 사용자 UID/GID |
 | `BOAN_OPENCLAW_ALLOWED_VERSIONS` | (없음) | 콤마구분 OpenClaw 버전 allowlist (런타임 추가 검증) |
 | `BOAN_GCP_ORG_ID` | (없음) | GCP workstation 사용 시 조직 ID |
+| `BOAN_ORG_LLM_PROXY_URL` | `https://boan-org-llm-proxy-sds-corp-*.a.run.app` | 조직 LLM egress proxy (Cloud Run). 로컬 dev 은 `http://boan-org-llm-proxy:8091`. |
+| `BOAN_ORG_LLM_PROXY_AUTH_TOKEN` | (env 필수) | proxy bearer 토큰 (32-byte hex 권장, org 공유). P3 에서 device JWT 로 대체. |
+| `BOAN_ORG_LLM_PROXY_BYPASS_HOSTS` | `boan-grounding,localhost,...` | proxy 우회해서 직접 호출할 로컬/internal 호스트. |
+| `BOAN_ORG_CREDENTIAL_GATE_URL` | `https://boan-org-credential-gate-sds-corp-*.a.run.app` | 조직 credential vault (Cloud Run + Secret Manager). |
+| `BOAN_ORG_CREDENTIAL_GATE_AUTH_TOKEN` | (env 필수) | gate bearer 토큰. 없으면 credential-filter 는 legacy 로컬 모드로 fallback. |
 
 ---
 

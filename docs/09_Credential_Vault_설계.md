@@ -1,4 +1,4 @@
-# Credential Vault 설계 — S3 → S4 분리 (Phase 1 ✅) + GCP KMS (Phase 2 진행 중)
+# Credential Vault 설계
 
 ## 0. 현재 상태 한눈에
 
@@ -7,8 +7,15 @@
 | Phase 1 | credential-filter 를 sandbox 밖 독립 컨테이너로 분리 | ✅ 완료 |
 | Phase 1 | sandbox 의 `boan-cred-*` volume mount 제거 | ✅ 완료 |
 | Phase 1 | sandbox → credential-filter HTTP API 일원화 | ✅ 완료 |
-| Phase 2 | GCP Cloud KMS envelope encryption | 🟡 설계 완료, 구현 대기 |
-| Phase 2 | KMS 자동 키 로테이션 | ⏳ |
+| **Phase 2** | **`boan-org-llm-proxy` (Cloud Run) 단일 egress** | ✅ 완료 (org-per-Cloud-Run, bearer 인증) |
+| **Phase 2** | **`boan-org-credential-gate` (Cloud Run + Secret Manager) 로 credential 이관** | ✅ 완료 (로컬 평문/AES 키 제거) |
+| **Phase 2** | **로컬 `credential-filter` → thin forwarder 모드** | ✅ 완료 (`BOAN_ORG_CREDENTIAL_GATE_URL` 설정 시) |
+| Phase 3 | mTLS + device-signed JWT (로컬 디바이스 attestation) | ⏳ 설계 중 |
+| Phase 3 | sandbox egress iptables lockdown (Cloud Run 만 허용) | ⏳ |
+| Phase 4 | MCP SSE/WebSocket 터널 through credential-gate | ⏳ |
+| Phase 4 | Audit log append-only + per-credential revoke | ⏳ |
+
+Phase 2 로 원래 계획하던 "GCP Cloud KMS envelope encryption (DEK+KEK)" 는 **폐기**. 대신 credential 평문을 아예 로컬 호스트에 두지 않는 "cloud-native 스토어 (Secret Manager) 로의 이관" 방식을 선택함. Managed Agent (Anthropic) 가 제시한 credential vault + proxy pattern 과 동일 방향.
 
 ## 1. 이전 (deprecated) 구조
 
@@ -80,7 +87,145 @@ export BOAN_ONECLI_CRED_FILTER_URL=http://boan-credential-filter:8082
 - credential 조회/등록은 HTTP API(http://boan-credential-filter:8082)로만 가능
 - boan-proxy의 credential 주입 경로 변경 없음 (이미 HTTP API 사용)
 
-### Phase 2: GCP Cloud KMS 연동 (진행 중)
+### Phase 2 (실제 구현) — Secret Manager 기반 cloud-native credential gate ✅
+
+로컬 호스트가 credential 평문을 **한 순간도 보유하지 않는** 구조. Anthropic Managed Agent 의
+"credential vault + proxy" 패턴과 동일 아키텍처.
+
+```
+┌─ LOCAL (untrusted) ──────────┐     ┌─ GCP Cloud Run ──────────────────┐
+│                              │     │                                   │
+│  boan-proxy (sandbox 내)    │────▶│  boan-org-llm-proxy-{org}        │
+│    {{CREDENTIAL:role}} 만     │     │   /v1/forward                     │
+│    envelope 에 담아 전송      │     │   1. host allowlist check         │
+│                              │     │   2. credresolver → gate 호출     │
+│  boan-credential-filter      │     │   3. placeholder → 평문 substitute │
+│    (thin forwarder mode)     │     │   4. upstream POST                │
+│    register/get/list 전부     │     │   5. response ScrubEchoes         │
+│    cloud 로 proxy            │     │                                   │
+│    ❌ 로컬 평문 저장 없음     │     │  boan-org-credential-gate-{org}  │
+│                              │◀────│   /v1/resolve (proxy 만 호출)    │
+│                              │     │   /v1/credentials/{org} CRUD     │
+└──────────────────────────────┘     │       │                           │
+                                     │       ▼                           │
+                                     │  GCP Secret Manager               │
+                                     │   secrets: boan-cred-{org}-{role}│
+                                     │   labels: managed-by, org, role   │
+                                     └───────────┬───────────────────────┘
+                                                 ▼
+                                     [ ollama.com / api.anthropic.com ]
+```
+
+**핵심 컴포넌트:**
+
+- `boan-org-llm-proxy` (Cloud Run, org 별 1개):
+  - 모든 외부 LLM upstream 호출의 유일한 egress.
+  - `/v1/forward` 는 bearer 토큰 인증 + host allowlist 검증 + `{{CREDENTIAL:*}}` placeholder 를
+    credential-gate 로부터 실제 평문으로 치환한 뒤 upstream 전송.
+  - 응답 수신 후 `credresolver.ScrubEchoes` 가 credential 문자열 echo 를 `[REDACTED]` 로 마스킹.
+  - 로컬 `boan-proxy` 는 placeholder 만 envelope 에 넣어 전송 → 로컬은 평문 credential 본 적 없음.
+
+- `boan-org-credential-gate` (Cloud Run, org 별 1개):
+  - GCP Secret Manager 백엔드.
+  - secret 이름: `boan-cred-{sanitized-org}-{sanitized-role}`.
+  - secret 라벨: `managed-by=boan-org-credential-gate`, `boan-org={org}`, `boan-role={role}`.
+  - `POST /v1/credentials/{org}` : 쓰기 only (응답에 평문 없음)
+  - `GET /v1/credentials/{org}` : 메타데이터 목록 (role, 생성/업데이트 시각)
+  - `POST /v1/resolve` : org-llm-proxy 만 호출. 평문 반환. 메모리에서 밀리초 단위로만 존재.
+  - `DELETE /v1/credentials/{org}/{role}` : 삭제.
+  - IAM `allUsers` invoker + bearer 토큰 게이트 (P3 에서 mTLS + device JWT 로 교체 예정).
+
+- 로컬 `boan-credential-filter` (thin forwarder 모드):
+  - `BOAN_ORG_CREDENTIAL_GATE_URL` + `_AUTH_TOKEN` 설정 시 모든 op 를 cloud gate 로 proxy.
+  - Register → gate POST (로컬 디스크 저장 **skip**).
+  - Get → gate `/v1/resolve` (로컬 AES 복호화 건너뜀).
+  - List → gate list.
+  - `credentials.json` + `aes.key` 는 마이그레이션 기간 동안 fallback 으로만 남아있음.
+
+**envelope 프로토콜 (boan-proxy ↔ org-llm-proxy):**
+
+```jsonc
+POST https://boan-org-llm-proxy-{org}-xxxx.a.run.app/v1/forward
+Authorization: Bearer {static token}   // P3 에서 JWT 로 대체
+{
+  "org_id": "sds-corp",
+  "caller_id": "boan-proxy",
+  "target": "https://ollama.com/api/chat",
+  "method": "POST",
+  "headers": {"Authorization": "Bearer {{CREDENTIAL:ollama-cloud-key}}"},
+  "body_b64": "eyJtb2RlbCI6...",
+  "timeout_ms": 180000
+}
+```
+
+응답:
+```jsonc
+{
+  "status": 200,
+  "headers": {...},
+  "body_b64": "..."
+}
+```
+
+**Credential 등록 플로우:**
+
+```
+사용자 UI (Credentials 페이지)
+  │ POST /api/credential/v1/store {role, key, ttl_hours}
+  ▼
+boan-proxy (admin.go)
+  │ POST http://boan-credential-filter:8082/credential/{org}
+  ▼
+boan-credential-filter (gate mode)
+  │ POST {credential-gate}/v1/credentials/{org}
+  │ Authorization: Bearer {gate token}
+  ▼
+boan-org-credential-gate
+  │ secretmanager.CreateSecret (idempotent) + AddSecretVersion
+  ▼
+GCP Secret Manager
+```
+
+**LLM 호출 플로우:**
+
+```
+boan-proxy openclaw_provider.go
+  │ dispatchLLMRequest(endpoint, headers{x-api-key: "{{CREDENTIAL:ollama-cloud-key}}"}, body)
+  │  ├─ 로컬 hosts? → direct (boan-grounding:8000 등)
+  │  └─ 외부 hosts? → forwardViaOrgProxy
+  ▼
+org-llm-proxy /v1/forward
+  │ credresolver.ResolveAll: {{CRED:x}} 탐지 → gate 호출 → 치환
+  │ http.Do(upstream)
+  │ credresolver.ScrubEchoes(response.body)
+  ▼
+upstream LLM
+```
+
+**검증된 불변성:**
+- 로컬 `credentials.json` 은 P2 전환 후 단 한 번도 업데이트되지 않음 (마지막 mtime: 2026-04-10).
+- 신규 등록된 credential 은 Secret Manager 에만 존재, 로컬 디스크 grep 시 0 hit.
+- 전체 LLM call 성공 (ollama GLM-5.1 응답) 하면서도 로컬은 placeholder 만 관찰.
+
+**환경변수:**
+
+| 변수 | 설정 대상 | 값 |
+|---|---|---|
+| `BOAN_ORG_LLM_PROXY_URL` | boan-proxy (sandbox) | `https://boan-org-llm-proxy-{org}-xxxx.a.run.app` |
+| `BOAN_ORG_LLM_PROXY_AUTH_TOKEN` | boan-proxy + org-llm-proxy Cloud Run | 32-byte hex (org 공유) |
+| `BOAN_ORG_LLM_PROXY_BYPASS_HOSTS` | boan-proxy | `boan-grounding,boan-llm-registry,...` (로컬 서비스) |
+| `BOAN_ORG_CREDENTIAL_GATE_URL` | org-llm-proxy + credential-filter | `https://boan-org-credential-gate-{org}-xxxx.a.run.app` |
+| `BOAN_ORG_CREDENTIAL_GATE_AUTH_TOKEN` | org-llm-proxy + credential-filter + gate | 32-byte hex (org 공유) |
+| `BOAN_GCP_PROJECT_ID` | credential-gate Cloud Run | `ai-security-test-473701` |
+
+**Terraform 모듈:**
+- `deploy/terraform/modules/boan-org-llm-proxy/`
+- `deploy/terraform/modules/boan-org-credential-gate/`
+- 둘 다 `envs/gcp/main.tf` 에서 wire. 이미지: GCR `gcr.io/{project}/boan-org-{...}:latest`.
+
+---
+
+### Phase 2 대안 (폐기됨) — GCP Cloud KMS envelope encryption
 
 **현재**: 로컬 AES-256 키 파일 (`/etc/boan-cred/aes.key`) — 단, sandbox 에서는 접근 불가 (Phase 1 격리 효과)
 **변경**: GCP Cloud KMS envelope encryption — KMS 키가 Google Cloud 에 머무름
