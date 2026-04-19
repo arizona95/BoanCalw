@@ -23,7 +23,25 @@ type Provisioner interface {
 	// 저장해두면 신규 사용자 VM 이 이 이미지로 프로비저닝된다.
 	// noop provider 는 ErrGoldenImageUnsupported 반환.
 	CaptureGoldenImage(ctx context.Context, current *userstore.Workstation, imageName, description string) (string, error)
+
+	// IsolateNetwork — kill chain 첫 단계. VM 에 "boan-quarantine" network tag 를
+	// 추가해 사전 설치된 deny-all egress firewall rule 에 걸리게 한다.
+	// VM 은 계속 running 상태라 RAM dump / disk snapshot 은 가능하지만 외부와
+	// 의 통신은 모두 차단된다.
+	// noop provider 는 ErrKillChainUnsupported 반환.
+	IsolateNetwork(ctx context.Context, current *userstore.Workstation) error
+
+	// ForensicDiskSnapshot — incident 용 disk snapshot (CaptureGoldenImage 과
+	// 동일 GCP API 지만 이름/라벨로 구분: 포렌식 용 image 로 라벨링).
+	// 반환: image URI. 실패해도 kill chain 다음 단계는 계속 진행해야 함.
+	ForensicDiskSnapshot(ctx context.Context, current *userstore.Workstation, incidentID string) (string, error)
+
+	// StopInstance — VM 전원 끔. RAM 증발. disk 는 유지.
+	StopInstance(ctx context.Context, current *userstore.Workstation) error
 }
+
+// ErrKillChainUnsupported — non-GCP provisioner 에서 kill chain 호출 시.
+var ErrKillChainUnsupported = fmt.Errorf("kill chain only supported on gcp-compute provisioner")
 
 // ErrGoldenImageUnsupported — non-GCP provisioner 에서 이미지 기능 호출 시.
 var ErrGoldenImageUnsupported = fmt.Errorf("golden image capture only supported on gcp-compute provisioner")
@@ -79,6 +97,18 @@ func (p *noopProvisioner) Delete(_ context.Context, _, _ string, _ *userstore.Wo
 
 func (p *noopProvisioner) CaptureGoldenImage(_ context.Context, _ *userstore.Workstation, _, _ string) (string, error) {
 	return "", ErrGoldenImageUnsupported
+}
+
+func (p *noopProvisioner) IsolateNetwork(_ context.Context, _ *userstore.Workstation) error {
+	return ErrKillChainUnsupported
+}
+
+func (p *noopProvisioner) ForensicDiskSnapshot(_ context.Context, _ *userstore.Workstation, _ string) (string, error) {
+	return "", ErrKillChainUnsupported
+}
+
+func (p *noopProvisioner) StopInstance(_ context.Context, _ *userstore.Workstation) error {
+	return ErrKillChainUnsupported
 }
 
 var slugRe = regexp.MustCompile(`[^a-z0-9]+`)

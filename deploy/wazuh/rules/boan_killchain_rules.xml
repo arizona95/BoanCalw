@@ -1,0 +1,30 @@
+<!--
+  BoanClaw Kill Chain detection rules — Wazuh manager 에 배포.
+  manager 컨테이너에서 /var/ossec/etc/rules/local_rules.xml 에 append 하거나
+  custom ruleset 으로 마운트.
+
+  Wazuh 는 process 감지를 위해 sysmon / sysmon-event / audit 중 하나가 설치돼
+  있어야 한다. Windows 기본 agent 는 process 이벤트를 일부만 수집 —
+  sysmon + wazuh-agent + custom command(osquery 등) 조합이 표준.
+
+  아래 규칙은 최소한의 예시 — process_name 이 rule.description 에 포함되도록
+  hardcoded. 실제 운영에서는 data.win.eventdata.processName 같은 구체 필드로
+  match 를 조여야 한다.
+-->
+<group name="boanclaw_killchain,">
+  <!-- 100200 : catchall for Windows process creation (Sysmon event 1) -->
+  <rule id="100200" level="12">
+    <if_group>sysmon_event1</if_group>
+    <field name="win.eventdata.image">(?i)\\\\claude(\\.exe)?$</field>
+    <description>BoanClaw Kill Chain: Claude CLI 실행 감지</description>
+    <group>boan_killchain_match,</group>
+  </rule>
+
+  <!-- 100201 : generic process name catchall for rules 관리자 추가용 -->
+  <rule id="100201" level="12">
+    <if_group>sysmon_event1</if_group>
+    <match>process_name</match>
+    <description>BoanClaw Kill Chain: 관리자 정의 금지 프로세스 감지</description>
+    <group>boan_killchain_match,</group>
+  </rule>
+</group>

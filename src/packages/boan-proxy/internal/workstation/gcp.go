@@ -43,6 +43,12 @@ type gcpInstance struct {
 	Metadata          gcpMetadata       `json:"metadata"`
 	NetworkInterfaces []gcpNIC          `json:"networkInterfaces"`
 	Disks             []gcpDisk         `json:"disks"`
+	Tags              gcpTags           `json:"tags"`
+}
+
+type gcpTags struct {
+	Items       []string `json:"items"`
+	Fingerprint string   `json:"fingerprint"`
 }
 
 type gcpDisk struct {
@@ -1006,4 +1012,166 @@ if (-not (Test-Path $desktopBoanclaw)) {
 icacls $desktopBoanclaw /grant "%s:(OI)(CI)F" /T 2>&1 | Out-Null
 LogStep "=== boanclaw startup end ==="
 `, username, password, username, username, username, username, username, username, username, username, username)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//                            Kill Chain ops
+// ═══════════════════════════════════════════════════════════════════════
+
+// quarantineTag — kill chain 발동 시 VM 에 추가되는 network tag.
+// 별도로 `boan-quarantine-deny-all` 이라는 firewall rule (Direction=EGRESS,
+// priority=100, targetTags=[quarantineTag], denied=["all"]) 이 프로젝트에 있어야
+// 실제로 egress 가 차단된다. terraform / gcloud 로 사전 생성 필요.
+const quarantineTag = "boan-quarantine"
+
+// IsolateNetwork — 현재 VM 의 tag 목록에 quarantineTag 추가.
+// GCP 는 setTags 요청이 tags 전체를 교체하므로 기존 tags 에 추가 후 PUT.
+func (p *gcpProvisioner) IsolateNetwork(ctx context.Context, current *userstore.Workstation) error {
+	name := instanceNameFromCurrent(current)
+	if name == "" {
+		return fmt.Errorf("current workstation has no instance")
+	}
+	inst, err := p.getInstance(ctx, name)
+	if err != nil {
+		return fmt.Errorf("get instance: %w", err)
+	}
+	existing := map[string]struct{}{}
+	for _, t := range inst.Tags.Items {
+		existing[t] = struct{}{}
+	}
+	if _, has := existing[quarantineTag]; has {
+		return nil // 이미 격리됨 — idempotent
+	}
+	existing[quarantineTag] = struct{}{}
+	items := make([]string, 0, len(existing))
+	for t := range existing {
+		items = append(items, t)
+	}
+	payload := map[string]any{
+		"items":       items,
+		"fingerprint": inst.Tags.Fingerprint,
+	}
+	raw, _ := json.Marshal(payload)
+	u := fmt.Sprintf(
+		"https://compute.googleapis.com/compute/v1/projects/%s/zones/%s/instances/%s/setTags",
+		url.PathEscape(p.cfg.WorkstationProjectID),
+		url.PathEscape(p.cfg.WorkstationZone),
+		url.PathEscape(name),
+	)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("setTags returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	// Best-effort: 격리 전용 firewall rule 이 있는지 확인 + 없으면 생성.
+	// 없어도 오류는 내지 않고 경고만 찍음 — tag 만 붙어도 수동 점검 가능.
+	if ferr := p.ensureQuarantineFirewall(ctx); ferr != nil {
+		log.Printf("[killchain] quarantine firewall rule ensure failed: %v", ferr)
+	}
+	return nil
+}
+
+// ensureQuarantineFirewall — boan-quarantine-deny-all 규칙이 없으면 생성.
+// Direction=EGRESS, priority=100 (application 의 기본 allow 보다 낮은 숫자=우선),
+// targetTags=[boan-quarantine], denied=["all"].
+func (p *gcpProvisioner) ensureQuarantineFirewall(ctx context.Context) error {
+	rule := "boan-quarantine-deny-all"
+	u := fmt.Sprintf(
+		"https://compute.googleapis.com/compute/v1/projects/%s/global/firewalls/%s",
+		url.PathEscape(p.cfg.WorkstationProjectID),
+		url.PathEscape(rule),
+	)
+	getReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, http.NoBody)
+	resp, err := p.client.Do(getReq)
+	if err == nil {
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			return nil // already present
+		}
+	}
+	createURL := fmt.Sprintf(
+		"https://compute.googleapis.com/compute/v1/projects/%s/global/firewalls",
+		url.PathEscape(p.cfg.WorkstationProjectID),
+	)
+	payload := map[string]any{
+		"name":              rule,
+		"description":       "Kill chain egress block for VMs tagged boan-quarantine",
+		"direction":         "EGRESS",
+		"priority":          100,
+		"targetTags":        []string{quarantineTag},
+		"destinationRanges": []string{"0.0.0.0/0"},
+		"denied":            []map[string]any{{"IPProtocol": "all"}},
+	}
+	raw, _ := json.Marshal(payload)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, createURL, bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	cresp, err := p.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer cresp.Body.Close()
+	if cresp.StatusCode < 200 || cresp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(cresp.Body, 2048))
+		return fmt.Errorf("create firewall %s returned %d: %s", rule, cresp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
+// ForensicDiskSnapshot — kill chain 의 disk snapshot 단계. CaptureGoldenImage
+// 와 동일 GCP API 를 쓰되 이름에 incident ID 를 끼워 넣어 식별 가능하게 함.
+// CaptureGoldenImage 는 snapshot 후 VM 을 재시작하는데, kill chain 에서는
+// 다음 단계가 STOP/DELETE 이므로 restart 는 의미 없다. 그래도 재사용 OK —
+// STOP 은 멱등하고 다음 StopInstance 가 다시 확실히 stop.
+func (p *gcpProvisioner) ForensicDiskSnapshot(ctx context.Context, current *userstore.Workstation, incidentID string) (string, error) {
+	name := instanceNameFromCurrent(current)
+	if name == "" {
+		return "", fmt.Errorf("current workstation has no instance")
+	}
+	// 이름 규칙: boan-forensic-{instance}-{incident}-{unix}
+	// 최대 63자 + lowercase + dash 제약 맞추기.
+	sanitize := func(s string) string {
+		out := make([]byte, 0, len(s))
+		for i := 0; i < len(s); i++ {
+			c := s[i]
+			if c >= 'A' && c <= 'Z' {
+				c += 32
+			}
+			if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' {
+				out = append(out, c)
+			} else {
+				out = append(out, '-')
+			}
+		}
+		return string(out)
+	}
+	incShort := sanitize(incidentID)
+	if len(incShort) > 20 {
+		incShort = incShort[len(incShort)-20:]
+	}
+	imageName := fmt.Sprintf("boan-forensic-%s-%s-%d", sanitize(name), incShort, time.Now().Unix())
+	if len(imageName) > 63 {
+		imageName = imageName[:63]
+	}
+	return p.CaptureGoldenImage(ctx, current, imageName, fmt.Sprintf("forensic snapshot for incident %s", incidentID))
+}
+
+// StopInstance — gcpProvisioner 의 내부 stopInstance 래퍼.
+func (p *gcpProvisioner) StopInstance(ctx context.Context, current *userstore.Workstation) error {
+	name := instanceNameFromCurrent(current)
+	if name == "" {
+		return fmt.Errorf("current workstation has no instance")
+	}
+	return p.stopInstance(ctx, name)
 }

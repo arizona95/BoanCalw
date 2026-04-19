@@ -33,6 +33,7 @@ import (
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/rbac"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/router"
 	boantls "github.com/samsung-sds/boanclaw/boan-proxy/internal/tls"
+	"github.com/samsung-sds/boanclaw/boan-proxy/internal/killchain"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/userstore"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/workstation"
 )
@@ -58,6 +59,8 @@ type Server struct {
 	guardrail    *guardrail.Client
 	declinedFPs  *declinedFingerprintStore
 	device       *devicekey.Identity
+	killchain    *killchain.Store
+	killchainRun *killchain.Runner
 }
 
 func New(cfg *config.Config) (*Server, error) {
@@ -145,7 +148,7 @@ func New(cfg *config.Config) (*Server, error) {
 		log.Printf("device identity loaded: id=%s pub_b64=%s...", device.DeviceID, device.PublicKeyBase64()[:32])
 	}
 
-	return &Server{
+	s := &Server{
 		cfg:          cfg,
 		ca:           ca,
 		dlpEng:       dlp.NewEngine(cfg.LocalLLMURL, cfg.LocalLLMModel),
@@ -182,7 +185,14 @@ func New(cfg *config.Config) (*Server, error) {
 		guardrail:    guardrail.NewWithToken(cfg.PolicyURL, cfg.OrgToken),
 		declinedFPs:  newDeclinedFingerprintStore(userDataDir),
 		device:       device,
-	}, nil
+	}
+	// Kill chain store + runner. 초기화 실패 시 fatal 하지 않음 — feature 자체가
+	// optional. 실패 시 runner nil → UI 가 기능 비활성화.
+	if kcStore, err := killchain.NewStore(userDataDir); err == nil {
+		s.killchain = kcStore
+		s.killchainRun = &killchain.Runner{Store: kcStore, Prov: s.workstations}
+	}
+	return s, nil
 }
 
 func splitCSV(v string) []string {
