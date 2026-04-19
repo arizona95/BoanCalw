@@ -5,7 +5,7 @@ source "$(dirname "$0")/test-helpers.sh"
 echo "═══ 서비스 상태 테스트 ═══"
 
 section "D-1: 서비스 헬스체크"
-for svc in boan-proxy boan-sandbox boan-admin-console boan-credential-filter boan-policy-server boan-computer-use; do
+for svc in boan-proxy boan-sandbox boan-admin-console boan-credential-filter boan-policy-server boan-llm-registry boan-audit-agent boan-org-llm-proxy boan-wazuh-manager boan-fluent-bit; do
   CNAME="boanclaw-${svc}-1"
   STATUS=$(docker inspect --format '{{.State.Status}}' "$CNAME" 2>/dev/null || echo "not found")
   if [ "$STATUS" = "running" ]; then

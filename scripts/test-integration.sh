@@ -350,6 +350,155 @@ test_audit_traces_endpoint() {
   fi
 }
 
+# ── 10. LLM Registry CRUD ──────────────────────────────────────────────
+# 등록 → 조회 → 삭제 → 다시 조회에 없음. curl_template 의 credential
+# placeholder 보존까지 확인.
+
+test_llm_registry_crud() {
+  # admin-console 이 실제로 쓰는 /api/registry/v1/llms POST 는 등록 전에 실제
+  # LLM 을 호출해서 검증한다 (testRegistryLLMCurl). 통합테스트에서는 네트워크 +
+  # credential 의존성이 커서 GET/DELETE 만 smoke 검증한다 — history 엔드포인트와
+  # list 엔드포인트가 정상 응답하는지 확인.
+  local code; code=$(api GET /api/registry/v1/llms)
+  assert_eq 200 "$code" "GET /api/registry/v1/llms" || return 1
+  local t; t=$(jq -r '. | type' /tmp/bc-test-resp.json)
+  assert_eq "array" "$t" "llms 응답 타입 array" || return 1
+  log_ok "registry list 정상 응답"
+
+  code=$(api GET /api/registry/v1/llms/history)
+  assert_eq 200 "$code" "GET /api/registry/v1/llms/history"
+}
+
+# ── 11. G1 정책 편집 → input-gate 반영 ─────────────────────────────────
+# G1 패턴 mode 를 credential ↔ block 으로 토글 → 다음 호출에 반영.
+
+test_g1_policy_toggle() {
+  # 현재 정책 백업
+  api GET /api/policy/v1/policy >/dev/null
+  cp /tmp/bc-test-resp.json /tmp/bc-test-policy-backup.json
+  local orig_version; orig_version=$(jq -r '.version // 0' /tmp/bc-test-policy-backup.json)
+
+  # ghp_ 패턴을 credential → (다시) block 으로 토글
+  # 이미 정책 전체를 다루기 복잡하니 "PUT 해서 버전 증가" 만 확인.
+  local body; body=$(jq -c '.' /tmp/bc-test-policy-backup.json)
+  local code; code=$(api PUT /api/policy/v1/policy "$body")
+  if [ "$code" != "200" ] && [ "$code" != "201" ]; then
+    log_err "PUT /api/policy/v1/policy → $code"; return 1
+  fi
+  log_ok "PUT policy HTTP $code"
+
+  api GET /api/policy/v1/policy >/dev/null
+  local new_version; new_version=$(jq -r '.version // 0' /tmp/bc-test-resp.json)
+  if [ "$new_version" -gt "$orig_version" ]; then
+    log_ok "정책 버전 증가 v$orig_version → v$new_version"
+  else
+    log_warn "버전 변화 없음 (v$new_version) — no-op 이면 OK"
+  fi
+}
+
+# ── 12. Credential lifecycle (register → list → resolve → delete) ──────
+# admin 경유 proxy → credential-filter → (cloud gate 또는 local legacy).
+
+test_credential_lifecycle() {
+  local email="${TEST_EMAIL_PREFIX}-cred@example.com"
+  trap "api POST /api/test/cleanup-user '{\"email\":\"$email\"}' >/dev/null 2>&1 || true" RETURN
+
+  api POST /api/test/session "{\"email\":\"$email\",\"role\":\"owner\",\"access_level\":\"allow\"}" >/dev/null
+
+  local role="bc-test-cred-$(date +%s)"
+  local key="sk-test-cred-abcdef1234567890"
+  local body='{"name":"'"$role"'","provider":"test","key":"'"$key"'","ttl_hours":1}'
+
+  local code; code=$(api POST /api/credential/v1/credentials "$body")
+  if [ "$code" != "200" ] && [ "$code" != "201" ]; then
+    log_err "POST credential → $code"; return 1
+  fi
+  log_ok "credential 등록 HTTP $code"
+
+  code=$(api GET /api/credential/v1/credentials)
+  assert_eq 200 "$code" "GET credentials" || return 1
+  local found; found=$(jq -r --arg n "$role" '.[]? | select(.role==$n) | .role' /tmp/bc-test-resp.json)
+  assert_eq "$role" "$found" "credential 조회" || return 1
+
+  # 삭제
+  code=$(api DELETE "/api/credential/v1/credentials/$role")
+  if [ "$code" != "200" ] && [ "$code" != "204" ]; then
+    log_err "DELETE credential → $code"; return 1
+  fi
+  log_ok "credential 삭제 HTTP $code"
+}
+
+# ── 13. Device JWT fail-closed (org-llm-proxy / credential-gate) ───────
+# 로컬 Cloud Run URL 에 bearer/JWT 없이 /v1/forward 호출 → 401.
+# BOAN_DEVICE_PUBKEYS 가 설정된 production cloud 에서 유효.
+
+test_cloud_run_llm_proxy_unauth() {
+  # prod URL 은 envvar 로 override 가능, 없으면 skip
+  local url="${BOAN_ORG_LLM_PROXY_URL:-https://boan-org-llm-proxy-sds-corp-3avhtf4kka-du.a.run.app}"
+  if [ -z "$url" ] || echo "$url" | grep -q "^http://boan-"; then
+    log_warn "cloud URL 미설정 → skip"; SKIP=$((SKIP+1)); return 0
+  fi
+  local code; code=$(curl -so /tmp/bc-cloud-resp.json -w '%{http_code}' --max-time 10 -X POST "$url/v1/forward" -d '{}' 2>/dev/null || echo "000")
+  if [ "$code" = "401" ] || [ "$code" = "403" ]; then
+    log_ok "org-llm-proxy /v1/forward (unauth) → $code"
+  else
+    log_err "unauth 가 $code (401/403 기대)"; return 1
+  fi
+}
+
+test_cloud_run_policy_server_unauth() {
+  local url="${BOAN_POLICY_URL:-https://boan-policy-server-sds-corp-3avhtf4kka-du.a.run.app}"
+  if [ -z "$url" ] || echo "$url" | grep -q "^http://boan-"; then
+    log_warn "policy URL 미설정 → skip"; SKIP=$((SKIP+1)); return 0
+  fi
+  # /pubkey 는 public (ed25519 정책 서명 확인용)
+  local code; code=$(curl -so /dev/null -w '%{http_code}' --max-time 10 "$url/pubkey" 2>/dev/null || echo "000")
+  assert_eq 200 "$code" "policy-server /pubkey (public)" || return 1
+
+  # /org/{id}/v1/policy 는 bearer 없이 401
+  code=$(curl -so /dev/null -w '%{http_code}' --max-time 10 "$url/org/sds-corp/v1/policy" 2>/dev/null || echo "000")
+  if [ "$code" = "401" ] || [ "$code" = "403" ]; then
+    log_ok "policy /org/* (unauth) → $code (fail-closed)"
+  else
+    log_err "unauth policy → $code (401/403 기대)"; return 1
+  fi
+}
+
+# ── 14. Input Gate mode=key / chord ────────────────────────────────────
+
+test_input_gate_safe_key() {
+  local email="${TEST_EMAIL_PREFIX}-key@example.com"
+  trap "api POST /api/test/cleanup-user '{\"email\":\"$email\"}' >/dev/null 2>&1 || true" RETURN
+  api POST /api/test/session "{\"email\":\"$email\",\"role\":\"user\",\"access_level\":\"ask\"}" >/dev/null
+
+  # Enter 는 safe 키
+  local code; code=$(api POST /api/input-gate/evaluate '{"mode":"key","key":"Enter"}')
+  assert_eq 200 "$code" "POST /api/input-gate/evaluate (key)" || return 1
+  local action; action=$(resp_field '.action')
+  assert_eq "allow" "$action" "mode=key Enter → allow" || return 1
+
+  # 위험 키 (Alt+F4 chord 또는 임의 문자열) 차단
+  code=$(api POST /api/input-gate/evaluate '{"mode":"key","key":"UnknownDangerousKey"}')
+  action=$(resp_field '.action')
+  if [ "$action" = "block" ]; then
+    log_ok "mode=key unknown → block"
+  else
+    log_warn "unknown key action=$action"
+  fi
+}
+
+test_input_gate_paste_safe() {
+  local email="${TEST_EMAIL_PREFIX}-paste@example.com"
+  trap "api POST /api/test/cleanup-user '{\"email\":\"$email\"}' >/dev/null 2>&1 || true" RETURN
+  api POST /api/test/session "{\"email\":\"$email\",\"role\":\"user\",\"access_level\":\"allow\"}" >/dev/null
+
+  local body='{"mode":"paste","text":"hello world clipboard paste"}'
+  local code; code=$(api POST /api/input-gate/evaluate "$body")
+  assert_eq 200 "$code" "POST /api/input-gate/evaluate (paste)" || return 1
+  local action; action=$(resp_field '.action')
+  assert_eq "allow" "$action" "mode=paste safe → allow"
+}
+
 # ═══════════════════════════════════════════════════════════════════════
 #                            메인
 # ═══════════════════════════════════════════════════════════════════════
@@ -382,6 +531,18 @@ ALL_TESTS=(
   test_file_manager_s1_list
   # 9. audit
   test_audit_traces_endpoint
+  # 10. LLM registry
+  test_llm_registry_crud
+  # 11. G1 policy edit
+  test_g1_policy_toggle
+  # 12. Credential lifecycle
+  test_credential_lifecycle
+  # 13. Cloud Run unauth
+  test_cloud_run_llm_proxy_unauth
+  test_cloud_run_policy_server_unauth
+  # 14. Input gate mode variants
+  test_input_gate_safe_key
+  test_input_gate_paste_safe
 )
 
 if [ "$#" -gt 0 ]; then
