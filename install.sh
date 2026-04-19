@@ -46,7 +46,7 @@ warn()  { echo -e "${YELLOW}⚠${NC} $*"; }
 fail()  { echo -e "${RED}✗${NC} $*"; exit 1; }
 
 # ── 설정 ──
-REPO_URL="${BOANCLAW_REPO_URL:-}"                       # 비어있으면 clone 안 함
+REPO_URL="${BOANCLAW_REPO_URL:-https://github.com/arizona95/BoanCalw.git}"  # 기본값: 공개 repo
 INSTALL_DIR="${BOANCLAW_INSTALL_DIR:-$HOME/boanclaw}"
 COMPOSE_FILE="docker-compose.dev.yml"
 MOUNT_DIR="$HOME/Desktop/boanclaw"

@@ -5,79 +5,66 @@
 
 ---
 
-## ⚡ 설치 (사용자)
-
-### 1) BoanClaw 받기
+## 1. 한 줄 설치
 
 ```bash
-git clone https://github.com/arizona95/BoanCalw.git ~/boanclaw && cd ~/boanclaw && bash install.sh
+bash <(curl -fsSL https://raw.githubusercontent.com/arizona95/BoanCalw/main/install.sh)
 ```
 
-### 2) 브라우저에서 가입 요청
+설치가 끝나면 브라우저에서 **<http://localhost:19080>** 접속.
 
-설치가 끝나면 **<http://localhost:19080>** 에 자동으로 로그인 화면이 뜹니다.
-**"가입 요청"** 을 눌러서 조직 소유자에게서 받은 **조직서버 URL** + **본인 회사 이메일** 두 가지만 입력하면 끝입니다. 토큰 / 조직 ID 같은 건 입력할 필요 없습니다 — URL 하나로 서버가 알아서 파싱해서 가입 요청을 소유자에게 보냅니다.
+---
 
-### 3) 소유자 승인 → 로그인
+## 2. 조직 가입 요청
 
-소유자가 관리 콘솔에서 승인하면 이메일 SSO 로 로그인 가능합니다.
+브라우저 화면 → **"가입 요청"** 클릭 → 두 가지 입력:
 
-> **조직 소유자(관리자)** 는 GCP 인프라 배포가 필요합니다 → [`docs/00_관리자_설치.md`](docs/00_관리자_설치.md) 참고.
+- **조직서버 URL** — 조직 소유자에게서 받은 값 (e.g. `https://boan-policy-server-sds-corp-xxxxx.run.app`)
+- **회사 이메일**
 
-### Windows 사용자
+제출하면 소유자에게 가입 요청이 전달되고, 승인 후 이메일 SSO 로 로그인 가능합니다. *토큰 / 조직 ID 는 입력할 필요 없습니다 — URL 하나로 끝.*
 
-WSL2 안에서 동일하게 실행합니다:
+> **조직 소유자(관리자)** 는 GCP 인프라 배포가 먼저 필요합니다 → [`docs/00_관리자_설치.md`](docs/00_관리자_설치.md) 참고.
 
+---
+
+## 3. 환경별 설치 가이드
+
+### case 1 — Linux / WSL2 (Docker 이미 있음)
+위의 한 줄 설치 그대로 실행. 끝.
+
+### case 2 — Windows (WSL 이 없는 경우)
+PowerShell (관리자) 에서:
 ```powershell
-# PowerShell (관리자) — WSL 설치 (최초 1회, 재부팅 필요)
 wsl --install
 ```
-
-재부팅 후 WSL Ubuntu 터미널에서:
+재부팅 → WSL Ubuntu 터미널 → Docker 설치:
 ```bash
-sudo apt update && sudo apt install -y docker.io docker-compose-plugin git curl
+sudo apt update && sudo apt install -y docker.io docker-compose-plugin curl
 sudo systemctl enable --now docker
 sudo usermod -aG docker $USER && newgrp docker
-# 이후 위 한 줄 설치 명령 실행
 ```
+그 다음 위의 한 줄 설치. Windows 브라우저에서 `http://localhost:19080` 자동 포워딩.
 
-Windows 브라우저에서 `http://localhost:19080` (WSL2 localhost 포워딩 자동).
-
-### 업데이트
-
-```bash
-cd ~/boanclaw && git pull && bash install.sh
-```
-
-### 트러블슈팅 (펼치기)
-
-<details>
-<summary>git / docker 가 없다면</summary>
-
+### case 3 — Linux 인데 Docker 가 없는 경우
 **Ubuntu / Debian**
 ```bash
-sudo apt update && sudo apt install -y git docker.io docker-compose-plugin curl
+sudo apt update && sudo apt install -y docker.io docker-compose-plugin curl
 sudo systemctl enable --now docker
 sudo usermod -aG docker $USER && newgrp docker
 ```
-
 **CentOS / RHEL / Fedora**
 ```bash
-sudo dnf install -y git docker docker-compose-plugin curl
+sudo dnf install -y docker docker-compose-plugin curl
 sudo systemctl enable --now docker
 sudo usermod -aG docker $USER && newgrp docker
 ```
+설치 후 위의 한 줄 설치 실행.
 
-**macOS**
-```bash
-brew install git
-# Docker Desktop: https://docs.docker.com/desktop/install/mac-install/
-```
-</details>
+### case 4 — macOS
+Docker Desktop 설치 (<https://docs.docker.com/desktop/install/mac-install/>) → 실행 → 위의 한 줄 설치.
 
-<details>
-<summary><code>docker-credential-desktop.exe: not found</code> 오류</summary>
-
+### case 5 — `docker-credential-desktop.exe: not found` 에러
 Docker Desktop 을 설치했다 제거한 환경에서 발생합니다.
 ```bash
 python3 -c "
@@ -87,7 +74,11 @@ c.pop('credsStore', None)
 with open('$HOME/.docker/config.json', 'w') as f: json.dump(c, f, indent=2)
 "
 ```
-</details>
+
+### 업데이트
+```bash
+cd ~/boanclaw && bash install.sh
+```
 
 ---
 
@@ -133,9 +124,6 @@ docker compose -f docker-compose.dev.yml down
 
 # 코드 변경 후 (proxy / sandbox / console 동시 빌드 보장)
 ./scripts/rebuild.sh
-
-# 관리 콘솔
-open http://localhost:19080
 ```
 
 | 포트 | 서비스 |
