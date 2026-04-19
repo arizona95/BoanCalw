@@ -362,6 +362,68 @@ services:
     networks: [boanclaw]
     depends_on: [boan-policy-server, boan-audit-agent, boan-guacamole, boan-computer-use, boan-credential-filter, boan-org-llm-proxy]
 
+  # ─────────────────────────────────────────────────────────────────────
+  # Wazuh manager — 조직 EDR 중앙 서버.
+  # 사용자 VM (Windows Golden Image) 안의 Wazuh agent 가 이 manager 로
+  # 이벤트 (FIM, 프로세스, 레지스트리, MITRE ATT&CK 매핑 alert) 를 보냄.
+  # Manager 가 룰 평가 → alert 을 /var/ossec/logs/alerts/alerts.json 에
+  # 찍고, Fluent Bit 가 tail 해서 조직 로그서버로 forwarding.
+  #
+  # 포트:
+  #   1514/udp   — agent → manager 이벤트 채널 (syslog)
+  #   1515/tcp   — agent 등록 (enrollment)
+  #   55000/tcp  — Wazuh REST API
+  # ─────────────────────────────────────────────────────────────────────
+  boan-wazuh-manager:
+    image: wazuh/wazuh-manager:4.7.5
+    container_name: boanclaw-boan-wazuh-manager-1
+    hostname: boan-wazuh-manager
+    restart: unless-stopped
+    ulimits:
+      memlock: {soft: -1, hard: -1}
+      nofile: {soft: 655360, hard: 655360}
+    ports:
+      - "1514:1514/udp"
+      - "1515:1515"
+      - "55000:55000"
+    environment:
+      - INDEXER_URL=
+      - INDEXER_USERNAME=
+      - INDEXER_PASSWORD=
+      - FILEBEAT_SSL_VERIFICATION_MODE=none
+      - API_USERNAME=wazuh-wui
+      - API_PASSWORD=BoanWazuh2026!
+    volumes:
+      # logs 만 share (Fluent Bit 이 alerts.json tail 하려면 필요).
+      # etc/queue/var 등은 container 내부 — default config 가 entrypoint 에
+      # 의해 자동 populate 되므로 volume 마운트로 덮어쓰지 않는다.
+      - boan-wazuh-logs:/var/ossec/logs
+    networks: [boanclaw]
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Fluent Bit — Wazuh alert 를 조직 로그서버로 forwarding.
+  # tail 로 /var/ossec/logs/alerts/alerts.json 읽고, http out 으로
+  # BOAN_LOG_FORWARD_URL 에 전송. 환경변수 없으면 stdout 으로만.
+  # ─────────────────────────────────────────────────────────────────────
+  boan-fluent-bit:
+    image: fluent/fluent-bit:2.2.2
+    container_name: boanclaw-boan-fluent-bit-1
+    hostname: boan-fluent-bit
+    restart: unless-stopped
+    volumes:
+      - ./deploy/fluent-bit/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
+      - ./deploy/fluent-bit/parsers.conf:/fluent-bit/etc/parsers.conf:ro
+      - boan-wazuh-logs:/var/ossec/logs:ro
+    environment:
+      - BOAN_ORG_ID=${BOAN_ORG_ID:-sds-corp}
+      - BOAN_LOG_FORWARD_URL=${BOAN_LOG_FORWARD_URL:-}
+      - BOAN_LOG_FORWARD_TOKEN=${BOAN_LOG_FORWARD_TOKEN:-}
+      - BOAN_LOG_FORWARD_HOST=${BOAN_LOG_FORWARD_HOST:-}
+      - BOAN_LOG_FORWARD_PORT=${BOAN_LOG_FORWARD_PORT:-443}
+      - BOAN_LOG_FORWARD_PATH=${BOAN_LOG_FORWARD_PATH:-/ingest}
+    networks: [boanclaw]
+    depends_on: [boan-wazuh-manager]
+
 volumes:
   boan-guac-db:
   boan-policy-data:
@@ -373,3 +435,5 @@ volumes:
   boan-rdp-transfer:
   boan-device-key:  # P3: Ed25519 device identity (private key)
   boan-hf-cache:    # vLLM 의 HuggingFace 모델 캐시 (재시작 시 재다운로드 회피)
+  # Wazuh alert 로그 — Fluent Bit 가 tail 해야 하므로 share.
+  boan-wazuh-logs:

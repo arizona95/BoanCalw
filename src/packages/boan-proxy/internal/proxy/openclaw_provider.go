@@ -984,17 +984,23 @@ func (s *Server) evaluateGuardrailLocal(ctx context.Context, orgID, text, mode s
 		return "block", "G2 LLM이 등록되지 않음 — fail-closed", "", lErr
 	}
 
-	// 3. 최소 프롬프트 — decision/reason만
+	// 3. JSON-first 프롬프트 — 첫 토큰이 "{" 가 되도록 강제.
+	// reasoning 모델(gemma cloud 등)이 CoT preamble 을 뱉어 토큰 예산을 모두
+	// 소진하면 JSON 이 나오지 않아 파싱 실패하므로, JSON 을 맨 앞에 배치하도록
+	// 명시적으로 요구한다.
 	systemPrompt := fmt.Sprintf(
-		"You are a security guardrail. Constitution:\n%s\n\n"+
-			"Reply ONLY with strict JSON: {\"decision\":\"allow|ask|block\",\"reason\":\"<10 words>\"}\n"+
-			"Be concise. No thinking, no explanation.",
+		"You are a security guardrail. Respond with ONE LINE of strict JSON ONLY.\n"+
+			"The very first character of your response MUST be \"{\".\n"+
+			"Do not think out loud. Do not explain. Do not add markdown.\n"+
+			"Schema: {\"decision\":\"allow|ask|block\",\"reason\":\"<10 words>\"}\n\n"+
+			"Constitution:\n%s",
 		strings.TrimSpace(constitution),
 	)
 	userPrompt := text
 
-	// G2 전용 호출 — max_tokens=100 (작은 응답)
-	out, fErr := s.callRegistryLLM(ctx, entry, systemPrompt, userPrompt, 100)
+	// G2 전용 호출 — max_tokens=500 (CoT 모델도 JSON 까지 도달할 여유 확보).
+	// callRegistryLLM 이 curl_template body 에 max_tokens 를 강제 주입한다.
+	out, fErr := s.callRegistryLLM(ctx, entry, systemPrompt, userPrompt, 500)
 	if fErr != nil {
 		return "block", "G2 LLM 호출 실패: " + fErr.Error(), "", fErr
 	}
@@ -1008,12 +1014,14 @@ func (s *Server) evaluateGuardrailLocal(ctx context.Context, orgID, text, mode s
 		Decision string `json:"decision"`
 		Reason   string `json:"reason"`
 	}
-	if start := strings.Index(content, "{"); start >= 0 {
-		if end := strings.LastIndex(content, "}"); end > start {
-			_ = json.Unmarshal([]byte(content[start:end+1]), &parsed)
-		}
+	// 첫 번째 완결된 JSON 오브젝트를 추출. LastIndex("}") 로 찾으면 모델이
+	// 뒤에 붙이는 tokenizer artifact(`<|turn|`) 나 추가 텍스트/JSON 때문에
+	// 전체 범위가 valid JSON 이 아니게 된다.
+	if obj := extractFirstJSONObject(content); obj != "" {
+		_ = json.Unmarshal([]byte(obj), &parsed)
 	}
 	if parsed.Decision == "" {
+		log.Printf("[G2] parse-fail content=%.500q", content)
 		return "block", "G2 응답 파싱 실패: " + content[:min(80, len(content))], "", nil
 	}
 	parsed.Decision = strings.ToLower(strings.TrimSpace(parsed.Decision))
@@ -1062,6 +1070,13 @@ func (s *Server) callRegistryLLM(ctx context.Context, entry *registryLLM, system
 		normalized, err := renderTemplateBody(body, systemPrompt+"\n\n"+userPrompt)
 		if err != nil {
 			return nil, err
+		}
+		// G2/G3 guardrail 호출은 짧은 JSON 응답만 필요하므로, 사용자 curl_template
+		// 이 max_tokens 를 생략했거나 너무 작게 설정한 경우에도 maxTokens 인자를
+		// 강제로 주입한다. CoT/reasoning 모델이 preamble 을 내뱉어 토큰 예산을
+		// 모두 소진하고 JSON 을 못 내는 증상의 근본 원인.
+		if maxTokens > 0 {
+			normalized = injectMaxTokens(normalized, maxTokens)
 		}
 		body = normalized
 	} else {
@@ -1387,6 +1402,98 @@ func forwardViaOrgProxy(ctx context.Context, proxyURL, proxyToken, orgID, device
 		return nil, 0, fmt.Errorf("org-llm-proxy body_b64 decode: %w", err)
 	}
 	return decoded, out.Status, nil
+}
+
+// extractFirstJSONObject — brace-depth 를 세어 가장 앞의 완결된 JSON
+// 오브젝트 substring 을 반환한다. 문자열 리터럴 안의 `{`/`}` 는 무시한다.
+// 닫히지 않으면 빈 문자열.
+func extractFirstJSONObject(s string) string {
+	start := strings.Index(s, "{")
+	if start < 0 {
+		return ""
+	}
+	depth := 0
+	inString := false
+	escape := false
+	for i := start; i < len(s); i++ {
+		c := s[i]
+		if escape {
+			escape = false
+			continue
+		}
+		if inString {
+			if c == '\\' {
+				escape = true
+				continue
+			}
+			if c == '"' {
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return s[start : i+1]
+			}
+		}
+	}
+	return ""
+}
+
+// injectMaxTokens — G2 가드레일 호출 전용. curl_template body 가 JSON 이면
+//   - max_tokens 를 n 이상으로 강제 (CoT + JSON 둘 다 들어갈 여유)
+//   - Ollama chat 호출은 `"format": "json"` 을 강제해 JSON 출력 보장
+//     (reasoning 모델이 "1. Analyze the Request:..." CoT 만 뱉어 JSON 파싱
+//     실패하는 현상의 근본 대응. format=json 이면 Ollama 가 grammar 제약으로
+//     첫 글자부터 JSON 만 나오게 함)
+// JSON 이 아니면 body 그대로 반환.
+func injectMaxTokens(body string, n int) string {
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(body), &obj); err != nil {
+		return body
+	}
+	atLeastN := func(m map[string]any, key string) {
+		if v, ok := m[key]; ok {
+			if f, ok := v.(float64); ok && int(f) >= n {
+				return
+			}
+		}
+		m[key] = n
+	}
+	// OpenAI / Anthropic / Ollama chat endpoint 은 max_tokens 를 따른다.
+	atLeastN(obj, "max_tokens")
+	// Ollama /api/generate 는 options.num_predict 를 따른다.
+	if opts, ok := obj["options"].(map[string]any); ok {
+		atLeastN(opts, "num_predict")
+		obj["options"] = opts
+	}
+	// Gemini generateContent 는 generationConfig.maxOutputTokens.
+	if cfg, ok := obj["generationConfig"].(map[string]any); ok {
+		atLeastN(cfg, "maxOutputTokens")
+		obj["generationConfig"] = cfg
+	}
+	// Ollama chat endpoint 특성 — messages 배열 + options 객체가 있으면 Ollama 로 간주.
+	// `format: "json"` 을 설정하면 출력이 valid JSON 한 개로 고정된다.
+	// `think: false` 도 유지/강제 — CoT 가 JSON 앞에 붙는 것을 막음.
+	if _, hasMessages := obj["messages"]; hasMessages {
+		if _, hasOptions := obj["options"]; hasOptions {
+			if _, already := obj["format"]; !already {
+				obj["format"] = "json"
+			}
+			obj["think"] = false
+		}
+	}
+	raw, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return string(raw)
 }
 
 func renderTemplateBody(body, prompt string) (string, error) {

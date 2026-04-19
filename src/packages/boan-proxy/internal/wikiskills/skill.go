@@ -180,6 +180,10 @@ func (c *GraphClient) UpsertDialog(ctx context.Context, d ClarificationDialog) (
 	return &out, nil
 }
 
+func (c *GraphClient) DeleteDialog(ctx context.Context, id string) error {
+	return c.call(ctx, "DELETE", "dialogs/"+id, nil, nil)
+}
+
 // ── LLM 호출 ─────────────────────────────────────────────
 
 type LLMConfig struct {
@@ -892,4 +896,240 @@ func RunAgenticIterate(ctx context.Context, gc *GraphClient, llm LLMConfig, dial
 		}
 	}
 	return res, nil
+}
+
+// ── skill.chat_continue ──────────────────────────────────
+//
+// 단일 통합 대화(primary dialog) 의 agentic loop 한 턴.
+//
+// 흐름:
+//   1) 관리자가 human turn 을 추가 (UI 가 upsertDialog 로 먼저 반영).
+//   2) 이 skill 이 dialog 전체를 보고 **다음 LLM 턴을 생성** + action 결정:
+//        - ASK_FOLLOWUP       : 아직 이해 부족 → 추가 질문 한 번 더
+//        - REQUEST_LABEL_FIX  : 과거 라벨이 잘못된 것 같음 → HITL 재라벨링 요청
+//        - UPDATE_WIKI        : 이해 완료 → agentic_iterate 로 wiki 갱신
+//        - CLOSE_AND_FIND_NEW : 이 주제 완벽히 이해 → find_ambiguous 로 새 애매
+//                               사례 가져와 같은 dialog 에 새 질문 턴 추가.
+//   3) 결과 turn + action 메타데이터 반환. UI 는 이것만 appendTurn 후 렌더.
+//
+// LLM 은 OpenAI 호환 chat endpoint 호출 (role=g3 또는 agentic_iterate).
+type ChatContinueResult struct {
+	Action         string                 `json:"action"`
+	Message        string                 `json:"message"`
+	Examples       []string               `json:"examples,omitempty"`
+	WikiUpdate     *AgenticIterateResult  `json:"wiki_update,omitempty"`
+	LabelFixTarget map[string]interface{} `json:"label_fix_target,omitempty"`
+	LLMRaw         string                 `json:"llm_raw,omitempty"`
+	Errors         []string               `json:"errors,omitempty"`
+}
+
+func RunChatContinue(ctx context.Context, gc *GraphClient, llm LLMConfig, dialogID string) (*ChatContinueResult, error) {
+	// 1) dialog 조회 (list 전체에서 id 매칭)
+	dialogs, err := gc.ListDialogsRaw(ctx, 200)
+	if err != nil {
+		return nil, fmt.Errorf("list dialogs: %w", err)
+	}
+	var target *ClarificationDialog
+	for i := range dialogs {
+		if dialogs[i].ID == dialogID {
+			target = &dialogs[i]
+			break
+		}
+	}
+	if target == nil {
+		return nil, fmt.Errorf("dialog %s not found", dialogID)
+	}
+
+	// 2) 프롬프트 구성 — 대화 이력 + 4가지 action 선택 요구
+	var convo strings.Builder
+	for _, t := range target.Turns {
+		convo.WriteString(fmt.Sprintf("[%s] %s\n", t.Role, t.Content))
+	}
+
+	// 현재 wiki 요약 (작은 list)
+	nodes, _ := gc.ListNodes(ctx)
+	var nodeSummary strings.Builder
+	for i, n := range nodes {
+		if i >= 20 {
+			break
+		}
+		fmt.Fprintf(&nodeSummary, "  - %s (path=%s): %s\n", n.ID, n.Path, n.Definition)
+	}
+
+	system := "You are the organization's guardrail wiki curator. You are having an ongoing " +
+		"clarification conversation with the admin. The admin just answered your previous " +
+		"question. Decide the NEXT action based on the conversation so far.\n\n" +
+		"You MUST pick ONE of these 4 actions:\n" +
+		"  1. ASK_FOLLOWUP       — the answer is good but something is still unclear.\n" +
+		"                          Ask ONE concrete follow-up question.\n" +
+		"  2. REQUEST_LABEL_FIX  — you believe one of the cited past decisions was mislabeled\n" +
+		"                          (e.g. admin approved something that actually contradicts the\n" +
+		"                          rule they just stated). Flag it for human re-review.\n" +
+		"  3. UPDATE_WIKI        — the conversation reached a clear, actionable rule.\n" +
+		"                          Ready to update the wiki. (The server will run agentic_iterate\n" +
+		"                          right after to apply the edits.)\n" +
+		"  4. CLOSE_AND_FIND_NEW — the current topic is fully understood AND wiki is already\n" +
+		"                          up to date. Move on: end this topic and (the server will then\n" +
+		"                          invoke find_ambiguous to surface the next boundary case).\n\n" +
+		"Reply with STRICT JSON ONLY, no markdown, no code fence:\n" +
+		"{\n" +
+		"  \"action\": \"ASK_FOLLOWUP|REQUEST_LABEL_FIX|UPDATE_WIKI|CLOSE_AND_FIND_NEW\",\n" +
+		"  \"message\": \"<your next reply to the admin in Korean, 1-3 sentences>\",\n" +
+		"  \"examples\": [\"(optional) supporting bullet\"],\n" +
+		"  \"label_fix\": { \"decision_text\": \"...\", \"current_label\": \"approve|deny\", \"suggested_label\": \"...\", \"reason\": \"...\" }\n" +
+		"}\n\n" +
+		"Rules:\n" +
+		"  • Korean replies. Short, natural conversational tone.\n" +
+		"  • REQUEST_LABEL_FIX 일 때만 label_fix 필드 작성. 아니면 생략.\n" +
+		"  • 단일 answer 로 규칙 명확해졌으면 UPDATE_WIKI 선택 (연속으로 질문만 계속 하지 말 것).\n" +
+		"  • UPDATE_WIKI 직후 자연스러운 턴: 다음 호출에서 LLM 이 wiki 갱신 결과 보고 CLOSE_AND_FIND_NEW 선택 기대.\n" +
+		"  • CLOSE_AND_FIND_NEW 선택 시 message 는 '이 부분은 이해했습니다. 다음 주제로 넘어갈게요' 같은 마무리.\n"
+
+	user := fmt.Sprintf("=== CURRENT WIKI (first 20 nodes) ===\n%s\n\n=== CONVERSATION SO FAR ===\n%s\n\n"+
+		"Decide the next action and reply.",
+		nodeSummary.String(), convo.String())
+
+	raw, err := callLLM(ctx, llm, system, user)
+	if err != nil {
+		return nil, fmt.Errorf("llm call: %w", err)
+	}
+
+	// JSON 추출 (첫 번째 완결 객체)
+	jsonStr := extractFirstJSON(raw)
+	if jsonStr == "" {
+		return &ChatContinueResult{
+			Action:  "ASK_FOLLOWUP",
+			Message: "(LLM JSON 파싱 실패) 다시 한 번 간단히 설명해주실 수 있을까요?",
+			LLMRaw:  raw,
+			Errors:  []string{"failed to parse LLM output as JSON"},
+		}, nil
+	}
+	var parsed struct {
+		Action   string   `json:"action"`
+		Message  string   `json:"message"`
+		Examples []string `json:"examples"`
+		LabelFix map[string]interface{} `json:"label_fix"`
+	}
+	if jerr := json.Unmarshal([]byte(jsonStr), &parsed); jerr != nil {
+		return &ChatContinueResult{
+			Action:  "ASK_FOLLOWUP",
+			Message: "(LLM JSON 파싱 실패) 다시 한 번 간단히 설명해주실 수 있을까요?",
+			LLMRaw:  raw,
+			Errors:  []string{jerr.Error()},
+		}, nil
+	}
+
+	result := &ChatContinueResult{
+		Action:   strings.ToUpper(strings.TrimSpace(parsed.Action)),
+		Message:  parsed.Message,
+		Examples: parsed.Examples,
+		LLMRaw:   raw,
+	}
+
+	// 3) 새 LLM 턴을 dialog 에 append
+	target.Turns = append(target.Turns, DialogTurn{
+		Role:     "llm",
+		Content:  parsed.Message,
+		Examples: parsed.Examples,
+	})
+
+	// 4) action 별 side effect
+	switch result.Action {
+	case "UPDATE_WIKI":
+		iter, ierr := RunAgenticIterate(ctx, gc, llm, dialogID)
+		if ierr != nil {
+			result.Errors = append(result.Errors, "wiki update: "+ierr.Error())
+		}
+		result.WikiUpdate = iter
+	case "CLOSE_AND_FIND_NEW":
+		// find_ambiguous 호출 → 첫 결과 질문을 같은 dialog 의 새 LLM 턴으로 append,
+		// 원본 생성된 dialog 들은 삭제 (primary 하나만 유지).
+		fa, ferr := RunFindAmbiguous(ctx, gc, llm, 50)
+		if ferr != nil {
+			result.Errors = append(result.Errors, "find_ambiguous: "+ferr.Error())
+		} else if fa != nil && len(fa.DialogsCreated) > 0 {
+			// 방금 생성된 dialog id 들을 전체 조회해서 첫 번째의 마지막 LLM 턴을 이관.
+			allAfter, _ := gc.ListDialogsRaw(ctx, 200)
+			var firstNewDialog *ClarificationDialog
+			for i := range allAfter {
+				for _, id := range fa.DialogsCreated {
+					if allAfter[i].ID == id {
+						firstNewDialog = &allAfter[i]
+						break
+					}
+				}
+				if firstNewDialog != nil {
+					break
+				}
+			}
+			if firstNewDialog != nil && len(firstNewDialog.Turns) > 0 {
+				last := firstNewDialog.Turns[len(firstNewDialog.Turns)-1]
+				target.Turns = append(target.Turns, DialogTurn{
+					Role:     "llm",
+					Content:  last.Content,
+					Examples: last.Examples,
+				})
+			}
+			// find_ambiguous 가 만든 sub-dialog 전부 정리.
+			for _, id := range fa.DialogsCreated {
+				if id != "" && id != dialogID {
+					_ = gc.DeleteDialog(ctx, id)
+				}
+			}
+		}
+	case "REQUEST_LABEL_FIX":
+		result.LabelFixTarget = parsed.LabelFix
+		// 실제 HITL 승인 큐 항목 생성은 proxy 레벨에서 수행 (wikiskills 는 policy-server 만 다룸).
+	case "ASK_FOLLOWUP":
+		// 아무 side effect 없음, message 만 추가됨.
+	default:
+		result.Action = "ASK_FOLLOWUP"
+		result.Errors = append(result.Errors, "unknown action returned; defaulted to ASK_FOLLOWUP")
+	}
+
+	// 5) dialog upsert (turns 전체 저장)
+	if _, uerr := gc.UpsertDialog(ctx, *target); uerr != nil {
+		result.Errors = append(result.Errors, "dialog upsert: "+uerr.Error())
+	}
+	return result, nil
+}
+
+// extractFirstJSON — brace-depth 기반으로 첫 번째 완결 JSON 오브젝트 추출.
+func extractFirstJSON(s string) string {
+	start := strings.Index(s, "{")
+	if start < 0 {
+		return ""
+	}
+	depth := 0
+	inStr := false
+	esc := false
+	for i := start; i < len(s); i++ {
+		c := s[i]
+		if esc {
+			esc = false
+			continue
+		}
+		if inStr {
+			if c == '\\' {
+				esc = true
+				continue
+			}
+			if c == '"' {
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inStr = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return s[start : i+1]
+			}
+		}
+	}
+	return ""
 }

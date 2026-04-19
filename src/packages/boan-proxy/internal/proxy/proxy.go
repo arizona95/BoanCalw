@@ -160,7 +160,24 @@ func New(cfg *config.Config) (*Server, error) {
 		orgServer:    orgserver.NewWithToken(cfg.PolicyURL, cfg.OrgToken),
 		orgs:         orgs,
 		otpStore:     otpStore,
-		workstations: workstation.New(cfg),
+		workstations: func() workstation.Provisioner {
+			prov := workstation.New(cfg)
+			// orgSettings.golden_image_uri 가 있으면 provisioner 가 그 이미지로
+			// 신규 사용자 VM 을 프로비저닝하도록 resolver 주입.
+			if orgSettings != nil {
+				workstation.AttachGoldenImageResolver(prov, func(orgID string) string {
+					rec := orgSettings.GetOrCreate(orgID)
+					if rec == nil {
+						return ""
+					}
+					if v, ok := rec.Settings["golden_image_uri"].(string); ok {
+						return v
+					}
+					return ""
+				})
+			}
+			return prov
+		}(),
 		guac:         guac.New(cfg),
 		guardrail:    guardrail.NewWithToken(cfg.PolicyURL, cfg.OrgToken),
 		declinedFPs:  newDeclinedFingerprintStore(userDataDir),

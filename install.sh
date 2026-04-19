@@ -121,17 +121,37 @@ mkdir -p "$MOUNT_DIR"
 ok "$MOUNT_DIR 생성 완료"
 
 # ── 4. 환경 설정 (최초 설치 시) ──
+# 사용자가 관리자로부터 받은 조직 URL + Token 을 환경변수로 전달하면
+# 로컬 proxy 가 해당 조직에 가입 요청을 보내도록 설정한다.
+# 한 줄 설치 예:
+#   curl ... | BOAN_ORG_URL=https://... BOAN_ORG_TOKEN=xxx BOAN_ORG_ID=sds-corp bash
 ENV_FILE="deploy/config/gcp.env"
-if [ ! -f "$ENV_FILE" ]; then
+if [ -n "${BOAN_ORG_URL:-}" ] && [ -n "${BOAN_ORG_TOKEN:-}" ] && [ -n "${BOAN_ORG_ID:-}" ]; then
+  info "조직 서버 연결 설정 (관리자 제공 값 사용)"
+  mkdir -p "$(dirname "$ENV_FILE")"
+  cat > "$ENV_FILE" <<ENVEOF
+# 관리자(admin-install.sh)가 배포한 조직에 연결하기 위한 값.
+BOAN_ORG_ID=$BOAN_ORG_ID
+BOAN_POLICY_URL=$BOAN_ORG_URL
+BOAN_ORG_TOKEN=$BOAN_ORG_TOKEN
+ENVEOF
+  # token 파일에도 쓰기 — 일관성
+  mkdir -p "deploy/config"
+  printf '%s' "$BOAN_ORG_TOKEN" > "deploy/config/${BOAN_ORG_ID}.token"
+  chmod 600 "deploy/config/${BOAN_ORG_ID}.token" 2>/dev/null || true
+  ok "조직 연결: $BOAN_ORG_ID → $BOAN_ORG_URL"
+elif [ ! -f "$ENV_FILE" ]; then
   info "기본 환경 파일 생성: $ENV_FILE"
   mkdir -p "$(dirname "$ENV_FILE")"
   cat > "$ENV_FILE" <<'ENVEOF'
-# GCP 설정 (선택사항 — GCP workstation 미사용 시 비워두면 됨)
-# BOAN_GCP_ORG_ID=
-# BOAN_OAUTH_CLIENT_ID=
-# BOAN_OAUTH_CLIENT_SECRET=
+# 조직 연결 (관리자가 admin-install.sh 실행 후 받은 값을 넣으세요):
+# BOAN_ORG_ID=
+# BOAN_POLICY_URL=
+# BOAN_ORG_TOKEN=
 ENVEOF
-  ok "기본 환경 파일 생성 완료"
+  warn "BOAN_ORG_URL / BOAN_ORG_TOKEN / BOAN_ORG_ID 미지정 — 단독 모드로 실행됩니다"
+  warn "조직에 가입하려면 관리자로부터 URL/Token 을 받아 $ENV_FILE 에 채우거나"
+  warn "환경변수로 다시 실행: BOAN_ORG_URL=... BOAN_ORG_TOKEN=... BOAN_ORG_ID=... ./install.sh"
 fi
 
 # ── 5. 호스트 UID/GID 자동 감지 ──
@@ -199,6 +219,17 @@ if curl -sf "http://localhost:$ADMIN_PORT/" > /dev/null 2>&1; then
   echo -e "  관리 콘솔:    ${CYAN}http://localhost:$ADMIN_PORT${NC}"
   echo -e "  마운트 폴더:  ${CYAN}$MOUNT_DIR${NC}"
   echo -e "  설치 경로:    $INSTALL_DIR"
+  if [ -n "${BOAN_ORG_URL:-}" ]; then
+    echo -e "  조직:         ${CYAN}${BOAN_ORG_ID}${NC} @ ${CYAN}${BOAN_ORG_URL}${NC}"
+  fi
+  echo ""
+  if [ -n "${BOAN_ORG_URL:-}" ]; then
+    echo -e "${YELLOW}다음 단계 (사용자):${NC}"
+    echo -e "  1. 브라우저에서 ${CYAN}http://localhost:$ADMIN_PORT${NC} 접속"
+    echo -e "  2. 회사 이메일로 로그인 → 조직 서버에 '가입 요청' 상태로 등록됨"
+    echo -e "  3. 관리자가 Authorization 탭에서 승인하면 VM 이 자동 할당됨"
+    echo -e "  4. Personal Computer 탭에서 원격 Windows 사용 가능"
+  fi
   echo ""
   echo -e "  시작:  ${YELLOW}cd $INSTALL_DIR && $COMPOSE -f $COMPOSE_FILE up -d${NC}"
   echo -e "  중지:  ${YELLOW}cd $INSTALL_DIR && $COMPOSE -f $COMPOSE_FILE down${NC}"

@@ -1748,6 +1748,81 @@ func (s *Server) StartAdmin() {
 		})
 	})
 
+	// POST /api/admin/workstation/image — owner 전용.
+	// owner 의 현재 VM 을 GCP Custom Image 로 스냅샷 → org settings 의
+	// golden_image_uri 에 저장 → 이후 신규 사용자 VM 은 이 이미지로 프로비저닝.
+	// 요구: 소유자 권한, owner 본인의 workstation 존재.
+	// 흐름: STOP → image 생성 (최대 20분) → START → settings 저장.
+	// 전용 go-routine 으로 실행해서 HTTP 응답은 즉시 ACK (long poll 방지).
+	mux.HandleFunc("/api/admin/workstation/image", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		sess, err := auth.SessionFromRequest(r, s.authProv)
+		if err != nil {
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]any{"error": "unauthenticated"})
+			return
+		}
+		if u, err := s.users.Get(sess.Email); err != nil || u == nil || strings.ToLower(u.Role) != "owner" {
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]any{"error": "owner role required"})
+			return
+		}
+		current, _ := s.users.Workstation(sess.Email)
+		if current == nil || current.InstanceID == "" {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]any{"error": "owner has no provisioned workstation"})
+			return
+		}
+		var body struct {
+			Name        string `json:"name,omitempty"`
+			Description string `json:"description,omitempty"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.Description == "" {
+			body.Description = fmt.Sprintf("BoanClaw golden image captured from %s at %s", current.InstanceID, time.Now().UTC().Format(time.RFC3339))
+		}
+
+		// ACK 즉시 반환 — 실제 imaging 은 background.
+		jobID := fmt.Sprintf("goldimg-%d", time.Now().UnixNano())
+		json.NewEncoder(w).Encode(map[string]any{
+			"status": "started",
+			"job_id": jobID,
+			"hint":   "골든 이미지 생성 중 (VM 정지 → 이미지 생성 → VM 재시작). 약 10-20분 소요.",
+		})
+
+		ws := &userstore.Workstation{
+			Provider:   current.Provider,
+			Platform:   current.Platform,
+			InstanceID: current.InstanceID,
+			Region:     current.Region,
+		}
+		orgID := sess.OrgID
+		email := sess.Email
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+			defer cancel()
+			log.Printf("[golden-image] start: orgID=%s email=%s instance=%s", orgID, email, ws.InstanceID)
+			imageURI, err := s.workstations.CaptureGoldenImage(ctx, ws, body.Name, body.Description)
+			if err != nil {
+				log.Printf("[golden-image] FAILED orgID=%s: %v", orgID, err)
+				return
+			}
+			log.Printf("[golden-image] SUCCESS orgID=%s imageURI=%s", orgID, imageURI)
+			// org settings 에 저장
+			if s.orgSettings != nil {
+				_, _ = s.orgSettings.Patch(orgID, nil, map[string]interface{}{
+					"golden_image_uri":       imageURI,
+					"golden_image_captured_at": time.Now().UTC().Format(time.RFC3339),
+					"golden_image_source_instance": ws.InstanceID,
+				})
+			}
+		}()
+	})
+
 	mux.HandleFunc("/api/workstation/me", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		sess, err := auth.SessionFromRequest(r, s.authProv)
@@ -2517,12 +2592,19 @@ func (s *Server) StartAdmin() {
 					if ru.Status == "approved" {
 						status = userstore.StatusApproved
 					}
+					// policy-server 는 user 에 대해 `machine_id` 필드로 TOFU binding
+					// 을 저장한다 (owner 는 `registered_ip` 사용 — 레거시 호환).
+					// 로컬 UI 컬럼 (바인딩 PC) 은 둘 다 보여야 하므로 non-empty 쪽 선택.
+					effectiveIP := ru.RegisteredIP
+					if effectiveIP == "" {
+						effectiveIP = ru.MachineID
+					}
 					if existing, ok := localByEmail[strings.ToLower(ru.Email)]; ok {
 						// GCP 가 진실의 원천 — role/status/IP 등 최신 값으로 overlay.
 						existing.Role = ru.Role
 						existing.Status = status
-						if ru.RegisteredIP != "" {
-							existing.RegisteredIP = ru.RegisteredIP
+						if effectiveIP != "" {
+							existing.RegisteredIP = effectiveIP
 						}
 						continue
 					}
@@ -2532,7 +2614,7 @@ func (s *Server) StartAdmin() {
 						Role:         ru.Role,
 						OrgID:        orgID,
 						Status:       status,
-						RegisteredIP: ru.RegisteredIP,
+						RegisteredIP: effectiveIP,
 						CreatedAt:    time.Now(),
 					})
 				}
@@ -3455,6 +3537,45 @@ func (s *Server) StartAdmin() {
 					out["partial_result"] = res
 				}
 				json.NewEncoder(w).Encode(out)
+				return
+			}
+			json.NewEncoder(w).Encode(res)
+			return
+		}
+
+		// skill/chat_continue — agentic loop 한 턴.
+		// input: {dialog_id}
+		// 반환: action + 새 LLM 턴 + (옵션) wiki_update 결과.
+		if suffix == "skill/chat_continue" && r.Method == http.MethodPost {
+			var body struct {
+				DialogID string `json:"dialog_id"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.DialogID == "" {
+				http.Error(w, "dialog_id required", http.StatusBadRequest)
+				return
+			}
+			llmURL, llmModel, llmKey, found := lookupLLMByRole("agentic_iterate")
+			if !found {
+				llmURL, llmModel, llmKey, found = lookupLLMByRole("g3")
+			}
+			if !found {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusPreconditionFailed)
+				json.NewEncoder(w).Encode(map[string]string{
+					"error": "LLM Registry 에 role=agentic_iterate 또는 role=g3 로 바인딩된 LLM 없음",
+				})
+				return
+			}
+			var orgToken string
+			if entry, ok := s.orgs.Resolve(orgID); ok {
+				orgToken = entry.Token
+			}
+			gc := wikiskills.NewGraphClient(orgURL, orgID, orgToken)
+			res, err := wikiskills.RunChatContinue(r.Context(), gc, wikiskills.LLMConfig{URL: llmURL, Model: llmModel, Key: llmKey}, body.DialogID)
+			w.Header().Set("Content-Type", "application/json")
+			if err != nil {
+				w.WriteHeader(http.StatusBadGateway)
+				json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
 				return
 			}
 			json.NewEncoder(w).Encode(res)
@@ -4736,11 +4857,36 @@ func (s *Server) StartAdmin() {
 			log.Printf("[computer-use/agent] grounding LMM not bound (vision-direct coordinate fallback)")
 		}
 
-		const maxSteps = 15
+		// ═══════════════════════════════════════════════════════════════════
+		// Agentic loop 설계
+		// ─────────────────────────────────────────────────────────────────
+		// 1) PLAN  — 작업 시작 시 Planner LLM 으로 objective 를 sub-goal 리스트로
+		//            분해 (예: "크롬 다운로드" → ["Edge 열기", "google.com/chrome
+		//            이동", "다운로드 클릭", "설치파일 실행"]).
+		// 2) LOOP  — 각 step 마다 OBSERVE(스크린샷) → THINK(vision LLM 으로 현재
+		//            sub-goal 진척 판정 + 다음 action 결정) → ACT(실행) → RECORD.
+		// 3) STATE — SUBGOAL_STATUS 로 상태 전이:
+		//              DONE       : 현재 sub-goal 완료 → idx++ (전부 끝나면 성공)
+		//              STUCK      : 같은 sub-goal 에서 진척 없음 → 재계획 시도
+		//              ADVANCING  : 현재 sub-goal 진행 중 → 다음 action 실행
+		// 4) GUARD — per-subgoal step 상한 (무한 루프 방지), 전체 replan 시도 상한.
+		// ═══════════════════════════════════════════════════════════════════
+
+		// Plan 관련 상한.
+		const maxSteps = 40             // 전체 agent 최대 step (subgoal 합계)
+		const maxStepsPerSubgoal = 10   // 한 sub-goal 에서 소비 가능한 최대 step
+		const maxReplans = 2            // 전체 루프 도중 planner 재호출 최대 횟수
+
 		executed := 0
 		lastScreenshotB64 := ""
 		lastActionSignature := "" // e.g. "click:282,231" — 정확 일치 중복 감지용
 		stagnationCount := 0      // 연속 '액션 실행했는데 화면 안 변함' 카운터
+
+		// Plan 상태 — 초기에는 비어있고 첫 스크린샷 캡처 후 planner 가 채움.
+		var plan []string
+		subgoalIdx := 0
+		stepsInCurrentSubgoal := 0
+		replanAttempts := 0
 
 		// clickCluster — 최근 click 좌표 + 발생 step. Fuzzy dedup + 화면 마커 양쪽에 사용.
 		// 커서 위치 + 몇 픽셀 어긋난 LLM 좌표가 동일 의도인데 sig 가 달라져 dedup 을 통과하는
@@ -4934,18 +5080,98 @@ func (s *Server) StartAdmin() {
 			return false, ""
 		}
 
+		// ── Planner ─────────────────────────────────────────────────────
+		// objective 를 sub-goal 리스트로 분해. 텍스트 전용 G2 엔트리(있으면)
+		// → chat 엔트리 → vision 엔트리 순으로 fallback. JSON 배열 강제 파싱.
+		// 실패 시 objective 전체를 단일 sub-goal 로 사용 (기존 동작과 동일).
+		runPlanner := func(objective string, priorHistory []string) []string {
+			// 1) planner LLM entry 선택
+			planEntry, _ := s.loadLLMByRole(r.Context(), "g2")
+			if planEntry == nil {
+				planEntry, _ = s.loadSelectedRegistryLLM(r.Context())
+			}
+			if planEntry == nil {
+				log.Printf("[computer-use/agent] planner: no LLM available; fallback single-subgoal")
+				return []string{objective}
+			}
+			log.Printf("[computer-use/agent] planner LLM=%s", planEntry.Name)
+
+			systemPrompt := "You are a task planner for a Windows desktop automation agent.\n" +
+				"Decompose the user's objective into a SHORT ordered list of concrete sub-goals.\n\n" +
+				"Guidelines:\n" +
+				"  • Each sub-goal is one VISIBLY observable outcome on the Windows screen\n" +
+				"    (e.g. 'Edge 브라우저 창이 열림', '주소창에 google.com/chrome 이 입력됨',\n" +
+				"     '다운로드 버튼이 눌림', 'ChromeSetup.exe 실행됨').\n" +
+				"  • 3-7 sub-goals. Too few = vague, too many = micromanaging.\n" +
+				"  • Do NOT list low-level actions like '클릭 X,Y' or 'ctrl+s 누르기'.\n" +
+				"    Sub-goals are WHAT-level, not HOW-level.\n" +
+				"  • If the user specified a method (e.g. 'Edge 써서'), reflect that in the plan.\n\n" +
+				"Reply with strict JSON ONLY:\n" +
+				"  {\"plan\": [\"subgoal 1\", \"subgoal 2\", ...]}\n"
+			if len(priorHistory) > 0 {
+				systemPrompt += "\nPRIOR AGENT HISTORY (previous approach failed/stuck — re-plan):\n"
+				for _, h := range priorHistory {
+					systemPrompt += "  - " + h + "\n"
+				}
+				systemPrompt += "Return a DIFFERENT plan that avoids the failure mode above.\n"
+			}
+
+			out, err := s.callRegistryLLM(r.Context(), planEntry, systemPrompt, "Objective: "+objective, 600)
+			if err != nil {
+				log.Printf("[computer-use/agent] planner error: %v — fallback single-subgoal", err)
+				return []string{objective}
+			}
+			content := extractContent(out)
+			if content == "" {
+				log.Printf("[computer-use/agent] planner empty response — fallback single-subgoal")
+				return []string{objective}
+			}
+			// JSON 추출
+			obj := extractFirstJSONObject(content)
+			if obj == "" {
+				log.Printf("[computer-use/agent] planner no JSON — fallback. raw=%.200q", content)
+				return []string{objective}
+			}
+			var parsed struct {
+				Plan []string `json:"plan"`
+			}
+			if jerr := json.Unmarshal([]byte(obj), &parsed); jerr != nil || len(parsed.Plan) == 0 {
+				log.Printf("[computer-use/agent] planner parse fail: %v raw=%.200q", jerr, obj)
+				return []string{objective}
+			}
+			// sanitize
+			out2 := make([]string, 0, len(parsed.Plan))
+			for _, s := range parsed.Plan {
+				s = strings.TrimSpace(s)
+				if s != "" {
+					out2 = append(out2, s)
+				}
+			}
+			if len(out2) == 0 {
+				return []string{objective}
+			}
+			log.Printf("[computer-use/agent] plan (%d subgoals): %v", len(out2), out2)
+			return out2
+		}
+
 		// ── 로그아웃/잠금 화면 감지 (관측값 기반) ───────────────────────────
 		// vision LMM 의 OBSERVATION 이 로그아웃/잠금/로그인 화면을 암시하면
 		// STATUS:COMPLETE 오판을 막고 즉시 중단. (스크린샷이 깨끗해 보인다고
 		// 완료로 오인하는 경우 방지)
 		looksBroken := func(observation string) bool {
+			// "sign in" 같은 generic 문구는 Edge welcome dialog 같은 일반 앱에도
+			// 자주 등장하므로 false positive 가 심하다. 진짜 Windows 세션 lock /
+			// logout 특유의 확실한 표현만 매칭.
 			lower := strings.ToLower(observation)
 			markers := []string{
-				"logged out", "log out", "logout",
-				"lock screen", "locked", "sign in", "sign-in", "signin",
-				"ctrl+alt+del", "ctrl-alt-del",
-				"press enter to log", "welcome screen",
-				"로그아웃", "잠금", "로그인 화면",
+				"ctrl+alt+del", "ctrl-alt-del", "ctrl+alt+delete",
+				"press ctrl+alt+del",
+				"press enter to log",
+				"press the windows key",
+				"windows login screen", "windows lock screen",
+				"session has been locked", "session was locked",
+				"workstation is locked",
+				"ctrl+alt+del로 잠금", "windows 로그인 화면", "세션이 잠겼",
 			}
 			for _, m := range markers {
 				if strings.Contains(lower, m) {
@@ -4955,15 +5181,36 @@ func (s *Server) StartAdmin() {
 			return false
 		}
 
-		// Vision 프롬프트 빌더 — 사람처럼 '브리핑 → 검증 → 결정' 흐름.
+		// Vision 프롬프트 빌더 — '브리핑 → 검증 → sub-goal 진척 판정 → 결정' 흐름.
 		// markers 는 스크린샷에 그려진 클릭 마커들과 1:1 매칭되는 메타정보 (LMM이 색상과 위치를 매칭).
 		// groundingBound 가 true면 click_element:DESCRIPTION 형식을 권장 (좌표 부담 감소).
-		buildVisionPrompt := func(scrW, scrH int, history []stepRecord, markers []clickMarker, stuck bool, groundingBound bool) string {
+		// plan/subgoalIdx — 현재 sub-goal 을 프롬프트에 넣어 LLM 이 집중하게 함.
+		buildVisionPrompt := func(scrW, scrH int, history []stepRecord, markers []clickMarker, stuck bool, groundingBound bool, plan []string, subgoalIdx int) string {
 			var sb strings.Builder
 			fmt.Fprintf(&sb, "You are a HUMAN operator (not an OCR engine) sitting in front of a Windows workstation\n")
 			fmt.Fprintf(&sb, "(resolution: %dx%d pixels) connected over RDP/Guacamole. Think holistically: judge the\n", scrW, scrH)
 			fmt.Fprintf(&sb, "overall situation, not just text on screen.\n\n")
 			fmt.Fprintf(&sb, "USER'S OBJECTIVE (verbatim): %s\n\n", agentReq.Prompt)
+
+			// ── 계획 + 현재 sub-goal ──────────────────────────────────
+			if len(plan) > 0 {
+				sb.WriteString("📋 EXECUTION PLAN (decomposed sub-goals):\n")
+				for i, sg := range plan {
+					marker := "  "
+					if i == subgoalIdx {
+						marker = "→ "
+					} else if i < subgoalIdx {
+						marker = "✓ "
+					}
+					fmt.Fprintf(&sb, "%s%d. %s\n", marker, i+1, sg)
+				}
+				sb.WriteString("\n")
+				if subgoalIdx < len(plan) {
+					fmt.Fprintf(&sb, "🎯 CURRENT SUB-GOAL [%d/%d]: %s\n", subgoalIdx+1, len(plan), plan[subgoalIdx])
+					sb.WriteString("   Focus ONLY on this sub-goal. Do NOT jump ahead. When the SCREEN visibly\n")
+					sb.WriteString("   shows this sub-goal achieved, output SUBGOAL_STATUS: DONE and we'll advance.\n\n")
+				}
+			}
 
 			// ── 시각적 마커 안내 ────────────────────────────────────────
 			if len(markers) > 0 {
@@ -5077,18 +5324,40 @@ func (s *Server) StartAdmin() {
 			sb.WriteString("              are there dialogs/popups, what state is the document in. Be specific.>\n")
 			sb.WriteString("VERIFICATION: <Looking at the markers (if any), did the previous click actually do what\n")
 			sb.WriteString("               you expected? yes/no — explain in 1 sentence.>\n")
+			sb.WriteString("SUBGOAL_STATUS: DONE | ADVANCING | STUCK\n")
+			sb.WriteString("  • DONE      — the screen visibly shows the CURRENT sub-goal achieved.\n")
+			sb.WriteString("                 (e.g. sub-goal was 'Edge browser open' and Edge IS visible)\n")
+			sb.WriteString("  • ADVANCING — sub-goal not yet done but your next action moves toward it.\n")
+			sb.WriteString("  • STUCK     — you've tried and the screen suggests this approach won't work.\n")
+			sb.WriteString("                 Use STUCK sparingly — it triggers re-planning of the entire task.\n")
 			sb.WriteString("STATUS: COMPLETE | INCOMPLETE\n")
+			sb.WriteString("  (COMPLETE only when ALL sub-goals are done and the entire objective is achieved.)\n")
 			sb.WriteString("REASONING: <1 sentence on why the next action is chosen and whether it honors the user's method.>\n")
 			if groundingBound {
 				sb.WriteString("NEXT_ACTION: <one of: key:NAME | type:TEXT | click_element:DESCRIPTION | double_click_element:DESCRIPTION | wait | stop>\n\n")
-				sb.WriteString("✨ A SPECIALIZED GROUNDING MODEL is available. For clicks, prefer click_element:DESCRIPTION\n")
-				sb.WriteString("   instead of click:X,Y. The grounding model will convert the description to coordinates.\n")
-				sb.WriteString("   DESCRIPTION should be a short, unambiguous noun phrase identifying the target element.\n")
-				sb.WriteString("   Good: 'the X close button on the Notepad title bar'\n")
-				sb.WriteString("   Good: 'the Save button in the file dialog'\n")
-				sb.WriteString("   Bad : 'something near the top'  (too vague)\n")
-				sb.WriteString("   Bad : 'click here' (no description of WHAT)\n")
-				sb.WriteString("   You may still output click:X,Y if you are CERTAIN of pixel coordinates, but prefer click_element.\n\n")
+				sb.WriteString("🚨 MANDATORY RULE — YOU MUST USE click_element (NOT click:X,Y) 🚨\n")
+				sb.WriteString("────────────────────────────────────────────────────────────────\n")
+				sb.WriteString("A specialized grounding model that reads pixels WAY better than you does\n")
+				sb.WriteString("coordinate detection. YOU ARE BAD AT PIXEL COORDINATES — you have been wrong\n")
+				sb.WriteString("before and will be wrong again. The grounding model is not.\n\n")
+				sb.WriteString("HARD RULES:\n")
+				sb.WriteString("  1. For EVERY click / double-click: output click_element:DESCRIPTION or\n")
+				sb.WriteString("     double_click_element:DESCRIPTION. NEVER click:X,Y. NEVER double_click:X,Y.\n")
+				sb.WriteString("  2. `click:X,Y` and `double_click:X,Y` are FORBIDDEN when grounding is available.\n")
+				sb.WriteString("     (They will be server-logged as a violation.)\n")
+				sb.WriteString("  3. DESCRIPTION must be a specific, unambiguous visual noun phrase:\n")
+				sb.WriteString("       ✓ 'Edge browser icon pinned on the Windows taskbar'\n")
+				sb.WriteString("       ✓ 'the close X button on the Notepad title bar'\n")
+				sb.WriteString("       ✓ 'the 다운로드 Chrome 버튼 on the Google Chrome official page'\n")
+				sb.WriteString("       ✓ 'the Start menu Windows logo at the very bottom-left of the taskbar'\n")
+				sb.WriteString("       ✗ 'the icon' / 'the button' / 'that thing' — TOO VAGUE, will fail\n")
+				sb.WriteString("       ✗ 'somewhere on screen' — worthless\n")
+				sb.WriteString("  4. If an element is not visible on screen, don't guess coordinates —\n")
+				sb.WriteString("     use `key:` (shortcut) or `type:` (typing) or `wait` instead.\n\n")
+				sb.WriteString("Why this rule is absolute: when you output click:X,Y directly, you hallucinate\n")
+				sb.WriteString("coordinates (e.g. click:39,361 landed on blank sidebar, click:1669,1046 hit a\n")
+				sb.WriteString("random taskbar cell). The grounding model sees actual pixels and maps your\n")
+				sb.WriteString("description to the right spot. Trust it.\n\n")
 			} else {
 				sb.WriteString("NEXT_ACTION: <one of: key:NAME | type:TEXT | click:X,Y | double_click:X,Y | wait | stop>\n\n")
 			}
@@ -5101,9 +5370,37 @@ func (s *Server) StartAdmin() {
 			sb.WriteString("    NEXT_ACTION = stop — the session is broken.\n")
 			sb.WriteString("  • NEXT_ACTION must be a SINGLE action. No JSON, no list, no trailing explanation.\n")
 			sb.WriteString("  • Coordinates are pixels, origin top-left. Use the CENTER of the target element.\n")
-			sb.WriteString("  • Never click within ~25 px of an existing marker — that area already failed.\n")
+			sb.WriteString("  • Never click within ~25 px of an existing marker — that area already failed.\n\n")
+
+			sb.WriteString("🪟 Windows desktop UX — read CAREFULLY (this rule fixes 90% of failures):\n")
+			sb.WriteString("  • Desktop icons (on the wallpaper) require DOUBLE-click to launch their app.\n")
+			sb.WriteString("    A single click only SELECTS the icon. You will see the icon highlighted but\n")
+			sb.WriteString("    nothing opens — that's the failure mode. If your goal is 'open X from desktop\n")
+			sb.WriteString("    icon', you MUST use double_click_element:DESCRIPTION (not click_element).\n")
+			sb.WriteString("  • Taskbar icons (the strip at the bottom) are SINGLE click.\n")
+			sb.WriteString("  • Start menu items are SINGLE click.\n")
+			sb.WriteString("  • File Explorer items typically DOUBLE click to open.\n")
+			sb.WriteString("  • In-app buttons (Save, OK, etc.) are SINGLE click.\n")
+			sb.WriteString("  • If you single-clicked a desktop icon last step and nothing opened, the\n")
+			sb.WriteString("    NEXT action MUST be double_click_element on the same icon (NOT another\n")
+			sb.WriteString("    single click — that's why the server blocks repeat clicks).\n")
+
 			return sb.String()
 		}
+
+		// ═══════════════════════════════════════════════════════════════════
+		// Plan 생성 — main loop 돌입 전.
+		// ═══════════════════════════════════════════════════════════════════
+		sendEvent(map[string]any{"type": "status", "text": "작업 계획 수립 중..."})
+		plan = runPlanner(agentReq.Prompt, nil)
+		// 계획을 채팅에 먼저 주입 — 사용자가 agent 의도 파악 가능
+		planMsgLines := make([]string, 0, len(plan)+1)
+		planMsgLines = append(planMsgLines, fmt.Sprintf("[gcp_exec] %s : 📋 실행 계획 (%d 단계)", agentReq.Prompt, len(plan)))
+		for i, sg := range plan {
+			planMsgLines = append(planMsgLines, fmt.Sprintf("  %d. %s", i+1, sg))
+		}
+		go injectOpenClawMessage(strings.Join(planMsgLines, "\n"))
+		sendEvent(map[string]any{"type": "plan", "subgoals": plan})
 
 		for step := 0; step < maxSteps; step++ {
 			// ── Step A: 스크린샷 캡처 (1회 retry 포함)
@@ -5205,7 +5502,7 @@ func (s *Server) StartAdmin() {
 			}
 			// stuck 조건: stagnation OR 클릭 클러스터에 누적이 있으면 (=같은 영역 반복)
 			stuck := stagnationCount >= 1 || len(clickCluster) >= 2
-			visionPrompt := buildVisionPrompt(scrW, scrH, recent, clickCluster, stuck, groundingEntry != nil)
+			visionPrompt := buildVisionPrompt(scrW, scrH, recent, clickCluster, stuck, groundingEntry != nil, plan, subgoalIdx)
 			// ── 사람처럼 '저번에 어디 찍었지' 를 시각적으로 보여주기:
 			// 원본 스크린샷에 클릭 마커를 그려서 vision LMM 에 전달.
 			// 원본(screenshotB64)은 화면 변화 감지/챗 표시용으로 그대로 둠.
@@ -5224,6 +5521,7 @@ func (s *Server) StartAdmin() {
 
 			observation := extractLine(thought, "OBSERVATION:")
 			status := strings.ToUpper(extractLine(thought, "STATUS:"))
+			subgoalStatus := strings.ToUpper(extractLine(thought, "SUBGOAL_STATUS:"))
 
 			// ── 세션 파괴 감지: 화면이 로그아웃/잠금 상태이면 즉시 중단.
 			// vision 이 COMPLETE 라고 해도 무시한다 (오판 방지).
@@ -5237,9 +5535,95 @@ func (s *Server) StartAdmin() {
 				return
 			}
 
-			// ── Step C: 완료 판단
-			if strings.Contains(status, "COMPLETE") && !strings.Contains(status, "INCOMPLETE") {
-				log.Printf("[computer-use/agent] vision says COMPLETE at step %d", step)
+			// ── Step B2: Sub-goal 상태 전이 (agentic loop 핵심)
+			// ─────────────────────────────────────────────────────────
+			// DONE     → 현재 sub-goal 달성. idx++. 모두 완료 시 COMPLETE.
+			// STUCK    → 재계획 (최대 maxReplans 회).
+			// ADVANCING → 다음 action 실행 경로로.
+			// (없거나 알 수 없음 → ADVANCING 취급)
+			stepsInCurrentSubgoal++
+			forceStuck := false
+			if stepsInCurrentSubgoal > maxStepsPerSubgoal {
+				log.Printf("[computer-use/agent] step=%d subgoal[%d] exceeded %d steps — force STUCK", step, subgoalIdx, maxStepsPerSubgoal)
+				forceStuck = true
+			}
+			if len(plan) > 0 && subgoalIdx < len(plan) {
+				advance := false
+				replan := false
+				switch {
+				case forceStuck:
+					replan = true
+				case strings.Contains(subgoalStatus, "DONE"):
+					advance = true
+				case strings.Contains(subgoalStatus, "STUCK"):
+					replan = true
+				}
+				if advance {
+					doneSG := plan[subgoalIdx]
+					subgoalIdx++
+					stepsInCurrentSubgoal = 0
+					// sub-goal 이 바뀌면 이전 UI 에서 쌓인 클릭 마커 / stagnation 도 리셋.
+					clickCluster = nil
+					stagnationCount = 0
+					lastActionSignature = ""
+					log.Printf("[computer-use/agent] step=%d subgoal[%d/%d] DONE: %q", step, subgoalIdx, len(plan), doneSG)
+					sendEvent(map[string]any{"type": "subgoal_done", "index": subgoalIdx - 1, "text": doneSG})
+					go injectOpenClawMessage(fmt.Sprintf("[gcp_exec] %s : ✓ [%d/%d] %s", agentReq.Prompt, subgoalIdx, len(plan), doneSG))
+					if subgoalIdx >= len(plan) {
+						log.Printf("[computer-use/agent] all subgoals done at step %d", step)
+						imgURL := makeChatScreenshotURL(screenshotB64)
+						completedMsg := fmt.Sprintf("[gcp_exec] %s : 🎉 전체 완료 (%d 단계)\n\n![](%s)", agentReq.Prompt, len(plan), imgURL)
+						go injectOpenClawMessage(completedMsg)
+						sendEvent(map[string]any{"type": "done", "actions_executed": executed})
+						return
+					}
+					// 다음 sub-goal 부터 새롭게 시작 — history 는 남겨두되 이번 step 은 액션 안 함.
+					stepHistory = append(stepHistory, stepRecord{
+						Step: step + 1, Observation: observation, Action: "SUBGOAL_DONE:" + doneSG, ScreenChanged: screenChanged,
+					})
+					continue
+				}
+				if replan {
+					if replanAttempts >= maxReplans {
+						log.Printf("[computer-use/agent] replan limit reached at step %d — aborting", step)
+						sendEvent(map[string]any{"type": "error", "text": fmt.Sprintf("재계획 한도 초과 (%d회) — 중단합니다.", maxReplans)})
+						imgURL := makeChatScreenshotURL(screenshotB64)
+						abortMsg := fmt.Sprintf("[gcp_exec] %s : ❌ 재계획 한도 초과 — 실패\n\n![](%s)", agentReq.Prompt, imgURL)
+						go injectOpenClawMessage(abortMsg)
+						sendEvent(map[string]any{"type": "done", "actions_executed": executed})
+						return
+					}
+					replanAttempts++
+					log.Printf("[computer-use/agent] step=%d STUCK — re-planning (attempt %d/%d)", step, replanAttempts, maxReplans)
+					sendEvent(map[string]any{"type": "status", "text": fmt.Sprintf("🔄 재계획 (%d/%d)...", replanAttempts, maxReplans)})
+					// 실패 맥락 전달
+					priorHist := []string{
+						fmt.Sprintf("이전 plan (%d sub-goal): %s", len(plan), strings.Join(plan, " → ")),
+						fmt.Sprintf("현재 막힌 sub-goal: %q", plan[subgoalIdx]),
+						fmt.Sprintf("최근 관찰: %s", observation),
+					}
+					plan = runPlanner(agentReq.Prompt, priorHist)
+					subgoalIdx = 0
+					stepsInCurrentSubgoal = 0
+					sendEvent(map[string]any{"type": "plan", "subgoals": plan})
+					// 새 계획을 채팅에 주입
+					rpLines := []string{fmt.Sprintf("[gcp_exec] %s : 🔄 재계획 (%d/%d)", agentReq.Prompt, replanAttempts, maxReplans)}
+					for i, sg := range plan {
+						rpLines = append(rpLines, fmt.Sprintf("  %d. %s", i+1, sg))
+					}
+					go injectOpenClawMessage(strings.Join(rpLines, "\n"))
+					stepHistory = append(stepHistory, stepRecord{
+						Step: step + 1, Observation: observation, Action: "REPLAN", ScreenChanged: screenChanged,
+					})
+					continue
+				}
+			}
+
+			// ── Step C: 완료 판단 (plan 이 전부 끝났을 때만 인정)
+			// plan 을 쓰는 경우 COMPLETE 는 SUBGOAL_DONE 누적으로 결정되므로
+			// 여기서는 plan 이 없는 (legacy) 경우만 COMPLETE 존중.
+			if len(plan) == 0 && strings.Contains(status, "COMPLETE") && !strings.Contains(status, "INCOMPLETE") {
+				log.Printf("[computer-use/agent] vision says COMPLETE at step %d (no-plan mode)", step)
 				imgURL := makeChatScreenshotURL(screenshotB64)
 				completedMsg := fmt.Sprintf("[gcp_exec] %s : 완료\n\n![](%s)", agentReq.Prompt, imgURL)
 				go injectOpenClawMessage(completedMsg)
@@ -5270,6 +5654,23 @@ func (s *Server) StartAdmin() {
 					Step: step + 1, Observation: observation, Action: "wait", ScreenChanged: false,
 				})
 				lastActionSignature = "wait"
+				continue
+			}
+
+			// ── Server-side enforcement: grounding 바인딩 시 `click:X,Y` 금지
+			// vision LMM 이 환각한 픽셀 좌표를 그대로 실행하면 매번 엉뚱한 위치를
+			// 클릭하게 된다. grounding 이 있을 땐 click_element 만 허용하고,
+			// click:X,Y 가 오면 실행하지 않고 다음 step 으로 재시도 (history 에
+			// 위반 기록). 프롬프트도 이 규칙을 명시한다.
+			if groundingEntry != nil && (actionType == "click" || actionType == "double_click" || actionType == "right_click") {
+				log.Printf("[computer-use/agent] step=%d REJECTED %s:%.0f,%.0f — must use click_element when grounding is available",
+					step, actionType, action["x"], action["y"])
+				sendEvent(map[string]any{"type": "status", "text": fmt.Sprintf("⛔ %s:X,Y 거부 — grounding 이 있을 땐 click_element:DESCRIPTION 를 사용해야 합니다", actionType)})
+				stepHistory = append(stepHistory, stepRecord{
+					Step: step + 1, Observation: observation,
+					Action:        "REJECTED_raw_click:grounding_available",
+					ScreenChanged: false,
+				})
 				continue
 			}
 
@@ -5329,10 +5730,12 @@ func (s *Server) StartAdmin() {
 				continue
 			}
 
-			// ── Fuzzy click dedup: 새 click 이 최근 3개 클릭의 ±25px 안이면 동일 의도로 간주
-			//    sig 단순 일치는 (282,231) 과 (280,229) 를 다른 액션으로 보지만,
-			//    실제 LLM 의도는 동일하므로 좌표 거리로 판정한다.
-			if actionType == "click" || actionType == "double_click" || actionType == "right_click" {
+			// ── Fuzzy click dedup: 새 click 이 최근 3개 클릭의 ±25px 안이면 동일 의도로 간주.
+			//    단, 직전 클릭 이후 화면이 "변했다면"(screenChanged=true) 같은 좌표라도
+			//    다른 UI 요소일 가능성이 높으므로 dedup 을 건너뛴다 — 예: Edge welcome
+			//    dialog 가 "Start without your data" → "Confirm and continue" 로 바뀐
+			//    뒤 같은 영역 클릭은 "실패 반복" 이 아니라 연속된 dialog 진행이다.
+			if (actionType == "click" || actionType == "double_click" || actionType == "right_click") && !screenChanged {
 				xRaw, _ := action["x"].(float64)
 				yRaw, _ := action["y"].(float64)
 				cx, cy := int(xRaw), int(yRaw)
@@ -5347,6 +5750,10 @@ func (s *Server) StartAdmin() {
 					stagnationCount++ // fuzzy 차단도 stagnation 으로 친다
 					continue
 				}
+			}
+			// 화면이 바뀌었다면 이전 clickCluster 는 현재와 무관한 과거 UI 의 좌표이므로 리셋.
+			if screenChanged {
+				clickCluster = nil
 			}
 
 			// ── 중복 액션 가드: 직전 서명과 같고 화면이 안 바뀌었다면 실행하지 않고 다음 스텝
