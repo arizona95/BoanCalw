@@ -25,6 +25,13 @@ type InputGateRequest struct {
 	// 비어있으면 하드코딩 안전망 사용 (bootstrap / policy fetch 실패).
 	// 컴파일 에러가 나는 패턴은 무시.
 	G1Patterns []G1PatternRule `json:"g1_patterns,omitempty"`
+
+	// PostCredentialSubstitute — credential gate 통과 후 재평가 시 true.
+	// 이때 G1 의 mode=credential 패턴은 건너뛴다 (이미 치환 완료).
+	// mode=block / redact 패턴은 계속 적용되어 "github pat key" 같은 context
+	// 검사 + G2/G3/DLP 가 substituted text 기준으로 실행되도록 보장한다.
+	// Caller (admin.go) 가 applyCredentialGate 호출 후 이 플래그와 함께 재귀 호출.
+	PostCredentialSubstitute bool `json:"-"`
 }
 
 // G1PatternRule — 정규식 + 매칭 시 동작.
@@ -307,6 +314,13 @@ func evaluateInputGateWithLocal(
 		}
 		for _, rule := range g1Rules {
 			if rule.mode == "redact" {
+				continue
+			}
+			// PostCredentialSubstitute=true 이면 credential mode 패턴은 건너뛴다.
+			// 이미 credential gate 에서 치환 완료 상태. 다시 감지해봤자 placeholder
+			// 를 또 치환하려고 해서 무의미. block 패턴은 계속 적용 (substituted text
+			// 가 "github pat key" 같은 context 금지 문구를 포함하는지 검사).
+			if rule.mode == "credential" && req.PostCredentialSubstitute {
 				continue
 			}
 			if rule.re.MatchString(text) {

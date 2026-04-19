@@ -596,8 +596,9 @@ func (s *Server) callRegistryLLM(ctx context.Context, entry *registryLLM, system
 	if headers["Content-Type"] == "" {
 		headers["Content-Type"] = "application/json"
 	}
-	// G2/G3 가드레일 호출 — 구름 모델(gemma4:31b-cloud 등) 지연 감안 90초
-	respRaw, status, err := s.dispatchLLMRequest(ctx, endpoint, headers, []byte(body), 90*time.Second)
+	// G2/G3 가드레일 호출 — Ollama Cloud (gemma4:31b-cloud 등) cold-start 가
+	// 60-120s 걸려서 90s 면 자주 timeout. 300s 로 늘려 안정화.
+	respRaw, status, err := s.dispatchLLMRequest(ctx, endpoint, headers, []byte(body), 300*time.Second)
 	if err != nil {
 		return nil, err
 	}

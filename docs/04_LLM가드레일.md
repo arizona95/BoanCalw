@@ -13,15 +13,24 @@
 
 ---
 
-## 1. 3 단 게이트 구조
+## 1. 4 단 게이트 체인
 
 ```
-G1 (정규식)        — 모든 사용자 무조건. credential / 위험 패턴 정규식
+Credential Gate (C) — secret (API key/PAT 등) → {{CREDENTIAL:name}} placeholder 로 치환.
+                      등록 안 된 unknown 값은 [REDACTED] + HITL 승인 생성.
+                      여기는 "변환" 전용 — 차단/허용 판정 안 함.
+                      ↓
+G1 (정규식)        — 모든 사용자 무조건. substituted text 에 대해 block/redact 패턴 적용
+                     (credential 패턴은 C 에서 이미 처리했으므로 건너뜀).
+                      ↓
 G2 (헌법 + 보안 LLM) — ask/deny 만. 보안 LLM 이 헌법 기준 판정 (allow / ask / block + reason)
+                      ↓
 G3 (자기진화 wiki)  — ask/deny 만. 보안 LLM 이 과거 결정(HITL log) 50건을 few-shot 학습
                      → 동일 보안 LLM 이 wiki 누적 사례까지 보고 재판정
                      → 결정이 누적되면 G3 가 G1 정규식 / G2 헌법 자동 개정 제안
 ```
+
+**체인 순서가 중요**: C 가 placeholder 로 바꾼 다음에도 substituted text 에 "github pat key" 같은 context 금지 문구가 남아있을 수 있음. 그걸 G1 (block 패턴) / G2 (헌법) / G3 (wiki) 이 순차적으로 다시 검사함. **C 통과 = 자동 allow 아님** — 오히려 C 는 downstream 가드레일이 secret 노출 걱정 없이 context 만 순수히 보도록 해주는 "정제" 단계.
 
 **G2 와 G3 는 같은 보안 LLM 슬롯을 공유** 합니다. 차이는 입력 컨텍스트:
 - G2: `<헌법> + <사용자 입력>`

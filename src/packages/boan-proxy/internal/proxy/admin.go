@@ -1223,12 +1223,28 @@ func (s *Server) StartAdmin() {
 			},
 		)
 		if resp.Action == "credential_required" && text != "" {
+			// Step 1: credential gate — secret → {{CREDENTIAL:name}} 치환 + unknown redact.
 			gateResult := s.applyCredentialGate(ctx, orgID, text, func(keys []string, previews []string, fps []string) string {
 				return createCredentialGateApproval(orgID, keys, previews, fps)
 			})
-			resp = InputGateResponse{Allowed: true, Action: "allow", Tier: "G1+credential", NormalizedText: gateResult.Prompt, Reason: "credential substituted", ApprovalID: gateResult.ApprovalID}
-			if gateResult.HITLRequired {
-				resp.Reason = "credential detected; unknown values redacted, HITL created"
+			// Step 2: substituted text 로 input gate 재평가 — G1 block/redact +
+			// G2 (헌법) + G3 (wiki) + DLP. PostCredentialSubstitute 로 credential
+			// 패턴만 skip (이미 치환 완료).
+			reReq := req
+			reReq.Text = gateResult.Prompt
+			reReq.PostCredentialSubstitute = true
+			resp = evaluateInputGateWithLocal(ctx, s.dlpEng, s.guardrail, s.evaluateGuardrailLocal, orgID, reReq,
+				func(reason string, r InputGateRequest) string {
+					return createInputGateApproval(requester, orgID, reason, r)
+				},
+			)
+			resp.NormalizedText = gateResult.Prompt
+			if gateResult.HITLRequired && resp.ApprovalID == "" {
+				resp.ApprovalID = gateResult.ApprovalID
+			}
+			// 최종 reason 에 credential gate 가 개입했음 표기 (tier 는 재평가 결과 유지).
+			if resp.Reason == "" {
+				resp.Reason = "credential gate passed → downstream allow"
 			}
 		}
 		// Observability trace — tier 와 reason 포함
@@ -1667,21 +1683,33 @@ func (s *Server) StartAdmin() {
 				return createInputGateApproval(sess.Email, sess.OrgID, reason, req)
 			},
 		)
-		// Credential-like input: substitute registered credentials with
-		// {{CREDENTIAL:name}}, redact unknowns, then allow through.
+		// Credential gate: secret → {{CREDENTIAL:name}} 치환 + unknown redact.
+		// 통과 후 substituted text 를 가지고 G1 block/redact + G2 + G3 + DLP 재평가.
+		// 체인: Credential → G1 → G2 → G3 → DLP.
 		if resp.Action == "credential_required" && body.Text != "" {
 			gateResult := s.applyCredentialGate(r.Context(), sess.OrgID, body.Text, func(keys []string, previews []string, fps []string) string {
 				return createCredentialGateApproval(sess.OrgID, keys, previews, fps)
 			})
-			resp = InputGateResponse{
-				Allowed:        true,
-				Action:         "allow",
-				NormalizedText: gateResult.Prompt,
-				Reason:         "credential substituted",
-			}
-			if gateResult.HITLRequired {
-				resp.Reason = "credential detected; unknown values redacted, HITL created"
+			reBody := body
+			reBody.Text = gateResult.Prompt
+			reBody.PostCredentialSubstitute = true
+			resp = evaluateInputGateWithLocal(
+				r.Context(),
+				s.dlpEng,
+				s.guardrail,
+				s.evaluateGuardrailLocal,
+				sess.OrgID,
+				reBody,
+				func(reason string, req InputGateRequest) string {
+					return createInputGateApproval(sess.Email, sess.OrgID, reason, req)
+				},
+			)
+			resp.NormalizedText = gateResult.Prompt
+			if gateResult.HITLRequired && resp.ApprovalID == "" {
 				resp.ApprovalID = gateResult.ApprovalID
+			}
+			if resp.Reason == "" {
+				resp.Reason = "credential gate passed → downstream allow"
 			}
 		}
 		if s.audit != nil {
@@ -4332,6 +4360,9 @@ func (s *Server) StartAdmin() {
 	//   4. 액션 타입별로 UI 반응 대기시간 차등 (type/dialog 유발 키는 더 길게)
 	//   5. Vision LMM 한 번 호출로 OBSERVATION / STATUS / NEXT_ACTION 모두 결정
 	// NDJSON 스트리밍으로 각 단계(스크린샷, AI 응답, 액션 실행 결과)를 실시간 전송
+	// Kill Chain — endpoint detection automated response.
+	s.registerKillChainEndpoints(mux)
+
 	// TEST 모드 전용 endpoint — cfg.TestMode 가 true 일 때만 등록.
 	// (test_endpoints.go) — prod 에서는 TEST 환경변수 미설정 → 등록 자체 안 됨.
 	if s.cfg.TestMode {

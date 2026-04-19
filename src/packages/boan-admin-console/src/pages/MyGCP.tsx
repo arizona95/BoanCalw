@@ -972,6 +972,13 @@ export default function MyGCP({ alwaysActive = false }: MyGCPProps = {}) {
     const target = remoteTarget();
     if (!win || !target) return;
     for (const char of text) {
+      // \n / \r → Enter 키 이벤트로 변환. 안 그러면 keyCode 10/13 의 generic
+      // KeyboardEvent 가 되어 Guacamole client 가 keysym 매핑 못 하고 무시.
+      if (char === "\n" || char === "\r") {
+        dispatchKeyEvent(win, target, "keydown", "Enter");
+        dispatchKeyEvent(win, target, "keyup", "Enter");
+        continue;
+      }
       dispatchKeyEvent(win, target, "keydown", char);
       dispatchKeyEvent(win, target, "keyup", char);
     }
@@ -1072,6 +1079,26 @@ export default function MyGCP({ alwaysActive = false }: MyGCPProps = {}) {
     // event.code로 Enter 판별 — 한글 IME 활성 시 event.key가 "Process"로 오는 버그 대응
     const isEnterCode = event.code === "Enter" || event.code === "NumpadEnter";
     if (event.key === "Enter" || (event.key === "Process" && isEnterCode)) {
+      // Alt+Enter — 줄바꿈 삽입. 옛 "실행" 단축키였는데 computer-use 삭제 후
+      // 명시적 줄바꿈으로 재배정. textarea 는 Alt+Enter 에 기본 newline 동작이
+      // 없어서 직접 cursor 위치에 \n 끼워넣고 selectionStart 갱신.
+      if (event.altKey) {
+        event.preventDefault();
+        const ta = event.currentTarget as HTMLTextAreaElement;
+        const start = ta.selectionStart ?? buffer.length;
+        const end = ta.selectionEnd ?? buffer.length;
+        const next = buffer.slice(0, start) + "\n" + buffer.slice(end);
+        setBuffer(next);
+        // React 렌더 후에 cursor 를 \n 다음으로 이동.
+        window.requestAnimationFrame(() => {
+          if (gateInputRef.current) {
+            gateInputRef.current.value = next;
+            gateInputRef.current.selectionStart = start + 1;
+            gateInputRef.current.selectionEnd = start + 1;
+          }
+        });
+        return;
+      }
       event.preventDefault();
       if (event.key === "Process") return; // IME 조합 중 Enter는 무시
       if (buffer.trim()) {
