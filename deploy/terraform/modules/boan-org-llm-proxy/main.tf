@@ -37,6 +37,11 @@ variable "rate_limit_rpm" {
   default     = "120"
 }
 
+variable "ingress" {
+  description = "Cloud Run ingress mode: INGRESS_TRAFFIC_ALL | INGRESS_TRAFFIC_INTERNAL_ONLY | INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER_AND_CLOUD_RUN"
+  default     = "INGRESS_TRAFFIC_ALL"
+}
+
 resource "google_service_account" "org_llm_proxy" {
   account_id   = "boan-org-llm-proxy"
   display_name = "BoanClaw Org LLM Proxy"
@@ -47,7 +52,7 @@ resource "google_cloud_run_v2_service" "org_llm_proxy" {
   name     = "boan-org-llm-proxy-${var.org_id}"
   location = var.region
   project  = var.project_id
-  ingress  = "INGRESS_TRAFFIC_ALL"
+  ingress  = var.ingress
 
   template {
     service_account = google_service_account.org_llm_proxy.email

@@ -45,11 +45,15 @@ module "logging" {
 }
 
 module "policy_server" {
-  source     = "../../modules/policy-server"
-  project_id = var.project_id
-  region     = var.region
-  org_id     = var.org_id
-  image      = var.policy_server_image
+  source          = "../../modules/policy-server"
+  project_id      = var.project_id
+  region          = var.region
+  org_id          = var.org_id
+  image           = var.policy_server_image
+  org_token       = var.org_token
+  device_pubkeys  = var.device_pubkeys
+  revoked_devices = var.revoked_devices
+  ingress         = var.cloud_run_ingress
 }
 
 module "org_llm_proxy" {
@@ -65,6 +69,7 @@ module "org_llm_proxy" {
   device_pubkeys             = var.device_pubkeys
   revoked_devices            = var.revoked_devices
   rate_limit_rpm             = var.org_llm_proxy_rpm
+  ingress                    = var.cloud_run_ingress
 }
 
 module "credential_gate" {
@@ -74,8 +79,9 @@ module "credential_gate" {
   org_id          = var.org_id
   image           = var.credential_gate_image
   auth_token      = var.credential_gate_auth_token
-  device_pubkeys  = ""
+  device_pubkeys  = var.device_pubkeys
   revoked_devices = var.revoked_devices
+  ingress         = var.cloud_run_ingress
 }
 
 module "admin_console" {

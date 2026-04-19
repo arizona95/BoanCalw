@@ -83,6 +83,19 @@ variable "org_llm_proxy_rpm" {
   default     = "120"
 }
 
+variable "org_token" {
+  description = "Deployment-level bearer token (BOAN_ORG_TOKEN). Local boan-proxy + admin-console present this in Authorization header to /org/* endpoints."
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "cloud_run_ingress" {
+  description = "Cloud Run ingress mode for all 3 services. INGRESS_TRAFFIC_ALL = public; INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER_AND_CLOUD_RUN = LB-only (requires HTTPS LB + Cloud Armor in front)."
+  type        = string
+  default     = "INGRESS_TRAFFIC_ALL"
+}
+
 variable "enable_firebase_hosting" {
   description = "Enable Firebase Hosting resources for admin console"
   type        = bool

@@ -17,6 +17,11 @@ variable "revoked_devices" {
   default     = ""
 }
 
+variable "ingress" {
+  description = "Cloud Run ingress mode: INGRESS_TRAFFIC_ALL | INGRESS_TRAFFIC_INTERNAL_ONLY | INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER_AND_CLOUD_RUN"
+  default     = "INGRESS_TRAFFIC_ALL"
+}
+
 resource "google_service_account" "credential_gate" {
   account_id   = "boan-org-cred-gate"
   display_name = "BoanClaw Org Credential Gate"
@@ -35,7 +40,7 @@ resource "google_cloud_run_v2_service" "credential_gate" {
   name     = "boan-org-credential-gate-${var.org_id}"
   location = var.region
   project  = var.project_id
-  ingress  = "INGRESS_TRAFFIC_ALL"
+  ingress  = var.ingress
 
   template {
     service_account = google_service_account.credential_gate.email

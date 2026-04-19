@@ -3,6 +3,32 @@ variable "region" { default = "asia-northeast3" }
 variable "org_id" {}
 variable "image" { default = "boanclaw/boan-policy-server:latest" }
 
+# Org-level shared bearer token (deployment-level). Sent in Authorization header.
+variable "org_token" {
+  description = "Bearer token (BOAN_ORG_TOKEN) accepted by policy-server. Sensitive."
+  sensitive   = true
+  default     = ""
+}
+
+# Cloud Run ingress mode. ALL (default) = public internet. INTERNAL_LOAD_BALANCER_AND_CLOUD_RUN
+# requires putting an HTTPS LB in front (with Cloud Armor for rate-limit / WAF).
+variable "ingress" {
+  description = "Cloud Run ingress mode: INGRESS_TRAFFIC_ALL | INGRESS_TRAFFIC_INTERNAL_ONLY | INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER_AND_CLOUD_RUN"
+  default     = "INGRESS_TRAFFIC_ALL"
+}
+
+# Trusted device Ed25519 pubkeys (csv, base64). When non-empty, fail-closed:
+# every /org/{id}/v1/* request must present a valid X-Boan-Device-JWT.
+variable "device_pubkeys" {
+  description = "Comma-separated base64 Ed25519 pubkeys of trusted local devices."
+  default     = ""
+}
+
+variable "revoked_devices" {
+  description = "Comma-separated device IDs blocked even if pubkey is trusted."
+  default     = ""
+}
+
 resource "google_service_account" "policy_server" {
   account_id   = "boan-policy-server"
   display_name = "BoanClaw Policy Server"
@@ -39,7 +65,7 @@ resource "google_cloud_run_v2_service" "policy_server" {
   name     = "boan-policy-server-${var.org_id}"
   location = var.region
   project  = var.project_id
-  ingress  = "INGRESS_TRAFFIC_ALL"
+  ingress  = var.ingress
 
   template {
     service_account = google_service_account.policy_server.email
@@ -66,6 +92,18 @@ resource "google_cloud_run_v2_service" "policy_server" {
       env {
         name  = "BOAN_KEY_DIR"
         value = "/etc/boan-policy"
+      }
+      env {
+        name  = "BOAN_ORG_TOKEN"
+        value = var.org_token
+      }
+      env {
+        name  = "BOAN_DEVICE_PUBKEYS"
+        value = var.device_pubkeys
+      }
+      env {
+        name  = "BOAN_REVOKED_DEVICES"
+        value = var.revoked_devices
       }
       volume_mounts {
         name       = "policy-data"

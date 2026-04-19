@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -10,9 +11,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/samsung-sds/boanclaw/boan-policy-server/internal/devicejwt"
 	"github.com/samsung-sds/boanclaw/boan-policy-server/internal/policy"
 	"github.com/samsung-sds/boanclaw/boan-policy-server/internal/signing"
 )
+
+const deviceJWTAudience = "boan-org-cloud"
 
 type Config struct {
 	Listen            string
@@ -25,6 +29,11 @@ type Config struct {
 	WikiLLMURL        string
 	WikiLLMModel      string
 	WikiLLMKey        string
+	// DevicePubKeys — comma-separated base64 Ed25519 pubkeys. When non-empty,
+	// all /org/{id}/v1/* (non-public) requests MUST present a valid device JWT
+	// in X-Boan-Device-JWT header. Absent/invalid → 401. fail-closed.
+	DevicePubKeys  string
+	RevokedDevices string
 }
 
 func LoadConfig() Config {
@@ -43,6 +52,8 @@ func LoadConfig() Config {
 		WikiLLMURL:        env("BOAN_WIKI_LLM_URL", ""),
 		WikiLLMModel:      env("BOAN_WIKI_LLM_MODEL", ""),
 		WikiLLMKey:        env("BOAN_WIKI_LLM_KEY", ""),
+		DevicePubKeys:     env("BOAN_DEVICE_PUBKEYS", ""),
+		RevokedDevices:    env("BOAN_REVOKED_DEVICES", ""),
 	}
 }
 
@@ -55,6 +66,9 @@ type Server struct {
 	trainingLog   *HITLTrainingLog
 	wikiStore     *WikiStore
 	wikiGraph     *policy.WikiGraphStore
+	// devicePubs — parsed Ed25519 pubkeys. Empty → device JWT not required (dev only).
+	devicePubs     []ed25519.PublicKey
+	revokedDevices map[string]struct{}
 }
 
 type checkinRequest struct {
@@ -87,15 +101,28 @@ func New(cfg Config) *Server {
 	if cfg.DataDir != "" {
 		trainingLogPath = cfg.DataDir + "/hitl_training.jsonl"
 	}
+	pubs, err := devicejwt.ParseAllowedPubs(cfg.DevicePubKeys)
+	if err != nil {
+		// fail-closed: refuse to start with malformed pubkeys
+		panic(fmt.Sprintf("BOAN_DEVICE_PUBKEYS parse: %v", err))
+	}
+	revoked := map[string]struct{}{}
+	for _, d := range strings.Split(cfg.RevokedDevices, ",") {
+		if d = strings.TrimSpace(d); d != "" {
+			revoked[d] = struct{}{}
+		}
+	}
 	return &Server{
-		cfg:           cfg,
-		store:         store,
-		signer:        signer,
-		guardrail:     NewGuardrailEvaluator(cfg.GuardrailLLMURL, cfg.GuardrailLLMModel, cfg.GuardrailLLMKey),
-		wikiGuardrail: NewGuardrailEvaluator(cfg.WikiLLMURL, cfg.WikiLLMModel, cfg.WikiLLMKey),
-		trainingLog:   NewHITLTrainingLog(trainingLogPath),
-		wikiStore:     NewWikiStore(cfg.DataDir),
-		wikiGraph:     policy.NewWikiGraphStore(cfg.DataDir),
+		cfg:            cfg,
+		store:          store,
+		signer:         signer,
+		guardrail:      NewGuardrailEvaluator(cfg.GuardrailLLMURL, cfg.GuardrailLLMModel, cfg.GuardrailLLMKey),
+		wikiGuardrail:  NewGuardrailEvaluator(cfg.WikiLLMURL, cfg.WikiLLMModel, cfg.WikiLLMKey),
+		trainingLog:    NewHITLTrainingLog(trainingLogPath),
+		wikiStore:      NewWikiStore(cfg.DataDir),
+		wikiGraph:      policy.NewWikiGraphStore(cfg.DataDir),
+		devicePubs:     pubs,
+		revokedDevices: revoked,
 	}
 }
 
@@ -152,16 +179,42 @@ func (s *Server) Start(ctx context.Context) error {
 	return srv.ListenAndServe()
 }
 
-// requireOrgToken — /org/ 요청에 Bearer 인증 요구.
-// 통과 조건 중 하나:
+// requireOrgToken — /org/ 요청에 Bearer + (옵션) device JWT 인증 요구.
+// 통과 조건:
+//   0. BOAN_DEVICE_PUBKEYS 가 설정된 경우 — X-Boan-Device-JWT 헤더가 있어야 하고
+//      trusted pubkey 로 서명돼 있어야 함. revoked 디바이스 거부. fail-closed.
 //   1. Token == BOAN_ORG_TOKEN (deployment-level, 전체 접근)
 //   2. Token == user.UserToken (해당 조직에 등록된 user, 본인 상태 조회 등 제한된 접근)
-// 둘 다 없으면 401 (fail-closed).
+//
+// device JWT 가 활성화되면 "등록된 디바이스만" 호출 가능 → 외부 스캐너의
+// Cloud Run 요청 폭주를 container 진입 전에 차단 가능 (GFE 에서 차단 안 되고
+// container 에선 차단하지만 최소한 bearer+JWT 둘 다 없으면 빠르게 401 반환).
 func (s *Server) requireOrgToken(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.cfg.OrgToken == "" {
 			http.Error(w, "server not configured: BOAN_ORG_TOKEN unset", http.StatusUnauthorized)
 			return
+		}
+		// 0) device JWT 검증 (활성화된 경우만) — bearer 보다 먼저 확인해서
+		//    JWT 없이 스캐너가 bearer 추측하는 것 자체를 막는다.
+		if len(s.devicePubs) > 0 {
+			jwt := strings.TrimSpace(r.Header.Get("X-Boan-Device-JWT"))
+			if jwt == "" {
+				http.Error(w, "device JWT required (X-Boan-Device-JWT)", http.StatusUnauthorized)
+				return
+			}
+			claims, err := devicejwt.Verify(jwt, s.devicePubs, deviceJWTAudience, 60*time.Second)
+			if err != nil {
+				http.Error(w, "device JWT invalid: "+err.Error(), http.StatusUnauthorized)
+				return
+			}
+			if sub, ok := claims["sub"].(string); ok {
+				if _, blocked := s.revokedDevices[sub]; blocked {
+					http.Error(w, "device revoked", http.StatusForbidden)
+					return
+				}
+				r.Header.Set("X-Boan-Verified-Device", sub)
+			}
 		}
 		auth := r.Header.Get("Authorization")
 		const prefix = "Bearer "
