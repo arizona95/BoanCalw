@@ -5,20 +5,24 @@
 
 ---
 
-## ⚡ 한 줄 설치 (사용자)
+## ⚡ 설치 (사용자)
 
-조직 관리자에게 받은 한 줄 명령을 그대로 실행하세요:
+### 1) BoanClaw 받기
 
 ```bash
-BOAN_ORG_URL="https://boan-policy-server-<org>-xxxxx.run.app" \
-BOAN_ORG_ID="<org>" \
-BOAN_ORG_TOKEN="<token>" \
-bash <(curl -fsSL https://raw.githubusercontent.com/arizona95/BoanCalw/main/install.sh)
+git clone https://github.com/arizona95/BoanCalw.git ~/boanclaw && cd ~/boanclaw && bash install.sh
 ```
 
-설치가 끝나면 브라우저에서 **<http://localhost:19080>** 접속 → SSO 로그인.
+### 2) 브라우저에서 가입 요청
 
-> **조직 관리자(소유자)** 분은 GCP 인프라 배포가 필요합니다 → [`docs/00_관리자_설치.md`](docs/00_관리자_설치.md) 참고.
+설치가 끝나면 **<http://localhost:19080>** 에 자동으로 로그인 화면이 뜹니다.
+**"가입 요청"** 을 눌러서 조직 소유자에게서 받은 **조직서버 URL** + **본인 회사 이메일** 두 가지만 입력하면 끝입니다. 토큰 / 조직 ID 같은 건 입력할 필요 없습니다 — URL 하나로 서버가 알아서 파싱해서 가입 요청을 소유자에게 보냅니다.
+
+### 3) 소유자 승인 → 로그인
+
+소유자가 관리 콘솔에서 승인하면 이메일 SSO 로 로그인 가능합니다.
+
+> **조직 소유자(관리자)** 는 GCP 인프라 배포가 필요합니다 → [`docs/00_관리자_설치.md`](docs/00_관리자_설치.md) 참고.
 
 ### Windows 사용자
 
