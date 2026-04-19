@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { Routes, Route, NavLink, Navigate, useLocation } from "react-router-dom";
 import { AuthProvider, useAuth } from "./auth";
+import { FocusProvider } from "./focusContext";
 import Login from "./pages/Login";
 import Register from "./pages/Register";
 import SelectOrg from "./pages/SelectOrg";
@@ -132,44 +133,38 @@ function Shell() {
   const fullBleed = location.pathname === "/my-boanclaw" || location.pathname === "/my-gcp" || location.pathname === "/wiki-graph";
   // FileManager needs a wider content area — ~1.3x default max-w-7xl
   const wideContent = location.pathname === "/files";
-  const showMyBoanClaw = location.pathname === "/my-boanclaw";
-  const showMyGCP = location.pathname === "/my-gcp";
+  const isUsage = mode === "usage";
+  // 사용모드에서는 두 surface 가 항상 보임. 기본모드에서는 라우트 매칭.
+  const showMyBoanClaw = isUsage || location.pathname === "/my-boanclaw";
+  const showMyGCP = isUsage || location.pathname === "/my-gcp";
   const showPersistentSurface = showMyBoanClaw || showMyGCP;
-
-  // 사용모드(Usage mode): 왼쪽 메뉴판 자리에 BoanClaw 채팅이 영구 표시,
-  // 오른쪽에 Personal Computer(또는 다른 라우트) 가 나란히 보인다.
-  if (mode === "usage") {
-    return (
-      <UsageShell
-        mode={mode}
-        toggleMode={toggleMode}
-        user={user}
-        logout={logout}
-        version={version}
-        updating={updating}
-        triggerUpdate={triggerUpdate}
-      />
-    );
-  }
 
   return (
     <div className="flex h-screen overflow-hidden">
-      <aside className="w-64 flex flex-col bg-boan-900 text-white">
-        <div className="flex items-center gap-2 px-4 py-5 border-b border-white/10">
-          <span className="text-xl font-bold tracking-tight">BoanClaw v0.4</span>
+      {/* 좌측 사이드바 — 모드에 따라 폭/콘텐츠 달라지지만 **DOM 트리는 동일** */}
+      <aside
+        className={`flex flex-col bg-boan-900 text-white border-r border-white/10 transition-[width] duration-150 ${
+          isUsage ? "w-[420px] min-w-[360px]" : "w-64"
+        }`}
+      >
+        <div className={`flex items-center gap-2 border-b border-white/10 flex-shrink-0 ${isUsage ? "px-4 py-3" : "px-4 py-5"}`}>
+          <span className={isUsage ? "text-sm font-bold tracking-tight" : "text-xl font-bold tracking-tight"}>
+            {isUsage ? "BoanClaw" : "BoanClaw v0.4"}
+          </span>
           {version?.current && (
             <span className="text-[10px] text-white/30 font-mono">{version.current}</span>
           )}
           <button
             onClick={toggleMode}
-            title="사용 모드로 전환 — BoanClaw 채팅 + Personal Computer 를 함께 쓰세요"
+            title={isUsage ? "기본 모드로 전환 — 전체 메뉴 다시 보기" : "사용 모드로 전환 — BoanClaw 채팅 + Personal Computer 를 함께 쓰세요"}
             className="ml-auto px-2 py-0.5 text-[10px] bg-white/10 hover:bg-white/20 rounded border border-white/20 text-white/80 hover:text-white font-medium"
           >
-            사용 모드 →
+            {isUsage ? "← 기본 모드" : "사용 모드 →"}
           </button>
         </div>
 
-        <nav className="flex-1 py-4 space-y-1">
+        {/* 기본모드: 내비게이션 / 사용모드: 채팅 자리 (실제 MyBoanClaw 는 아래 공통 영역에서 렌더됨) */}
+        <nav className={`flex-1 py-4 space-y-1 ${isUsage ? "hidden" : "block"}`}>
           {NAV_ITEMS.map((item) => (
             <div key={item.path}>
               {item.separator && <div className="mx-4 my-2 border-t border-white/10" />}
@@ -191,68 +186,98 @@ function Shell() {
           ))}
         </nav>
 
+        {/* 사용모드: 채팅이 들어갈 빈 슬롯 (MyBoanClaw 는 아래 portal 위치에서 렌더해서
+            position 고정) — 여기서는 공간만 잡아주고 chat iframe 이 flex-1 로 채움 */}
+        <div
+          id="boan-chat-slot"
+          className={`flex-1 min-h-0 bg-white text-gray-900 ${isUsage ? "block" : "hidden"}`}
+        />
+
         {user && (
-          <div className="px-4 py-3 border-t border-white/10 space-y-2">
+          <div className={`border-t border-white/10 flex-shrink-0 ${isUsage ? "px-3 py-2 flex items-center gap-2" : "px-4 py-3 space-y-2"}`}>
             {version?.update_available && !updating && (
               <button
                 onClick={triggerUpdate}
-                className="w-full px-2 py-1.5 bg-emerald-500/20 border border-emerald-400/30 rounded-lg text-xs text-emerald-300 hover:bg-emerald-500/30 transition-colors text-left"
+                className={isUsage
+                  ? "px-2 py-1 bg-emerald-500/20 border border-emerald-400/30 rounded text-[10px] text-emerald-300 hover:bg-emerald-500/30"
+                  : "w-full px-2 py-1.5 bg-emerald-500/20 border border-emerald-400/30 rounded-lg text-xs text-emerald-300 hover:bg-emerald-500/30 transition-colors text-left"}
+                title={isUsage ? `NEW ${version.latest} — 업데이트` : undefined}
               >
-                <span className="font-medium">NEW {version.latest}</span>
-                <span className="block text-emerald-400/60 text-[10px] mt-0.5">
-                  업데이트 하시겠습니까?
-                </span>
+                {isUsage ? "NEW" : (
+                  <>
+                    <span className="font-medium">NEW {version.latest}</span>
+                    <span className="block text-emerald-400/60 text-[10px] mt-0.5">업데이트 하시겠습니까?</span>
+                  </>
+                )}
               </button>
             )}
             {updating && (
-              <div className="px-2 py-1.5 bg-yellow-500/20 border border-yellow-400/30 rounded-lg text-xs text-yellow-300 animate-pulse">
-                업데이트 중... 잠시 후 새로고침됩니다
-              </div>
+              isUsage
+                ? <span className="text-[10px] text-yellow-300 animate-pulse">업데이트 중...</span>
+                : <div className="px-2 py-1.5 bg-yellow-500/20 border border-yellow-400/30 rounded-lg text-xs text-yellow-300 animate-pulse">업데이트 중... 잠시 후 새로고침됩니다</div>
             )}
             {user.org_id && (
-              <div className="flex items-center gap-1.5 px-2 py-1 bg-white/5 rounded-lg">
-                <span className="text-white/40 text-xs">🏢</span>
-                <span className="text-xs text-white/60 font-mono truncate">{user.org_id}</span>
-              </div>
+              isUsage
+                ? <span className="text-[10px] text-white/50 font-mono truncate">🏢 {user.org_id}</span>
+                : (
+                  <div className="flex items-center gap-1.5 px-2 py-1 bg-white/5 rounded-lg">
+                    <span className="text-white/40 text-xs">🏢</span>
+                    <span className="text-xs text-white/60 font-mono truncate">{user.org_id}</span>
+                  </div>
+                )
             )}
-            <div className="flex items-center gap-2">
-              <div className="w-7 h-7 rounded-full bg-boan-600 flex items-center justify-center text-xs font-bold flex-shrink-0">
-                {(user.name ?? user.email ?? "?")[0].toUpperCase()}
+            {isUsage ? (
+              <div className="flex-1 min-w-0 flex items-center gap-2 ml-auto justify-end">
+                <span className="text-xs text-white/70 truncate">{user.name ?? user.email}</span>
+                <span className={`text-[10px] px-1.5 py-0.5 rounded-full ${ROLE_COLOR[user.role] ?? ROLE_COLOR.user}`}>
+                  {user.role_label}
+                </span>
+                <button
+                  onClick={logout}
+                  title="로그아웃"
+                  className="text-[10px] text-white/40 hover:text-white/80 px-1.5 py-0.5 rounded hover:bg-white/10"
+                >
+                  ↗
+                </button>
               </div>
-              <div className="flex-1 min-w-0">
-                <p className="text-xs text-white truncate">{user.name ?? user.email}</p>
-                <div className="flex items-center gap-1.5">
-                  <span className={`text-xs px-1.5 py-0.5 rounded-full font-medium ${ROLE_COLOR[user.role] ?? ROLE_COLOR.user}`}>
-                    {user.role_label}
-                  </span>
-                  <button
-                    onClick={logout}
-                    title="로그아웃"
-                    className="text-xs text-white/40 hover:text-white/80 px-1.5 py-0.5 rounded hover:bg-white/10"
-                  >
-                    ↗ 로그아웃
-                  </button>
+            ) : (
+              <div className="flex items-center gap-2">
+                <div className="w-7 h-7 rounded-full bg-boan-600 flex items-center justify-center text-xs font-bold flex-shrink-0">
+                  {(user.name ?? user.email ?? "?")[0].toUpperCase()}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="text-xs text-white truncate">{user.name ?? user.email}</p>
+                  <div className="flex items-center gap-1.5">
+                    <span className={`text-xs px-1.5 py-0.5 rounded-full font-medium ${ROLE_COLOR[user.role] ?? ROLE_COLOR.user}`}>
+                      {user.role_label}
+                    </span>
+                    <button
+                      onClick={logout}
+                      title="로그아웃"
+                      className="text-xs text-white/40 hover:text-white/80 px-1.5 py-0.5 rounded hover:bg-white/10"
+                    >
+                      ↗ 로그아웃
+                    </button>
+                  </div>
                 </div>
               </div>
-            </div>
+            )}
           </div>
         )}
       </aside>
 
-      <main className={`flex-1 bg-gradient-to-br from-boan-200 via-boan-100 to-white ${fullBleed ? "overflow-hidden flex flex-col" : "overflow-y-auto"}`}>
-        {!canEdit && !fullBleed && (
+      <main className={`flex-1 bg-gradient-to-br from-boan-200 via-boan-100 to-white ${fullBleed || isUsage ? "overflow-hidden flex flex-col" : "overflow-y-auto"}`}>
+        {!canEdit && !fullBleed && !isUsage && (
           <div className="bg-yellow-50 border-b border-yellow-200 px-6 py-2 text-xs text-yellow-800 flex items-center gap-2">
             <span>👁️</span>
             <span>읽기 전용 모드입니다. 설정을 변경하려면 소유자 권한이 필요합니다.</span>
           </div>
         )}
-        <div className={fullBleed ? "flex-1 flex min-h-0" : wideContent ? "p-8 w-full max-w-[104rem] mx-auto" : "p-8 max-w-7xl mx-auto"}>
-          {/* 일반 라우트 */}
-          <div className={showPersistentSurface ? "hidden" : fullBleed ? "h-full flex-1 flex min-w-0" : "h-full"}>
+        <div className={isUsage ? "flex-1 flex min-h-0" : fullBleed ? "flex-1 flex min-h-0" : wideContent ? "p-8 w-full max-w-[104rem] mx-auto" : "p-8 max-w-7xl mx-auto"}>
+          {/* 일반 라우트 — 사용모드이거나 my-boanclaw/my-gcp 일 땐 숨김 */}
+          <div className={isUsage || showPersistentSurface ? "hidden" : fullBleed ? "h-full flex-1 flex min-w-0" : "h-full"}>
             <Routes>
-              {/* default landing — owner: LLM Registry, viewer: org-overview */}
               <Route path="/" element={canEdit ? <Navigate to="/llm-registry" replace /> : <Navigate to="/org-overview" replace />} />
-              {/* legacy /dashboard URL */}
               <Route path="/dashboard" element={<Navigate to="/llm-registry" replace />} />
               <Route path="/org" element={canEdit ? <OrgSettings /> : <ReadOnly />} />
               <Route path="/org-overview" element={<OrgOverview />} />
@@ -260,15 +285,12 @@ function Shell() {
               <Route path="/policies" element={<Navigate to="/gateway" replace />} />
               <Route path="/llm-registry" element={<LLMRegistry />} />
               <Route path="/audit" element={<Navigate to="/observability" replace />} />
-              {/* Credentials — 모든 사용자가 본인 자격증명을 등록/관리할 수 있어야 함 */}
               <Route path="/credentials" element={<Credentials />} />
               <Route path="/approvals" element={canEdit ? <Approvals /> : <ReadOnly />} />
               <Route path="/observability" element={canEdit ? <Observability /> : <ReadOnly />} />
               <Route path="/wiki" element={<Navigate to="/wiki-graph" replace />} />
               <Route path="/wiki-graph" element={canEdit ? <WikiGraph /> : <ReadOnly />} />
-              {/* Authorization = Users + SSO 통합 */}
               <Route path="/authorization" element={canEdit ? <Authorization /> : <ReadOnly />} />
-              {/* legacy redirects so 직접 URL bookmark 도 동작 */}
               <Route path="/users" element={<Navigate to="/authorization?tab=users" replace />} />
               <Route path="/sso" element={<Navigate to="/authorization?tab=sso" replace />} />
               <Route path="/files" element={<FileManager />} />
@@ -277,106 +299,45 @@ function Shell() {
             </Routes>
           </div>
 
-          {/* 내 BoanClaw - 항상 마운트, 탭 전환시 hide/show */}
-          <div
-            aria-hidden={!showMyBoanClaw}
-            className={`flex-1 h-full relative ${showMyBoanClaw ? "flex" : "hidden"}`}
-          >
-            <MyBoanClaw />
-          </div>
-
-          {/* 내 작업 컴퓨터 - 항상 마운트, 탭 전환시 hide/show → RDP 세션 유지 */}
+          {/* 내 작업 컴퓨터 — 항상 동일 DOM 위치에 마운트. 사용모드/라우트 전환은
+              className 변경만 → RDP + Guacamole 세션 유지. 재연결 없음. */}
           <div
             aria-hidden={!showMyGCP}
             className={`flex-1 h-full relative ${showMyGCP ? "flex" : "hidden"}`}
           >
-            <MyGCP />
+            <MyGCP alwaysActive />
           </div>
         </div>
       </main>
-    </div>
-  );
-}
 
-type UsageShellProps = {
-  mode: Mode;
-  toggleMode: () => void;
-  user: ReturnType<typeof useAuth>["user"];
-  logout: ReturnType<typeof useAuth>["logout"];
-  version: { current: string; latest: string; update_available: boolean } | null;
-  updating: boolean;
-  triggerUpdate: () => void;
-};
+      {/*
+        MyBoanClaw — 앱 전체에서 유일한 인스턴스. 위치는 mode 에 따라 CSS 로만
+        바뀐다. DOM 트리의 position 은 고정 → iframe 이 unmount 안 되므로
+        세션 재연결 없음.
 
-// UsageShell — 사용모드 전용 레이아웃.
-//
-// 구조:  [채팅 사이드바 (왼쪽, 고정 폭) ] | [ Personal Computer 메인 영역 (오른쪽) ]
-//
-// 의도: 운영자가 BoanClaw 채팅을 보면서 동시에 원격 PC 를 조작할 수 있게
-// 두 surface 를 항상 나란히 띄운다. 탭 전환 없음.
-function UsageShell({ toggleMode, user, logout, version, updating, triggerUpdate }: UsageShellProps) {
-  return (
-    <div className="flex h-screen overflow-hidden">
-      {/* 채팅 사이드바 — 왼쪽 */}
-      <aside className="w-[420px] min-w-[360px] flex flex-col bg-boan-900 text-white border-r border-white/10">
-        <div className="flex items-center gap-2 px-4 py-3 border-b border-white/10 flex-shrink-0">
-          <span className="text-sm font-bold tracking-tight">BoanClaw</span>
-          {version?.current && (
-            <span className="text-[10px] text-white/30 font-mono">{version.current}</span>
-          )}
-          <button
-            onClick={toggleMode}
-            title="기본 모드로 전환 — 전체 메뉴 다시 보기"
-            className="ml-auto px-2 py-0.5 text-[10px] bg-white/10 hover:bg-white/20 rounded border border-white/20 text-white/80 hover:text-white font-medium"
-          >
-            ← 기본 모드
-          </button>
-        </div>
-
-        {/* 채팅창 (영구 마운트) — embedded 플래그로 iframe auto-focus 비활성 */}
-        <div className="flex-1 min-h-0 bg-white text-gray-900">
-          <MyBoanClaw embedded />
-        </div>
-
-        {/* 하단 사용자 정보 */}
-        {user && (
-          <div className="px-3 py-2 border-t border-white/10 flex items-center gap-2 flex-shrink-0">
-            {version?.update_available && !updating && (
-              <button
-                onClick={triggerUpdate}
-                className="px-2 py-1 bg-emerald-500/20 border border-emerald-400/30 rounded text-[10px] text-emerald-300 hover:bg-emerald-500/30"
-                title={`NEW ${version.latest} — 업데이트`}
-              >
-                NEW
-              </button>
-            )}
-            {updating && (
-              <span className="text-[10px] text-yellow-300 animate-pulse">업데이트 중...</span>
-            )}
-            {user.org_id && (
-              <span className="text-[10px] text-white/50 font-mono truncate">🏢 {user.org_id}</span>
-            )}
-            <div className="flex-1 min-w-0 flex items-center gap-2 ml-auto justify-end">
-              <span className="text-xs text-white/70 truncate">{user.name ?? user.email}</span>
-              <span className={`text-[10px] px-1.5 py-0.5 rounded-full ${ROLE_COLOR[user.role] ?? ROLE_COLOR.user}`}>
-                {user.role_label}
-              </span>
-              <button
-                onClick={logout}
-                title="로그아웃"
-                className="text-[10px] text-white/40 hover:text-white/80 px-1.5 py-0.5 rounded hover:bg-white/10"
-              >
-                ↗
-              </button>
-            </div>
-          </div>
-        )}
-      </aside>
-
-      {/* Personal Computer (영구 마운트 → RDP 세션 유지) */}
-      <main className="flex-1 flex flex-col bg-gradient-to-br from-boan-200 via-boan-100 to-white overflow-hidden">
-        <MyGCP alwaysActive />
-      </main>
+        기본모드 + /my-boanclaw 라우트:
+          사이드바 오른쪽 전체 영역에 오버레이
+        사용모드:
+          왼쪽 사이드바 내부의 chat-slot 위치에 오버레이 (top/bottom offset 으로
+          사이드바 헤더 + 푸터 피함)
+        그 외: hidden
+      */}
+      <div
+        aria-hidden={!showMyBoanClaw}
+        className={(() => {
+          if (isUsage) {
+            // 사이드바 폭 420 + 헤더 ~48 + 푸터 ~40 offset
+            return "fixed z-10 left-0 top-[48px] bottom-[40px] w-[420px] min-w-[360px]";
+          }
+          if (location.pathname === "/my-boanclaw") {
+            // 사이드바 오른쪽 전체
+            return "fixed z-10 left-64 right-0 top-0 bottom-0";
+          }
+          return "hidden";
+        })()}
+      >
+        <MyBoanClaw embedded={isUsage} />
+      </div>
     </div>
   );
 }
@@ -394,12 +355,14 @@ function ReadOnly() {
 export default function App() {
   return (
     <AuthProvider>
-      <Routes>
-        <Route path="/login" element={<LoginGuard />} />
-        <Route path="/register" element={<RegisterGuard />} />
-        <Route path="/select-org" element={<SelectOrg />} />
-        <Route path="/*" element={<Shell />} />
-      </Routes>
+      <FocusProvider>
+        <Routes>
+          <Route path="/login" element={<LoginGuard />} />
+          <Route path="/register" element={<RegisterGuard />} />
+          <Route path="/select-org" element={<SelectOrg />} />
+          <Route path="/*" element={<Shell />} />
+        </Routes>
+      </FocusProvider>
     </AuthProvider>
   );
 }

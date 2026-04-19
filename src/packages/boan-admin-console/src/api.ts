@@ -517,6 +517,20 @@ export const wikiGraphApi = {
       errors?: string[];
       llm_raw?: string;
     }>("/api/wiki-graph/skill/find_ambiguous", { method: "POST", body: "{}" }),
+  // Agentic chat loop — 단일 primary dialog 에서 다음 턴 + action 결정.
+  chatContinue: (dialog_id: string) =>
+    request<{
+      action: "ASK_FOLLOWUP" | "REQUEST_LABEL_FIX" | "UPDATE_WIKI" | "CLOSE_AND_FIND_NEW";
+      message: string;
+      examples?: string[];
+      wiki_update?: unknown;
+      label_fix_target?: Record<string, unknown>;
+      errors?: string[];
+      llm_raw?: string;
+    }>("/api/wiki-graph/skill/chat_continue", {
+      method: "POST",
+      body: JSON.stringify({ dialog_id }),
+    }),
 };
 
 export const workstationApi = {
@@ -524,6 +538,17 @@ export const workstationApi = {
     fetch("/api/workstation/me", { credentials: "include" }).then((r) => {
       if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
       return r.json() as Promise<PersonalWorkstation>;
+    }),
+  // owner 의 현재 VM 으로부터 GCP Custom Image 생성. 10-20분 소요. 시작 즉시 ACK 반환.
+  captureGoldenImage: (name?: string, description?: string) =>
+    fetch("/api/admin/workstation/image", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name ?? "", description: description ?? "" }),
+    }).then(async (r) => {
+      if (!r.ok) throw new Error(`${r.status} ${(await r.text()) || r.statusText}`);
+      return r.json() as Promise<{ status: string; job_id: string; hint: string }>;
     }),
 };
 

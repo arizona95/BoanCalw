@@ -264,9 +264,13 @@ export default function WikiGraph() {
   const [newDef, setNewDef] = useState("");
   const [newContent, setNewContent] = useState("");
 
-  // Dialog 탭
-  const [activeDialog, setActiveDialog] = useState<string | null>(null);
+  // Dialog 탭 — single primary thread
   const [userMsg, setUserMsg] = useState("");
+  const [lastAction, setLastAction] = useState<{
+    action: string;
+    message: string;
+    wiki_update?: unknown;
+  } | null>(null);
 
   // find_ambiguous
   const [finding, setFinding] = useState(false);
@@ -369,7 +373,6 @@ export default function WikiGraph() {
       const created = res.dialogs_created?.length ?? 0;
       if (created > 0) {
         setMsg(`🔍 LLM 이 ${res.questions_found}개 질문 생성 (대화 ${created}개)`);
-        setActiveDialog(res.dialogs_created[0]);
       } else if (res.errors?.length) {
         setErr(
           `LLM 응답 폐기 (모델 크기 한계 가능성). 상세: ${res.errors.join(" | ")}`,
@@ -385,12 +388,8 @@ export default function WikiGraph() {
     }
   };
 
-  const appendTurn = async (dialogID: string, role: "human" | "llm", content: string) => {
-    const d = dialogs.find((x) => x.id === dialogID);
-    if (!d) return;
-    await wikiGraphApi.upsertDialog({ ...d, turns: [...d.turns, { role, content }] });
-    await loadRaw();
-  };
+  // (legacy helper — 유지만, 현재 chat_continue 로 대체됨)
+  void dialogs; void userMsg; void setUserMsg; void lastAction; void setLastAction;
 
   return (
     <div className="flex-1 h-full flex flex-col min-h-0 min-w-0">
@@ -576,116 +575,95 @@ export default function WikiGraph() {
         )}
 
         {/* ── Dialog 탭 ── */}
-        {tab === "dialog" && (
-          <div className="flex-1 min-h-0 flex gap-3">
-            {/* 좌: 질문 목록 */}
-            <div className="w-80 bg-white border border-gray-200 rounded-xl flex flex-col overflow-hidden">
-              <div className="px-3 py-2 border-b border-gray-100 flex flex-col gap-1.5">
-                <button
-                  onClick={findAmbiguous}
-                  disabled={finding}
-                  className="text-xs px-3 py-2 bg-boan-600 text-white rounded hover:bg-boan-700 disabled:opacity-40 font-medium"
-                >
-                  {finding ? "🔍 LLM 분석 중..." : "🔍 LLM 이 애매한 경계 찾기"}
-                </button>
-                <div className="text-[10px] text-gray-500 leading-tight">
-                  최근 approve/deny 결정에서 경계가 애매한 케이스를 LLM 이 찾아 질문을 생성.
+        {tab === "dialog" && (() => {
+          // ── 단일 통합 대화 (primary) ────────────────────────────
+          // 여러 dialog 이 있으면 첫 번째를 primary 로 사용 (나머지는 backend
+          // CLOSE_AND_FIND_NEW 가 자동 정리). UI 는 하나의 연속된 chat.
+          const primary = dialogs[0];
+          return (
+            <div className="flex-1 min-h-0 flex flex-col bg-white border border-gray-200 rounded-xl overflow-hidden">
+              <div className="px-4 py-2 border-b border-gray-100 flex items-center justify-between">
+                <div className="min-w-0">
+                  <div className="text-sm font-medium text-gray-700">💬 G3 Wiki 대화 (agentic loop)</div>
+                  <div className="text-[10px] text-gray-500">
+                    {primary
+                      ? `${primary.turns.length} 턴 · LLM 이 애매한 경계를 찾고 당신 답변을 반영 → wiki 진화. ASK / FIX / UPDATE / CLOSE 분기`
+                      : "대화 없음. 아래 버튼으로 첫 질문을 LLM 이 생성하도록 요청"}
+                  </div>
                 </div>
-              </div>
-              <div className="flex-1 overflow-y-auto divide-y divide-gray-100">
-                {dialogs.length === 0 ? (
-                  <div className="p-4 text-center text-xs text-gray-400">
-                    질문 없음. 위 버튼으로 LLM 을 실행하세요.
-                  </div>
-                ) : dialogs.map((d) => (
-                  <div
-                    key={d.id}
-                    className={`group relative w-full flex ${
-                      activeDialog === d.id ? "bg-boan-50" : "hover:bg-gray-50"
-                    }`}
+                {!primary && (
+                  <button
+                    onClick={findAmbiguous}
+                    disabled={finding}
+                    className="text-xs px-3 py-1.5 bg-boan-600 text-white rounded hover:bg-boan-700 disabled:opacity-40 font-medium"
                   >
-                    <button
-                      onClick={() => setActiveDialog(d.id ?? null)}
-                      className="flex-1 text-left px-3 py-2 min-w-0"
-                    >
-                      <div className="text-xs font-medium text-gray-700 truncate">
-                        {d.turns[0]?.content.slice(0, 40) ?? "(비어있음)"}
-                      </div>
-                      <div className="text-[10px] text-gray-400 mt-0.5 flex justify-between">
-                        <span>{d.turns.length} 턴</span>
-                        <span>{d.started_at ? new Date(d.started_at).toLocaleString("ko-KR", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : ""}</span>
-                      </div>
-                    </button>
-                    <button
-                      title="대화 삭제"
-                      onClick={async () => {
-                        if (!d.id) return;
-                        if (!confirm("이 대화를 삭제할까요?")) return;
-                        await wikiGraphApi.deleteDialog(d.id);
-                        if (activeDialog === d.id) setActiveDialog(null);
-                        await loadRaw();
-                      }}
-                      className="opacity-0 group-hover:opacity-100 px-2 text-xs text-gray-400 hover:text-red-600 transition-opacity"
-                    >
-                      🗑
-                    </button>
-                  </div>
-                ))}
+                    {finding ? "🔍 분석 중..." : "🔍 첫 질문 생성"}
+                  </button>
+                )}
               </div>
-            </div>
-            {/* 우: 대화 본문 */}
-            <div className="flex-1 bg-white border border-gray-200 rounded-xl flex flex-col overflow-hidden min-h-0">
-              {activeDialog ? (() => {
-                const d = dialogs.find((x) => x.id === activeDialog);
-                if (!d) return <div className="p-6 text-sm text-gray-400">대화를 찾을 수 없음</div>;
-                return <>
-                  <div className="px-4 py-2 border-b border-gray-100 flex items-center justify-between">
-                    <div className="text-xs text-gray-500">
-                      {d.turns.length} 턴 · 시작 {d.started_at ? new Date(d.started_at).toLocaleString("ko-KR") : "-"}
-                    </div>
-                    <button
-                      onClick={() => runAgenticIterate(d.id!)}
-                      disabled={iterating}
-                      className="text-[11px] px-2.5 py-1 bg-purple-600 text-white rounded hover:bg-purple-700 disabled:opacity-40"
-                      title="이 대화를 LLM 이 읽고 wiki 편집"
-                    >
-                      🤖 이 답변 반영 (agentic)
-                    </button>
+              <div className="flex-1 overflow-y-auto p-4 space-y-3">
+                {primary ? (
+                  primary.turns.map((t, i) => <DialogTurnView key={i} turn={t} />)
+                ) : (
+                  <div className="h-full flex items-center justify-center text-sm text-gray-400 text-center">
+                    아직 대화가 없습니다. 상단 '🔍 첫 질문 생성' 을 누르면 LLM 이 과거 decision 중 애매한 경계를 찾아 첫 질문을 만듭니다.
                   </div>
-                  <div className="flex-1 overflow-y-auto p-4 space-y-3">
-                    {d.turns.map((t, i) => <DialogTurnView key={i} turn={t} />)}
-                  </div>
-                  <div className="border-t border-gray-100 p-3 flex gap-2">
-                    <textarea
-                      value={userMsg}
-                      onChange={(e) => setUserMsg(e.target.value)}
-                      placeholder="사용자 답변..."
-                      rows={2}
-                      className="flex-1 text-xs border border-gray-200 rounded px-2 py-1 resize-none"
-                    />
-                    <button
-                      disabled={!userMsg.trim()}
-                      onClick={async () => {
-                        const answer = userMsg.trim();
-                        await appendTurn(d.id!, "human", answer);
-                        setUserMsg("");
-                        // Auto-run agentic_iterate on this dialog
-                        runAgenticIterate(d.id!);
-                      }}
-                      className="text-xs px-4 py-1 bg-boan-600 text-white rounded hover:bg-boan-700 disabled:opacity-40 self-end"
-                    >
-                      답변 + 🤖
-                    </button>
-                  </div>
-                </>;
-              })() : (
-                <div className="flex-1 flex items-center justify-center text-sm text-gray-400 text-center px-6">
-                  좌측에서 질문을 선택하세요.
+                )}
+                {iterating && <div className="text-[10px] text-gray-400 italic">LLM 이 응답 생성 중...</div>}
+              </div>
+              {primary && (
+                <div className="border-t border-gray-100 p-3 flex gap-2">
+                  <textarea
+                    value={userMsg}
+                    onChange={(e) => setUserMsg(e.target.value)}
+                    placeholder="답변 입력... (LLM 이 action 결정: ASK / FIX / UPDATE / CLOSE_AND_NEW)"
+                    rows={2}
+                    className="flex-1 text-xs border border-gray-200 rounded px-2 py-1 resize-none"
+                  />
+                  <button
+                    disabled={!userMsg.trim() || iterating}
+                    onClick={async () => {
+                      const answer = userMsg.trim();
+                      setUserMsg("");
+                      setIterating(true);
+                      try {
+                        await wikiGraphApi.upsertDialog({ ...primary, turns: [...primary.turns, { role: "human", content: answer }] });
+                        const res = await wikiGraphApi.chatContinue(primary.id!);
+                        setLastAction(res);
+                        await loadRaw();
+                        if (res.action === "UPDATE_WIKI") await loadNodes();
+                      } catch (e) {
+                        setErr(e instanceof Error ? e.message : String(e));
+                      } finally {
+                        setIterating(false);
+                      }
+                    }}
+                    className="text-xs px-4 py-1 bg-boan-600 text-white rounded hover:bg-boan-700 disabled:opacity-40 self-end"
+                  >
+                    답변 + 🤖
+                  </button>
+                </div>
+              )}
+              {lastAction && (
+                <div className="border-t border-gray-100 px-4 py-2 text-[11px] flex items-center gap-3 bg-gray-50">
+                  <span className="font-medium text-gray-600">마지막 action:</span>
+                  <span className={`px-2 py-0.5 rounded ${
+                    lastAction.action === "UPDATE_WIKI" ? "bg-green-100 text-green-700" :
+                    lastAction.action === "CLOSE_AND_FIND_NEW" ? "bg-blue-100 text-blue-700" :
+                    lastAction.action === "REQUEST_LABEL_FIX" ? "bg-orange-100 text-orange-700" :
+                    "bg-gray-100 text-gray-600"
+                  }`}>{lastAction.action}</span>
+                  {(() => {
+                    const wu = lastAction.wiki_update as { actions_planned?: number } | null | undefined;
+                    if (!wu || typeof wu !== "object") return null;
+                    const n: number = wu.actions_planned ?? 0;
+                    return <span className="text-gray-500">wiki 변경 {n} 건</span>;
+                  })()}
                 </div>
               )}
             </div>
-          </div>
-        )}
+          );
+        })()}
       </div>
     </div>
   );

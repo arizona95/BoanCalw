@@ -10,6 +10,7 @@ import {
   type PersonalWorkstation,
 } from "../api";
 import { useAuth } from "../auth";
+import { useFocusTarget } from "../focusContext";
 
 const IMMEDIATE_KEYS = new Set([
   "Tab",
@@ -46,7 +47,13 @@ type MyGCPProps = {
 export default function MyGCP({ alwaysActive = false }: MyGCPProps = {}) {
   const location = useLocation();
   const { user } = useAuth();
+  const { focusTarget, focusTargetRef, setFocusTarget } = useFocusTarget();
   const isActive = alwaysActive || location.pathname === "/my-gcp";
+  // 기본(non-usage) 모드에서는 focus 주인이 항상 "gcp".
+  // 사용모드에서는 focusTargetRef 를 동기적으로 읽어 판단 — React 리렌더보다
+  // 먼저 blur / RAF 가 실행되는 race 를 피하기 위함.
+  const ownsFocusNow = () => (alwaysActive ? focusTargetRef.current === "gcp" : true);
+  const ownsFocus = alwaysActive ? focusTarget === "gcp" : true;
   const [workstation, setWorkstation] = useState<PersonalWorkstation | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -63,7 +70,6 @@ export default function MyGCP({ alwaysActive = false }: MyGCPProps = {}) {
   const remoteClipboardCleanupRef = useRef<(() => void) | null>(null);
   const capturedRemoteClipboardRef = useRef("");
   const bridgeRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const allowExternalFocusUntilRef = useRef(0);
   const isSubmittingRef = useRef(false);
   const ignoreNextChangeRef = useRef(false);
 
@@ -71,10 +77,14 @@ export default function MyGCP({ alwaysActive = false }: MyGCPProps = {}) {
   const screenTitle = useMemo(() => stateTitle(workstation?.status ?? ""), [workstation?.status]);
 
   const focusGateInput = () => {
+    // ref 로 실시간 체크 — closure 의 stale ownsFocus 가 아니라 RAF/timeout
+    // 이 실제로 실행되는 시점의 focusTarget 을 본다.
+    if (!ownsFocusNow()) return;
     gateInputRef.current?.focus({ preventScroll: true });
   };
 
   const focusGateInputDeferred = () => {
+    if (!ownsFocusNow()) return;
     window.requestAnimationFrame(() => focusGateInput());
   };
 
@@ -342,30 +352,14 @@ export default function MyGCP({ alwaysActive = false }: MyGCPProps = {}) {
   }, [isActive, remoteReady]);
 
   useEffect(() => {
-    if (!isActive) return;
-
-    const allowOpenClawFocus = () => {
-      allowExternalFocusUntilRef.current = Date.now() + 400;
-    };
-
-    window.addEventListener("boan:allow-openclaw-focus", allowOpenClawFocus as EventListener);
-    return () => {
-      window.removeEventListener("boan:allow-openclaw-focus", allowOpenClawFocus as EventListener);
-    };
-  }, [isActive]);
-
-  useEffect(() => {
     if (!isActive || !remoteReady) return;
+    if (!ownsFocus) return;
 
+    // focusTarget === "gcp" 일 때만 창 복귀 시 gate input 복구.
     const handleVisibilityChange = () => {
-      if (document.visibilityState === "visible") {
-        focusGateInputDeferred();
-      }
+      if (document.visibilityState === "visible") focusGateInputDeferred();
     };
-
-    const handleWindowFocus = () => {
-      focusGateInputDeferred();
-    };
+    const handleWindowFocus = () => focusGateInputDeferred();
 
     document.addEventListener("visibilitychange", handleVisibilityChange);
     window.addEventListener("focus", handleWindowFocus);
@@ -373,7 +367,12 @@ export default function MyGCP({ alwaysActive = false }: MyGCPProps = {}) {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       window.removeEventListener("focus", handleWindowFocus);
     };
-  }, [isActive, remoteReady]);
+  }, [isActive, remoteReady, ownsFocus]);
+
+  // focusTarget 이 "gcp" 로 돌아오면 즉시 gate input 복구.
+  useEffect(() => {
+    if (ownsFocus && isActive && remoteReady) focusGateInputDeferred();
+  }, [ownsFocus, isActive, remoteReady]);
 
   useEffect(() => {
     return () => {
@@ -1444,7 +1443,10 @@ export default function MyGCP({ alwaysActive = false }: MyGCPProps = {}) {
 
   const handleTextareaBlur = (_event: FocusEvent<HTMLTextAreaElement>) => {
     if (!isActive || !remoteReady) return;
-    if (Date.now() < allowExternalFocusUntilRef.current) return;
+    // blur 가 먼저 터지고 focusin(IFRAME) 이 직후에 발생해 focusTarget="boanclaw"
+    // 로 바뀌는 타이밍이 있다. focusGateInputDeferred 내부에서 ref 기반으로
+    // 재확인하므로, RAF 가 실제로 실행되는 시점에는 이미 "boanclaw" 로 바뀌어
+    // 있어 early return 된다.
     focusGateInputDeferred();
   };
 
@@ -1480,8 +1482,8 @@ export default function MyGCP({ alwaysActive = false }: MyGCPProps = {}) {
               onPointerDown={(event) => {
                 event.preventDefault();
                 forwardPointerEvent(event);
-                // 채팅 패널에서 GCP로 돌아올 때 gate 포커스 복구
-                // (mousedown 포워딩 이후 비동기로 실행해야 Guacamole가 클릭을 정상 처리)
+                // GCP 쪽을 누르면 focus 주인을 "gcp" 로 선언.
+                setFocusTarget("gcp");
                 window.setTimeout(focusGateInput, 0);
               }}
               onPointerUp={(event) => {

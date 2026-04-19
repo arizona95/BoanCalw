@@ -1,4 +1,76 @@
 import { useEffect, useState } from "react";
+import { orgSettingsApi, workstationApi } from "../api";
+
+// GoldenImagePanel — owner 전용. 현재 등록된 골든 이미지 URI 표시 + "내 VM 을
+// 골든 이미지로 굽기" 버튼. 버튼 누르면 /api/admin/workstation/image 호출 →
+// 백엔드가 VM 정지 → Custom Image 생성 → VM 재시작 (약 10-20분 소요).
+// 이후 신규 사용자 VM 은 이 이미지로 프로비저닝되어 관리자가 설치해둔
+// 파일 / 폴더 / endpoint agent 가 그대로 들어있음.
+function GoldenImagePanel() {
+  const [uri, setUri] = useState<string>("");
+  const [capturedAt, setCapturedAt] = useState<string>("");
+  const [source, setSource] = useState<string>("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string>("");
+
+  const refresh = () => {
+    orgSettingsApi.get()
+      .then((rec) => {
+        const s = (rec?.settings ?? {}) as Record<string, unknown>;
+        setUri(typeof s.golden_image_uri === "string" ? s.golden_image_uri : "");
+        setCapturedAt(typeof s.golden_image_captured_at === "string" ? s.golden_image_captured_at : "");
+        setSource(typeof s.golden_image_source_instance === "string" ? s.golden_image_source_instance : "");
+      })
+      .catch(() => undefined);
+  };
+  useEffect(() => { refresh(); const t = setInterval(refresh, 15_000); return () => clearInterval(t); }, []);
+
+  const capture = async () => {
+    if (!confirm("현재 본인(소유자) VM 을 Custom Image 로 스냅샷합니다.\nVM 이 10-20분간 재부팅되며 그 동안 Personal Computer 를 쓸 수 없습니다. 계속할까요?")) return;
+    setBusy(true); setMsg("");
+    try {
+      const r = await workstationApi.captureGoldenImage();
+      setMsg(`✓ 시작됨 (job=${r.job_id}) — ${r.hint}`);
+      // 15초 뒤 자동 refresh
+      setTimeout(refresh, 15_000);
+    } catch (e) {
+      setMsg(`✗ 실패: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="mb-6 rounded-xl border border-indigo-200 bg-indigo-50 p-4">
+      <div className="flex items-start justify-between gap-4">
+        <div className="flex-1 min-w-0">
+          <h2 className="text-sm font-semibold text-indigo-900">🧊 골든 이미지 (신규 사용자 VM 템플릿)</h2>
+          {uri ? (
+            <div className="mt-2 text-xs text-indigo-800 space-y-0.5">
+              <div><span className="text-indigo-500">이미지:</span> <code className="bg-white px-1 rounded">{uri}</code></div>
+              {capturedAt && <div><span className="text-indigo-500">생성:</span> {new Date(capturedAt).toLocaleString("ko-KR")}</div>}
+              {source && <div><span className="text-indigo-500">원본:</span> <code className="bg-white px-1 rounded">{source}</code></div>}
+              <div className="mt-1 text-[11px] text-indigo-600">신규 사용자 VM 은 이 이미지로 프로비저닝됩니다.</div>
+            </div>
+          ) : (
+            <p className="mt-2 text-xs text-indigo-700">
+              아직 등록된 골든 이미지가 없습니다. 본인 VM 에 기본 파일 / 폴더 / endpoint agent 를 세팅한 뒤 "굽기" 버튼을 누르면 그 상태로 스냅샷됩니다.
+            </p>
+          )}
+        </div>
+        <button
+          onClick={capture}
+          disabled={busy}
+          className="shrink-0 px-3 py-2 rounded-lg bg-indigo-600 text-white text-xs font-medium hover:bg-indigo-700 disabled:opacity-50"
+          title="내 VM 을 GCP Custom Image 로 스냅샷 (약 10-20분)"
+        >
+          {busy ? "요청 중..." : uri ? "🔁 다시 굽기" : "🧊 내 VM 굽기"}
+        </button>
+      </div>
+      {msg && <div className="mt-2 text-xs text-indigo-900 bg-white border border-indigo-200 rounded px-2 py-1">{msg}</div>}
+    </div>
+  );
+}
 
 interface UserRow {
   email: string;
@@ -65,6 +137,7 @@ export default function Users() {
 
   return (
     <div className="p-6 max-w-5xl">
+      <GoldenImagePanel />
       <div className="flex items-center justify-between mb-6">
         <h1 className="text-xl font-bold text-gray-800">
           사용자 관리
