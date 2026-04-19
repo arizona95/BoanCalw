@@ -74,7 +74,6 @@ type Config struct {
 	GuacamolePassword         string        `json:"guacamole_password"`
 	GuacamoleBasePath         string        `json:"guacamole_base_path"`
 	OpenClawGatewayToken      string        `json:"openclaw_gateway_token"`
-	ComputerUseURL            string        `json:"computer_use_url"`
 	RDPTransferRoot           string        `json:"rdp_transfer_root"`
 }
 
@@ -103,7 +102,7 @@ func Load() (*Config, error) {
 		CredentialFilterURL:       env("BOAN_CREDENTIAL_FILTER_URL", "http://boan-credential-filter:8082"),
 		OrgLLMProxyURL:            env("BOAN_ORG_LLM_PROXY_URL", "http://boan-org-llm-proxy:8091"),
 		OrgLLMProxyToken:          env("BOAN_ORG_LLM_PROXY_AUTH_TOKEN", ""),
-		OrgLLMProxyBypassHosts:    env("BOAN_ORG_LLM_PROXY_BYPASS_HOSTS", "boan-grounding,localhost,127.0.0.1,boan-llm-registry,boan-credential-filter,boan-policy-server,boan-guacamole,boan-computer-use,boan-sandbox,boan-proxy"),
+		OrgLLMProxyBypassHosts:    env("BOAN_ORG_LLM_PROXY_BYPASS_HOSTS", "localhost,127.0.0.1,boan-llm-registry,boan-credential-filter,boan-policy-server,boan-guacamole,boan-sandbox,boan-proxy"),
 		DeviceKeyPath:             env("BOAN_DEVICE_KEY_PATH", "/data/boan-device/identity.json"),
 		OAuthClientID:             env("BOAN_OAUTH_CLIENT_ID", ""),
 		OAuthClientSecret:         env("BOAN_OAUTH_CLIENT_SECRET", ""),
@@ -141,7 +140,6 @@ func Load() (*Config, error) {
 		GuacamolePassword:         env("BOAN_GUACAMOLE_PASSWORD", ""),
 		GuacamoleBasePath:         env("BOAN_GUACAMOLE_BASE_PATH", "/remote/"),
 		OpenClawGatewayToken:      env("BOAN_OPENCLAW_GATEWAY_TOKEN", "boan-openclaw-local"),
-		ComputerUseURL:            env("BOAN_COMPUTER_USE_URL", "http://boan-computer-use:8090"),
 		RDPTransferRoot:           env("BOAN_RDP_TRANSFER_ROOT", "/data/rdp-transfer"),
 	}
 

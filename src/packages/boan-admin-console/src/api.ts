@@ -189,11 +189,11 @@ export const registryApi = {
     request<LLMEntry>(`${REGISTRY_BASE}/v1/llms/${name}/bind-security-lmm`, {
       method: "POST",
     }),
-  bindRole: (name: string, role: "chat" | "vision" | "grounding" | "g2" | "g3") =>
+  bindRole: (name: string, role: "chat" | "g2" | "g3") =>
     request<{ status: string; name: string; role: string }>(`${REGISTRY_BASE}/v1/llms/${name}/bind-role/${role}`, {
       method: "POST",
     }),
-  unbindRole: (name: string, role: "chat" | "vision" | "grounding" | "g2" | "g3") =>
+  unbindRole: (name: string, role: "chat" | "g2" | "g3") =>
     request<{ status: string; name: string; role: string }>(`${REGISTRY_BASE}/v1/llms/${name}/unbind-role/${role}`, {
       method: "POST",
     }),

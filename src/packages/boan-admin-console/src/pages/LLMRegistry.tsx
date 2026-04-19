@@ -219,7 +219,7 @@ export default function LLMRegistry() {
     }
   };
 
-  const handleBindRole = async (name: string, role: "chat" | "vision" | "grounding" | "g2" | "g3") => {
+  const handleBindRole = async (name: string, role: "chat" | "g2" | "g3") => {
     setError(null);
     try {
       await registryApi.bindRole(name, role);
@@ -230,7 +230,7 @@ export default function LLMRegistry() {
     }
   };
 
-  const handleUnbindRole = async (name: string, role: "chat" | "vision" | "grounding" | "g2" | "g3") => {
+  const handleUnbindRole = async (name: string, role: "chat" | "g2" | "g3") => {
     setError(null);
     try {
       await registryApi.unbindRole(name, role);
@@ -512,8 +512,6 @@ export default function LLMRegistry() {
                   <th className="text-left px-4 py-3 font-medium text-gray-500">상태</th>
                   <th className="text-left px-4 py-3 font-medium text-gray-500">키</th>
                   <th className="text-center px-2 py-3 font-medium text-blue-600">CHAT</th>
-                  <th className="text-center px-2 py-3 font-medium text-purple-600">VISION</th>
-                  <th className="text-center px-2 py-3 font-medium text-pink-600" title="GUI grounding (자연어 → 픽셀 좌표)">GUI</th>
                   <th className="text-center px-2 py-3 font-medium text-amber-600">G2</th>
                   <th className="text-center px-2 py-3 font-medium text-green-600">G3</th>
                   <th className="text-right px-4 py-3 font-medium text-gray-500">액션</th>
@@ -526,12 +524,10 @@ export default function LLMRegistry() {
                   // 새 역할 추가 시 이 lookup 에 색상을 명시해야 bundle 에 포함됨.
                   const ROLE_BG: Record<string, string> = {
                     chat: "bg-blue-500",
-                    vision: "bg-purple-500",
-                    grounding: "bg-pink-500",
                     g2: "bg-amber-500",
                     g3: "bg-green-500",
                   };
-                  const RoleCell = ({ role }: { role: "chat" | "vision" | "grounding" | "g2" | "g3" }) => {
+                  const RoleCell = ({ role }: { role: "chat" | "g2" | "g3" }) => {
                     const isBound = llm.roles?.includes(role) ?? false;
                     const boundClass = ROLE_BG[role] ?? "bg-gray-500";
                     return (
@@ -567,8 +563,6 @@ export default function LLMRegistry() {
                         )}
                       </td>
                       <RoleCell role="chat" />
-                      <RoleCell role="vision" />
-                      <RoleCell role="grounding" />
                       <RoleCell role="g2" />
                       <RoleCell role="g3" />
                       <td className="px-4 py-3 text-right">

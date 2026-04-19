@@ -181,7 +181,7 @@ services:
       - BOAN_LLM_REGISTRY_URL=http://boan-llm-registry:8086
       - BOAN_ORG_LLM_PROXY_URL=http://boan-org-llm-proxy:8091
       - BOAN_ORG_LLM_PROXY_AUTH_TOKEN=${BOAN_ORG_LLM_PROXY_AUTH_TOKEN:-boan-org-llm-proxy-local}
-      - BOAN_ORG_LLM_PROXY_BYPASS_HOSTS=boan-grounding,localhost,127.0.0.1,boan-llm-registry,boan-credential-filter,boan-policy-server,boan-guacamole,boan-computer-use,boan-sandbox,boan-proxy,boan-audit-agent,boan-agent
+      - BOAN_ORG_LLM_PROXY_BYPASS_HOSTS=localhost,127.0.0.1,boan-llm-registry,boan-credential-filter,boan-policy-server,boan-guacamole,boan-sandbox,boan-proxy,boan-audit-agent,boan-agent
       - BOAN_OTEL_ENDPOINT=http://boan-audit-agent:8084
       - BOAN_USER_DATA_DIR=/data/users
       - BOAN_MOUNT_ROOT=/home/boan/Desktop/boanclaw
@@ -206,18 +206,6 @@ services:
       timeout: 5s
       retries: 3
 
-  boan-computer-use:
-    build:
-      context: src/packages/boan-computer-use
-    ports:
-      - "8090:8090"
-    networks: [boanclaw]
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8090/healthz"]
-      interval: 15s
-      timeout: 10s
-      retries: 3
-
   boan-admin-console:
     build:
       context: src/packages/boan-admin-console
@@ -230,54 +218,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-
-  # ── boan-grounding ────────────────────────────────────────────────────────
-  # GUI element grounding 전용 vLLM 서버. 자연어 ("the X close button on Notepad")
-  # → 픽셀 좌표 (x, y) 변환만 담당. boan-proxy 의 computer-use agent 가 click 결정 시
-  # http://boan-grounding:8000/v1/chat/completions 호출.
-  #
-  # 모델은 LLM Registry 에서 "grounding" 역할로 바인딩되어야 활성화됨.
-  #
-  # 사용 모델: osunlp/UGround-V1-2B (Qwen2-VL 베이스, BF16 ~4GB VRAM)
-  #   • ScreenSpot-Pro 26.6% / ScreenSpot-v2 77.1% (Mobile-Text 94%, Desktop-Text 92%)
-  #   • 현재 OS-Atlas-Base-7B (18.9%) 대비 40% 향상
-  # 모델 교체: command 의 --model 만 바꾸고 컨테이너 재시작.
-  # 호스트 nvidia driver 가 CUDA 12.9+ 지원하면 vllm/vllm-openai:latest + Tongyi-MAI/MAI-UI-2B
-  #   (ScreenSpot-Pro 57.4%) 로 업그레이드 가능. 현재는 driver CUDA 12.4 라 v0.8.5.
-  #
-  # 요구사항: host 에 nvidia-container-toolkit (이미 됨).
-  boan-grounding:
-    image: vllm/vllm-openai:v0.8.5
-    command:
-      - "--model=osunlp/UGround-V1-2B"
-      - "--served-model-name=grounding"
-      - "--host=0.0.0.0"
-      - "--port=8000"
-      - "--dtype=bfloat16"
-      - "--max-model-len=4096"
-      - "--gpu-memory-utilization=0.85"
-      - "--trust-remote-code"
-      - "--enforce-eager"
-    environment:
-      - HF_HUB_ENABLE_HF_TRANSFER=1
-    volumes:
-      - boan-hf-cache:/root/.cache/huggingface
-    networks: [boanclaw]
-    ipc: host
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/v1/models', timeout=5)"]
-      interval: 30s
-      timeout: 10s
-      retries: 30   # 첫 모델 다운로드 시간 고려: 30 * 30s = 15분
-      start_period: 60s
-    restart: unless-stopped
 
   boan-sandbox:
     build:
@@ -296,8 +236,8 @@ services:
       - TEST=true
       - HTTP_PROXY=http://localhost:18080
       - HTTPS_PROXY=http://localhost:18080
-      - NO_PROXY=localhost,127.0.0.1,boan-proxy,boan-policy-server,boan-guacamole,boan-audit-agent,boan-credential-filter,boan-llm-registry,boan-whitelist-proxy,boan-computer-use,boan-org-llm-proxy,boan-grounding,.run.app
-      - no_proxy=localhost,127.0.0.1,boan-proxy,boan-policy-server,boan-guacamole,boan-audit-agent,boan-credential-filter,boan-llm-registry,boan-whitelist-proxy,boan-computer-use,boan-org-llm-proxy,boan-grounding,.run.app
+      - NO_PROXY=localhost,127.0.0.1,boan-proxy,boan-policy-server,boan-guacamole,boan-audit-agent,boan-credential-filter,boan-llm-registry,boan-whitelist-proxy,boan-org-llm-proxy,.run.app
+      - no_proxy=localhost,127.0.0.1,boan-proxy,boan-policy-server,boan-guacamole,boan-audit-agent,boan-credential-filter,boan-llm-registry,boan-whitelist-proxy,boan-org-llm-proxy,.run.app
       - BOAN_PROXY_ADMIN=http://localhost:18081
       - BOAN_SESSION_ID=dev-session-001
       - BOAN_ONECLI_CRED_FILTER_URL=http://boan-credential-filter:8082
@@ -318,7 +258,7 @@ services:
       # 싶으면 host env 에서 BOAN_ORG_LLM_PROXY_URL=http://boan-org-llm-proxy:8091 로 override.
       - BOAN_ORG_LLM_PROXY_URL=${BOAN_ORG_LLM_PROXY_URL:-https://boan-org-llm-proxy-sds-corp-3avhtf4kka-du.a.run.app}
       - BOAN_ORG_LLM_PROXY_AUTH_TOKEN=${BOAN_ORG_LLM_PROXY_AUTH_TOKEN:-boan-org-llm-proxy-local}
-      - BOAN_ORG_LLM_PROXY_BYPASS_HOSTS=boan-grounding,localhost,127.0.0.1,boan-llm-registry,boan-credential-filter,boan-policy-server,boan-guacamole,boan-computer-use,boan-sandbox,boan-proxy,boan-audit-agent,boan-agent
+      - BOAN_ORG_LLM_PROXY_BYPASS_HOSTS=localhost,127.0.0.1,boan-llm-registry,boan-credential-filter,boan-policy-server,boan-guacamole,boan-sandbox,boan-proxy,boan-audit-agent,boan-agent
       # P3: device identity (Ed25519 keypair). 최초 기동 시 /etc/boan-device/identity.json 자동 생성.
       - BOAN_DEVICE_KEY_PATH=/data/boan-device/identity.json
       - BOAN_USER_DATA_DIR=/data/users
@@ -360,7 +300,7 @@ services:
       - ${BOAN_INSTALL_DIR:-.}/.boanclaw-latest:/app/.boanclaw-latest:ro
       - /tmp/boanclaw-triggers:/app/triggers
     networks: [boanclaw]
-    depends_on: [boan-policy-server, boan-audit-agent, boan-guacamole, boan-computer-use, boan-credential-filter, boan-org-llm-proxy]
+    depends_on: [boan-policy-server, boan-audit-agent, boan-guacamole, boan-credential-filter, boan-org-llm-proxy]
 
   # ─────────────────────────────────────────────────────────────────────
   # Wazuh manager — 조직 EDR 중앙 서버.
@@ -434,6 +374,5 @@ volumes:
   boan-user-data:
   boan-rdp-transfer:
   boan-device-key:  # P3: Ed25519 device identity (private key)
-  boan-hf-cache:    # vLLM 의 HuggingFace 모델 캐시 (재시작 시 재다운로드 회피)
   # Wazuh alert 로그 — Fluent Bit 가 tail 해야 하므로 share.
   boan-wazuh-logs:
