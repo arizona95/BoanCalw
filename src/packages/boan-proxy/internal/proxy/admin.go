@@ -3523,7 +3523,76 @@ func (s *Server) StartAdmin() {
 				json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
 				return
 			}
-			json.NewEncoder(w).Encode(res)
+
+			// ── Part B: UPDATE_WIKI 후 "큰 변화" 이면 자동 개정 제안 체크 ──
+			// actions_planned >= 2 (2 개 이상 노드 변경) 을 임계치로 잡음.
+			// 조건 맞으면 background goroutine 으로 policy-server 에 propose-amendment
+			// + propose-g1-amendment 호출. 결과가 있으면 approvalsStore 에 pending
+			// 으로 쌓이고, 응답에 pending_amendment_check 플래그로 UI 에 알림.
+			pendingAmend := []string{}
+			if res.Action == "UPDATE_WIKI" && res.WikiUpdate != nil && res.WikiUpdate.ActionsPlanned >= 2 {
+				// 동기 호출 — 너무 오래 걸리면 chat_continue 응답 지연될 수 있으나
+				// propose-amendment 는 LLM 1 회 호출이라 5-10 초. 응답에 결과를
+				// 담아서 UI 가 바로 "Approvals 확인" 배지 보이게 함.
+				orgClient := s.orgs.ClientFor(orgID)
+				if prop, perr := orgClient.ProposeAmendment(orgID); perr == nil {
+					if diff, _ := prop["diff"].(string); strings.TrimSpace(diff) != "" {
+						reasoning, _ := prop["reasoning"].(string)
+						id := fmt.Sprintf("apr-%s", randomMachineID()[:12])
+						approvalsMu.Lock()
+						approvalsStore = append(approvalsStore, map[string]any{
+							"id":          id,
+							"sessionId":   "constitution",
+							"command":     "constitution-amendment:review",
+							"args":        []string{"diff=" + diff, "reasoning=" + reasoning},
+							"requester":   "g3-wiki-chat-auto",
+							"org_id":      orgID,
+							"requestedAt": time.Now().UTC().Format(time.RFC3339),
+							"status":      "pending",
+						})
+						approvalsMu.Unlock()
+						pendingAmend = append(pendingAmend, "constitution:"+id)
+					}
+				} else {
+					log.Printf("[chat_continue auto-amendment] ProposeAmendment failed: %v", perr)
+				}
+				if prop, perr := orgClient.ProposeG1Amendment(orgID); perr == nil {
+					if diff, _ := prop["diff"].(string); strings.TrimSpace(diff) != "" {
+						reasoning, _ := prop["reasoning"].(string)
+						id := fmt.Sprintf("apr-%s", randomMachineID()[:12])
+						approvalsMu.Lock()
+						approvalsStore = append(approvalsStore, map[string]any{
+							"id":          id,
+							"sessionId":   "g1-patterns",
+							"command":     "g1-amendment:review",
+							"args":        []string{"diff=" + diff, "reasoning=" + reasoning},
+							"requester":   "g3-wiki-chat-auto",
+							"org_id":      orgID,
+							"requestedAt": time.Now().UTC().Format(time.RFC3339),
+							"status":      "pending",
+						})
+						approvalsMu.Unlock()
+						pendingAmend = append(pendingAmend, "g1:"+id)
+					}
+				} else {
+					log.Printf("[chat_continue auto-amendment] ProposeG1Amendment failed: %v", perr)
+				}
+			}
+
+			// 응답에 pending_amendment 필드 얹어서 UI 가 배지 표시할 수 있게.
+			resEnvelope := map[string]any{
+				"action":           res.Action,
+				"message":          res.Message,
+				"examples":         res.Examples,
+				"wiki_update":      res.WikiUpdate,
+				"label_fix_target": res.LabelFixTarget,
+				"llm_raw":          res.LLMRaw,
+				"errors":           res.Errors,
+			}
+			if len(pendingAmend) > 0 {
+				resEnvelope["pending_amendment"] = pendingAmend
+			}
+			json.NewEncoder(w).Encode(resEnvelope)
 			return
 		}
 

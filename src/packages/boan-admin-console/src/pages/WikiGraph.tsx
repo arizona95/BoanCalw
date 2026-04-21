@@ -271,6 +271,7 @@ export default function WikiGraph() {
     message: string;
     wiki_update?: unknown;
     label_fix_target?: Record<string, unknown>;
+    pending_amendment?: string[];
   } | null>(null);
 
   // find_ambiguous
@@ -672,6 +673,26 @@ export default function WikiGraph() {
                   }}
                   onDismiss={() => setLastAction(null)}
                 />
+              )}
+              {/* UPDATE_WIKI 후 큰 변경 — 자동 개정 제안이 Approvals 에 등록됨 */}
+              {lastAction && Array.isArray(lastAction.pending_amendment) && lastAction.pending_amendment.length > 0 && (
+                <div className="mx-4 my-3 rounded-lg border-2 border-blue-300 bg-blue-50 p-3 text-xs">
+                  <div className="font-semibold text-blue-800 mb-1">
+                    🔔 Wiki 변경이 커서 자동 개정 제안을 생성했습니다
+                  </div>
+                  <div className="text-blue-700 mb-2">
+                    G1 (정규식) / G2 (헌법) 개정 diff 가 <strong>Approvals 탭</strong> 에 pending 으로 등록됐습니다.
+                    내용 확인 후 수락하면 정책 버전 ++.
+                  </div>
+                  <div className="flex gap-1 flex-wrap text-[10px] font-mono">
+                    {lastAction.pending_amendment.map((id, i) => (
+                      <span key={i} className="px-2 py-0.5 rounded bg-blue-200 text-blue-900">{id}</span>
+                    ))}
+                  </div>
+                  <a href="/approvals" className="mt-2 inline-block text-xs text-blue-700 underline">
+                    → Approvals 탭 열기
+                  </a>
+                </div>
               )}
             </div>
           );

@@ -527,6 +527,7 @@ export const wikiGraphApi = {
       label_fix_target?: Record<string, unknown>;
       errors?: string[];
       llm_raw?: string;
+      pending_amendment?: string[];
     }>("/api/wiki-graph/skill/chat_continue", {
       method: "POST",
       body: JSON.stringify({ dialog_id }),
