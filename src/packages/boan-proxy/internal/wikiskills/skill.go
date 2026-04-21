@@ -145,6 +145,18 @@ func (c *GraphClient) CreateEdge(ctx context.Context, e Edge) (*Edge, error) {
 func (c *GraphClient) AppendDecision(ctx context.Context, d Decision) error {
 	return c.call(ctx, "POST", "decisions", d, nil)
 }
+
+// UpdateDecisionLabel — HITL label-fix 승인 시 사용. id 로 찾아서 decision 필드
+// (approve/deny) 만 바꿈. 반환: 수정 후 Decision.
+func (c *GraphClient) UpdateDecisionLabel(ctx context.Context, id, newLabel, reason string) (*Decision, error) {
+	var out Decision
+	body := map[string]any{"decision": newLabel, "reason": reason}
+	err := c.call(ctx, "PATCH", "decisions/"+id, body, &out)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
 func (c *GraphClient) DeleteNode(ctx context.Context, id string) error {
 	return c.call(ctx, "DELETE", "nodes/"+id, nil, nil)
 }
@@ -956,38 +968,59 @@ func RunChatContinue(ctx context.Context, gc *GraphClient, llm LLMConfig, dialog
 		fmt.Fprintf(&nodeSummary, "  - %s (path=%s): %s\n", n.ID, n.Path, n.Definition)
 	}
 
+	// 최근 decision 30건 — LLM 이 "이 규칙과 충돌하는 과거 결정" 을 능동적으로
+	// 스캔해서 REQUEST_LABEL_FIX 를 제안할 수 있게 함. 사용자가 지적하지 않아도.
+	decisions, _ := gc.ListDecisions(ctx, 30)
+	var decSummary strings.Builder
+	for _, d := range decisions {
+		txt := strings.TrimSpace(d.Input)
+		if len(txt) > 80 {
+			txt = txt[:80] + "..."
+		}
+		fmt.Fprintf(&decSummary, "  - [%s] %q (id=%s)\n", d.Decision, txt, d.ID)
+	}
+
 	system := "You are the organization's guardrail wiki curator. You are having an ongoing " +
 		"clarification conversation with the admin. The admin just answered your previous " +
 		"question. Decide the NEXT action based on the conversation so far.\n\n" +
 		"You MUST pick ONE of these 4 actions:\n" +
 		"  1. ASK_FOLLOWUP       — the answer is good but something is still unclear.\n" +
 		"                          Ask ONE concrete follow-up question.\n" +
-		"  2. REQUEST_LABEL_FIX  — you believe one of the cited past decisions was mislabeled\n" +
-		"                          (e.g. admin approved something that actually contradicts the\n" +
-		"                          rule they just stated). Flag it for human re-review.\n" +
+		"  2. REQUEST_LABEL_FIX  — ★PROACTIVE★: scan 'RECENT DECISIONS' list yourself. If any\n" +
+		"                          past decision contradicts the rule that was just clarified\n" +
+		"                          (e.g. something was approved but the new rule says it should\n" +
+		"                          be deny), flag it. **You must ASK, not apply.** Phrase your\n" +
+		"                          message as a question with Accept/Reject framing, e.g.:\n" +
+		"                          \"'X' 결정이 방금 확립된 기준과 어긋나 보입니다. deny 로\n" +
+		"                           고치는 게 맞을까요? (아래 Accept/Reject 버튼 클릭)\"\n" +
+		"                          Do NOT write '고치겠습니다' or anything that implies the LLM\n" +
+		"                          already applied the fix — user decides by clicking the button.\n" +
 		"  3. UPDATE_WIKI        — the conversation reached a clear, actionable rule.\n" +
 		"                          Ready to update the wiki. (The server will run agentic_iterate\n" +
 		"                          right after to apply the edits.)\n" +
 		"  4. CLOSE_AND_FIND_NEW — the current topic is fully understood AND wiki is already\n" +
-		"                          up to date. Move on: end this topic and (the server will then\n" +
-		"                          invoke find_ambiguous to surface the next boundary case).\n\n" +
+		"                          up to date AND no suspect past decisions remain. Move on.\n\n" +
+		"DECISION PRIORITY (when multiple criteria match):\n" +
+		"  Whenever you successfully 'UPDATE_WIKI' in a previous turn, **the next turn should\n" +
+		"  first look for REQUEST_LABEL_FIX candidates** in RECENT DECISIONS before choosing\n" +
+		"  CLOSE_AND_FIND_NEW. That way admin gets to accept/reject relabeling proactively.\n\n" +
 		"Reply with STRICT JSON ONLY, no markdown, no code fence:\n" +
 		"{\n" +
 		"  \"action\": \"ASK_FOLLOWUP|REQUEST_LABEL_FIX|UPDATE_WIKI|CLOSE_AND_FIND_NEW\",\n" +
-		"  \"message\": \"<your next reply to the admin in Korean, 1-3 sentences>\",\n" +
+		"  \"message\": \"<Korean reply, 1-3 sentences — question form for REQUEST_LABEL_FIX>\",\n" +
 		"  \"examples\": [\"(optional) supporting bullet\"],\n" +
-		"  \"label_fix\": { \"decision_text\": \"...\", \"current_label\": \"approve|deny\", \"suggested_label\": \"...\", \"reason\": \"...\" }\n" +
+		"  \"label_fix\": { \"decision_id\": \"<id from RECENT DECISIONS>\", \"decision_text\": \"<exact text>\", \"current_label\": \"approve|deny\", \"suggested_label\": \"approve|deny\", \"reason\": \"<why this violates the new rule>\" }\n" +
 		"}\n\n" +
 		"Rules:\n" +
 		"  • Korean replies. Short, natural conversational tone.\n" +
 		"  • REQUEST_LABEL_FIX 일 때만 label_fix 필드 작성. 아니면 생략.\n" +
+		"  • label_fix.decision_id MUST exactly match an id from RECENT DECISIONS.\n" +
 		"  • 단일 answer 로 규칙 명확해졌으면 UPDATE_WIKI 선택 (연속으로 질문만 계속 하지 말 것).\n" +
-		"  • UPDATE_WIKI 직후 자연스러운 턴: 다음 호출에서 LLM 이 wiki 갱신 결과 보고 CLOSE_AND_FIND_NEW 선택 기대.\n" +
-		"  • CLOSE_AND_FIND_NEW 선택 시 message 는 '이 부분은 이해했습니다. 다음 주제로 넘어갈게요' 같은 마무리.\n"
+		"  • CLOSE_AND_FIND_NEW 는 REQUEST_LABEL_FIX 후보가 없을 때만.\n"
 
-	user := fmt.Sprintf("=== CURRENT WIKI (first 20 nodes) ===\n%s\n\n=== CONVERSATION SO FAR ===\n%s\n\n"+
-		"Decide the next action and reply.",
-		nodeSummary.String(), convo.String())
+	user := fmt.Sprintf("=== CURRENT WIKI (first 20 nodes) ===\n%s\n\n=== RECENT DECISIONS (last 30) ===\n%s\n\n=== CONVERSATION SO FAR ===\n%s\n\n"+
+		"Decide the next action and reply. If 대화에서 새로 확립된 규칙과 어긋나는 과거 결정이 있다면, CLOSE_AND_FIND_NEW 로 넘어가기 전에 REQUEST_LABEL_FIX 로 제안하세요.",
+		nodeSummary.String(), decSummary.String(), convo.String())
 
 	raw, err := callLLM(ctx, llm, system, user)
 	if err != nil {

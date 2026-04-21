@@ -293,6 +293,8 @@ func (s *Server) handleOrg(w http.ResponseWriter, r *http.Request) {
 		s.wgListDecisions(w, r, orgID)
 	case rest == "v1/wiki-graph/decisions" && r.Method == http.MethodPost:
 		s.wgAppendDecision(w, r, orgID)
+	case strings.HasPrefix(rest, "v1/wiki-graph/decisions/") && r.Method == http.MethodPatch:
+		s.wgUpdateDecision(w, r, orgID, strings.TrimPrefix(rest, "v1/wiki-graph/decisions/"))
 	case rest == "v1/wiki-graph/dialogs" && r.Method == http.MethodGet:
 		s.wgListDialogs(w, r, orgID)
 	case rest == "v1/wiki-graph/dialogs" && r.Method == http.MethodPost:

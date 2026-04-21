@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/samsung-sds/boanclaw/boan-policy-server/internal/policy"
 )
@@ -206,6 +207,32 @@ func (s *Server) wgAppendDecision(w http.ResponseWriter, r *http.Request, orgID 
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(body)
+}
+
+// wgUpdateDecision — HITL label-fix 승인 후 decision 하나의 라벨 변경.
+// PATCH /org/{id}/v1/wiki-graph/decisions/{decisionID}
+// body: {"decision":"approve|deny","reason":"..."}
+func (s *Server) wgUpdateDecision(w http.ResponseWriter, r *http.Request, orgID, decisionID string) {
+	var body struct {
+		Decision string `json:"decision"`
+		Reason   string `json:"reason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	body.Decision = strings.TrimSpace(body.Decision)
+	if body.Decision != "approve" && body.Decision != "deny" {
+		http.Error(w, `{"error":"decision must be approve or deny"}`, http.StatusBadRequest)
+		return
+	}
+	out, err := s.wikiGraph.UpdateDecision(orgID, decisionID, body.Decision, body.Reason)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
 }
 
 func (s *Server) wgListDecisions(w http.ResponseWriter, r *http.Request, orgID string) {

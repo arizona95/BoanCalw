@@ -270,6 +270,7 @@ export default function WikiGraph() {
     action: string;
     message: string;
     wiki_update?: unknown;
+    label_fix_target?: Record<string, unknown>;
   } | null>(null);
 
   // find_ambiguous
@@ -661,6 +662,17 @@ export default function WikiGraph() {
                   })()}
                 </div>
               )}
+              {/* REQUEST_LABEL_FIX 제안 카드 — Accept/Reject 로 사용자 결정 받아야 실제 적용 */}
+              {lastAction && lastAction.action === "REQUEST_LABEL_FIX" && lastAction.label_fix_target && (
+                <LabelFixProposal
+                  target={lastAction.label_fix_target as Record<string, unknown>}
+                  onApplied={async () => {
+                    await loadRaw();
+                    setLastAction(null);
+                  }}
+                  onDismiss={() => setLastAction(null)}
+                />
+              )}
             </div>
           );
         })()}
@@ -694,6 +706,92 @@ function DialogTurnView({ turn }: { turn: DialogTurn }) {
             </ul>
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+// LabelFixProposal — LLM 이 REQUEST_LABEL_FIX 로 제안한 decision 재라벨을
+// 사용자가 Accept/Reject 하는 카드. Accept 시에만 실제 decision store 수정.
+function LabelFixProposal({
+  target,
+  onApplied,
+  onDismiss,
+}: {
+  target: Record<string, unknown>;
+  onApplied: () => void | Promise<void>;
+  onDismiss: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const decisionID = (target.decision_id as string) || "";
+  const decisionText = (target.decision_text as string) || "";
+  const currentLabel = (target.current_label as string) || "?";
+  const suggestedLabel = (target.suggested_label as string) || "";
+  const reason = (target.reason as string) || "";
+
+  const canApply = Boolean(decisionID && (suggestedLabel === "approve" || suggestedLabel === "deny"));
+
+  const handleAccept = async () => {
+    if (!canApply) {
+      setError("decision_id 또는 suggested_label 누락 — LLM 응답 확인 필요");
+      return;
+    }
+    setBusy(true); setError(null);
+    try {
+      await wikiGraphApi.labelFixApply(decisionID, suggestedLabel as "approve" | "deny", reason);
+      await onApplied();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="mx-4 my-3 rounded-lg border-2 border-orange-300 bg-orange-50 p-3 text-xs">
+      <div className="flex items-start justify-between gap-2 mb-2">
+        <div className="font-semibold text-orange-800">
+          🏷️ LLM 재라벨 제안 — 승인하시겠습니까?
+        </div>
+        <button
+          onClick={onDismiss}
+          disabled={busy}
+          className="text-orange-600 hover:text-orange-800 text-[10px]"
+          title="닫기 (적용 안 함)"
+        >
+          ✕
+        </button>
+      </div>
+      <div className="space-y-1 mb-3">
+        <div><span className="text-orange-600">대상 결정:</span> <code className="bg-white px-1 rounded text-[10px]">{decisionText || decisionID || "(unknown)"}</code></div>
+        <div>
+          <span className="text-orange-600">변경:</span>{" "}
+          <span className="inline-flex items-center gap-1">
+            <span className="px-1.5 py-0.5 rounded bg-gray-200 text-gray-700 text-[10px] line-through">{currentLabel}</span>
+            <span>→</span>
+            <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${suggestedLabel === "deny" ? "bg-red-200 text-red-800" : "bg-green-200 text-green-800"}`}>{suggestedLabel}</span>
+          </span>
+        </div>
+        {reason && <div className="text-orange-700"><span className="text-orange-600">이유:</span> {reason}</div>}
+      </div>
+      {error && <div className="mb-2 text-red-700 text-[11px]">{error}</div>}
+      <div className="flex gap-2">
+        <button
+          onClick={handleAccept}
+          disabled={busy || !canApply}
+          className="px-3 py-1.5 rounded bg-orange-600 text-white text-[11px] font-medium hover:bg-orange-700 disabled:opacity-50"
+        >
+          {busy ? "적용 중..." : "✓ 수락 — 적용"}
+        </button>
+        <button
+          onClick={onDismiss}
+          disabled={busy}
+          className="px-3 py-1.5 rounded border border-gray-300 bg-white text-gray-700 text-[11px] hover:bg-gray-50"
+        >
+          거절
+        </button>
       </div>
     </div>
   );

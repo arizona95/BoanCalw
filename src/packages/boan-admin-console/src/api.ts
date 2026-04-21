@@ -531,6 +531,13 @@ export const wikiGraphApi = {
       method: "POST",
       body: JSON.stringify({ dialog_id }),
     }),
+  // HITL 사용자가 REQUEST_LABEL_FIX 제안 Accept 시 호출. Reject 는 UI 측에서
+  // dismiss 만 — 이 API 자체는 Accept 경로 전용.
+  labelFixApply: (decision_id: string, new_label: "approve" | "deny", reason: string) =>
+    request<{ status: string; decision: unknown }>("/api/wiki-graph/skill/label_fix_apply", {
+      method: "POST",
+      body: JSON.stringify({ decision_id, new_label, reason }),
+    }),
 };
 
 export const workstationApi = {

@@ -259,6 +259,31 @@ func (s *WikiGraphStore) AppendDecision(orgID string, d *DecisionLog) error {
 	return writeJSON(filepath.Join(s.orgDir(orgID), "decisions", d.ID+".json"), d)
 }
 
+// UpdateDecision — HITL label-fix 승인 시 단일 decision 의 decision/reason 필드
+// 를 갱신한다. id 필요. timestamp / input 은 유지 (역사적 사실은 보존).
+func (s *WikiGraphStore) UpdateDecision(orgID, id string, newDecision, newReason string) (*DecisionLog, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path := filepath.Join(s.orgDir(orgID), "decisions", id+".json")
+	var d DecisionLog
+	if err := readJSON(path, &d); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(newDecision) != "" {
+		d.Decision = newDecision
+	}
+	if strings.TrimSpace(newReason) != "" {
+		// reason 은 기존 값에 "[label-fix @ timestamp] ..." prefix 를 덧붙여
+		// 원래 reason 은 그대로 남기는 편이 debugging/audit 에 유리.
+		d.Reason = fmt.Sprintf("[label-fix @ %s] %s | prev: %s",
+			time.Now().UTC().Format(time.RFC3339), newReason, d.Reason)
+	}
+	if err := writeJSON(path, &d); err != nil {
+		return nil, err
+	}
+	return &d, nil
+}
+
 func (s *WikiGraphStore) ListDecisions(orgID string, limit int) ([]DecisionLog, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

@@ -3527,6 +3527,39 @@ func (s *Server) StartAdmin() {
 			return
 		}
 
+		// skill/label_fix_apply — HITL 사용자가 REQUEST_LABEL_FIX 제안을 Accept
+		// 했을 때 실제로 decision 의 label 을 바꾼다. Reject 면 UI 측에서 아무것도
+		// 호출 안 함. body: {decision_id, new_label, reason}
+		if suffix == "skill/label_fix_apply" && r.Method == http.MethodPost {
+			var body struct {
+				DecisionID string `json:"decision_id"`
+				NewLabel   string `json:"new_label"`
+				Reason     string `json:"reason"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.DecisionID == "" || body.NewLabel == "" {
+				http.Error(w, "decision_id + new_label required", http.StatusBadRequest)
+				return
+			}
+			if body.NewLabel != "approve" && body.NewLabel != "deny" {
+				http.Error(w, "new_label must be approve or deny", http.StatusBadRequest)
+				return
+			}
+			var orgToken string
+			if entry, ok := s.orgs.Resolve(orgID); ok {
+				orgToken = entry.Token
+			}
+			gc := wikiskills.NewGraphClient(orgURL, orgID, orgToken)
+			updated, err := gc.UpdateDecisionLabel(r.Context(), body.DecisionID, body.NewLabel, body.Reason)
+			w.Header().Set("Content-Type", "application/json")
+			if err != nil {
+				w.WriteHeader(http.StatusBadGateway)
+				json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]any{"status": "ok", "decision": updated})
+			return
+		}
+
 		// skill/find_ambiguous — LLM 이 애매한 경계선 케이스 찾아서 질문 생성.
 		if suffix == "skill/find_ambiguous" && r.Method == http.MethodPost {
 			llmURL, llmModel, llmKey, found := lookupLLMByRole("find_ambiguous")
