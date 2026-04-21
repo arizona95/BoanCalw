@@ -147,6 +147,56 @@ func credentialGateRoleName(rawKey, fingerprint string) string {
 	}
 }
 
+// ── Golden Image job tracking ─────────────────────────────────────────
+// in-memory: 서버 재시작 시 초기화됨 (중단된 job 은 수동 확인 필요).
+type goldImageJob struct {
+	ID         string    `json:"id"`
+	StartedAt  time.Time `json:"started_at"`
+	FinishedAt time.Time `json:"finished_at,omitempty"`
+	Status     string    `json:"status"` // running | success | failed
+	Stage      string    `json:"stage"`  // 현재 단계 hint
+	ImageName  string    `json:"image_name,omitempty"`
+	ImageURI   string    `json:"image_uri,omitempty"`
+	Error      string    `json:"error,omitempty"`
+}
+
+var (
+	goldImageJobMu sync.Mutex
+	goldImageJobs  = map[string]*goldImageJob{}
+)
+
+func recordGoldImageJob(j *goldImageJob) {
+	goldImageJobMu.Lock()
+	defer goldImageJobMu.Unlock()
+	goldImageJobs[j.ID] = j
+	// simple GC — 24 시간 지난 job 정리.
+	cutoff := time.Now().Add(-24 * time.Hour)
+	for id, other := range goldImageJobs {
+		if !other.FinishedAt.IsZero() && other.FinishedAt.Before(cutoff) {
+			delete(goldImageJobs, id)
+		}
+	}
+}
+
+func updateGoldImageJob(id string, mutator func(*goldImageJob)) {
+	goldImageJobMu.Lock()
+	defer goldImageJobMu.Unlock()
+	if j := goldImageJobs[id]; j != nil {
+		mutator(j)
+	}
+}
+
+func getGoldImageJob(id string) *goldImageJob {
+	goldImageJobMu.Lock()
+	defer goldImageJobMu.Unlock()
+	if j := goldImageJobs[id]; j != nil {
+		// copy to avoid concurrent mutation by caller
+		copy := *j
+		return &copy
+	}
+	return nil
+}
+
 func detectRegistryCredentialKeys(curl string) []string {
 	seen := map[string]struct{}{}
 	out := make([]string, 0)
@@ -412,6 +462,25 @@ func (s *Server) StartAdmin() {
 		}
 		_ = os.MkdirAll(s.cfg.UserDataDir, 0700)
 		_ = os.WriteFile(filepath.Join(s.cfg.UserDataDir, "bound_user"), []byte(strings.TrimSpace(strings.ToLower(email))), 0600)
+	}
+
+	// clearBoundUserIfMatches — 사용자 삭제 시 호출. bound_user 파일 내용이
+	// 삭제되는 이메일과 일치하면 파일 제거 → 다음 사용자가 로그인/등록 가능.
+	clearBoundUserIfMatches := func(email string) {
+		if strings.TrimSpace(s.cfg.UserDataDir) == "" {
+			return
+		}
+		path := filepath.Join(s.cfg.UserDataDir, "bound_user")
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return
+		}
+		current := strings.TrimSpace(strings.ToLower(string(raw)))
+		target := strings.TrimSpace(strings.ToLower(email))
+		if current == target {
+			_ = os.Remove(path)
+			log.Printf("[user-delete] bound_user file cleared (was %s)", current)
+		}
 	}
 
 	if bound := inferBoundUser(); bound != "" && readBoundUser() == bound {
@@ -1528,10 +1597,18 @@ func (s *Server) StartAdmin() {
 
 		// ACK 즉시 반환 — 실제 imaging 은 background.
 		jobID := fmt.Sprintf("goldimg-%d", time.Now().UnixNano())
+		recordGoldImageJob(&goldImageJob{
+			ID:        jobID,
+			StartedAt: time.Now().UTC(),
+			Status:    "running",
+			Stage:     "시작 중 — VM 정지 요청",
+			ImageName: body.Name,
+		})
 		json.NewEncoder(w).Encode(map[string]any{
-			"status": "started",
-			"job_id": jobID,
-			"hint":   "골든 이미지 생성 중 (VM 정지 → 이미지 생성 → VM 재시작). 약 10-20분 소요.",
+			"status":   "started",
+			"job_id":   jobID,
+			"hint":     "골든 이미지 생성 중. 약 5-15분 소요 — GET /api/admin/workstation/image/status?job_id=<id> 로 진행 상황 폴링 가능.",
+			"poll_url": "/api/admin/workstation/image/status?job_id=" + jobID,
 		})
 
 		ws := &userstore.Workstation{
@@ -1545,13 +1622,54 @@ func (s *Server) StartAdmin() {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 			defer cancel()
-			log.Printf("[golden-image] start: orgID=%s email=%s instance=%s", orgID, email, ws.InstanceID)
+			log.Printf("[golden-image] start: orgID=%s email=%s instance=%s job=%s", orgID, email, ws.InstanceID, jobID)
+
+			// 시간대별 대략적인 stage 추정을 위한 goroutine — 실제 진행 정보가
+			// 없으니 경과 시간 기반으로 표시만 변경. CaptureGoldenImage 는
+			// refactor 하지 않음 (STOP 3분 → create image 5-15분 → START 3분).
+			stageTicker := time.NewTicker(15 * time.Second)
+			defer stageTicker.Stop()
+			done := make(chan struct{})
+			go func() {
+				for {
+					select {
+					case <-done:
+						return
+					case <-stageTicker.C:
+						updateGoldImageJob(jobID, func(j *goldImageJob) {
+							if j.Status != "running" {
+								return
+							}
+							elapsed := time.Since(j.StartedAt).Seconds()
+							switch {
+							case elapsed < 60:
+								j.Stage = "1/4 VM 정지 중 (TERMINATED 대기)"
+							case elapsed < 180:
+								j.Stage = "2/4 이미지 생성 요청됨 (GCP Custom Image 생성 시작)"
+							case elapsed < 600:
+								j.Stage = "3/4 이미지 빌드 중 (Windows boot disk 복제 — 5-10분 소요)"
+							default:
+								j.Stage = "4/4 이미지 READY 대기 + VM 재시작 준비"
+							}
+						})
+					}
+				}
+			}()
+
 			imageURI, err := s.workstations.CaptureGoldenImage(ctx, ws, body.Name, body.Description)
+			close(done)
+			finish := time.Now().UTC()
 			if err != nil {
-				log.Printf("[golden-image] FAILED orgID=%s: %v", orgID, err)
+				log.Printf("[golden-image] FAILED orgID=%s job=%s: %v", orgID, jobID, err)
+				updateGoldImageJob(jobID, func(j *goldImageJob) {
+					j.Status = "failed"
+					j.Stage = "실패"
+					j.Error = err.Error()
+					j.FinishedAt = finish
+				})
 				return
 			}
-			log.Printf("[golden-image] SUCCESS orgID=%s imageURI=%s", orgID, imageURI)
+			log.Printf("[golden-image] SUCCESS orgID=%s job=%s imageURI=%s", orgID, jobID, imageURI)
 			// org settings 에 저장
 			if s.orgSettings != nil {
 				_, _ = s.orgSettings.Patch(orgID, nil, map[string]interface{}{
@@ -1560,7 +1678,47 @@ func (s *Server) StartAdmin() {
 					"golden_image_source_instance": ws.InstanceID,
 				})
 			}
+			updateGoldImageJob(jobID, func(j *goldImageJob) {
+				j.Status = "success"
+				j.Stage = "완료"
+				j.ImageURI = imageURI
+				j.FinishedAt = finish
+			})
 		}()
+	})
+
+	// GET /api/admin/workstation/image/status?job_id=<id> — 골든 이미지 생성 진행상황.
+	mux.HandleFunc("/api/admin/workstation/image/status", func(w http.ResponseWriter, r *http.Request) {
+		if cors(w, r) { return }
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodGet {
+			http.NotFound(w, r); return
+		}
+		jobID := r.URL.Query().Get("job_id")
+		if jobID == "" {
+			http.Error(w, `{"error":"job_id required"}`, http.StatusBadRequest); return
+		}
+		j := getGoldImageJob(jobID)
+		if j == nil {
+			http.Error(w, `{"error":"job not found (서버 재시작 시 메모리에서 사라짐)"}`, http.StatusNotFound); return
+		}
+		elapsed := int(time.Since(j.StartedAt).Seconds())
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":          j.ID,
+			"status":      j.Status,
+			"stage":       j.Stage,
+			"started_at":  j.StartedAt.Format(time.RFC3339),
+			"finished_at": func() any {
+				if j.FinishedAt.IsZero() {
+					return nil
+				}
+				return j.FinishedAt.Format(time.RFC3339)
+			}(),
+			"elapsed_seconds": elapsed,
+			"image_name":      j.ImageName,
+			"image_uri":       j.ImageURI,
+			"error":           j.Error,
+		})
 	})
 
 	mux.HandleFunc("/api/workstation/me", func(w http.ResponseWriter, r *http.Request) {
@@ -1875,19 +2033,42 @@ func (s *Server) StartAdmin() {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		// owner-only
-		sess, err := auth.SessionFromRequest(r, s.authProv)
-		if err != nil || roles.Normalize(roles.Role(sess.Role)) != roles.Owner {
-			w.WriteHeader(http.StatusForbidden)
-			json.NewEncoder(w).Encode(map[string]string{"error": "소유자 권한 필요"})
-			return
+		// GET 은 public — 이 호스트가 연결 가능한 조직 목록은 로그인 드롭다운
+		// 등에서 비로그인 상태에도 필요. POST/DELETE/PATCH 만 owner 제한.
+		if r.Method != http.MethodGet {
+			sess, err := auth.SessionFromRequest(r, s.authProv)
+			if err != nil || roles.Normalize(roles.Role(sess.Role)) != roles.Owner {
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(map[string]string{"error": "소유자 권한 필요"})
+				return
+			}
 		}
 
 		switch r.Method {
 		case http.MethodGet:
+			// owner 면 전체 조회 (token 포함), 아니면 token 은 마스킹.
+			isOwner := false
+			if sess, err := auth.SessionFromRequest(r, s.authProv); err == nil && sess != nil {
+				if roles.Normalize(roles.Role(sess.Role)) == roles.Owner {
+					isOwner = true
+				}
+			}
+			rawOrgs := s.orgs.List()
+			orgs := make([]map[string]any, 0, len(rawOrgs))
+			for _, o := range rawOrgs {
+				entry := map[string]any{
+					"org_id": o.OrgID,
+					"url":    o.URL,
+					"label":  o.Label,
+				}
+				if isOwner {
+					entry["token"] = o.Token
+				}
+				orgs = append(orgs, entry)
+			}
 			json.NewEncoder(w).Encode(map[string]any{
 				"active": s.orgs.ActiveID(),
-				"orgs":   s.orgs.List(),
+				"orgs":   orgs,
 			})
 		case http.MethodPost:
 			var body orgstore.Entry
@@ -2565,8 +2746,20 @@ func (s *Server) StartAdmin() {
 			}
 			// 2) local userstore 에서 제거 (있을 때만; 없어도 계속 진행)
 			_ = s.users.Delete(body.Email)
-			// 3) org server 에서 제거 — 진실의 원천.
+			// 2a) bound_user 파일이 이 email 을 가리키면 clear — 안 그러면
+			//     "이 PC 는 이미 다른 사용자 계정에 연결됨" 이라고 login 차단됨.
+			clearBoundUserIfMatches(body.Email)
+			// 3) org server 에서 제거 — 진실의 원천. 404 는 idempotent-OK
+			// (로컬에만 있던 계정은 cloud 에 애초에 없으므로 not-found = 이미 삭제됨).
 			if err := s.orgs.ClientFor(targetOrg).DeleteUser(targetOrg, body.Email); err != nil {
+				if strings.Contains(err.Error(), "404") {
+					log.Printf("[user-delete] org server 404 (already gone) for %s — treated as success", body.Email)
+					json.NewEncoder(w).Encode(map[string]any{
+						"status":  "ok",
+						"warning": "사용자가 조직 서버에는 없었습니다 (로컬 전용 계정이었을 수 있음). VM + 로컬은 삭제됨.",
+					})
+					return
+				}
 				w.WriteHeader(http.StatusBadGateway)
 				json.NewEncoder(w).Encode(map[string]string{"error": "조직 서버 삭제 실패: " + err.Error()})
 				return

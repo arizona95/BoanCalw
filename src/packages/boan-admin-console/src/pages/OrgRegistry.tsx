@@ -25,9 +25,25 @@ export default function OrgRegistry() {
   const load = () => {
     setLoading(true);
     fetch("/api/admin/orgs", { credentials: "include" })
-      .then((r) => r.json())
-      .then((d) => setData(d))
-      .catch(() => setErr("조직 목록을 불러오지 못했습니다."))
+      .then(async (r) => {
+        if (!r.ok) {
+          // 403/401 등 — 조직 목록 접근 권한 없음. 빈 상태로 표시.
+          const d = await r.json().catch(() => ({ error: `${r.status}` }));
+          setErr(d.error ?? `${r.status} ${r.statusText}`);
+          setData({ active: "", orgs: [] });
+          return;
+        }
+        const d = await r.json();
+        // 응답이 shape 안 맞으면 기본값으로 복구.
+        setData({
+          active: typeof d.active === "string" ? d.active : "",
+          orgs: Array.isArray(d.orgs) ? d.orgs : [],
+        });
+      })
+      .catch(() => {
+        setErr("조직 목록을 불러오지 못했습니다.");
+        setData({ active: "", orgs: [] });
+      })
       .finally(() => setLoading(false));
   };
 
@@ -134,7 +150,7 @@ export default function OrgRegistry() {
 
       {loading ? (
         <div className="text-sm text-gray-400 py-8 text-center">로딩 중...</div>
-      ) : data.orgs.length === 0 ? (
+      ) : (data?.orgs?.length ?? 0) === 0 ? (
         <div className="text-sm text-gray-400 py-8 text-center">연결된 조직이 없습니다.</div>
       ) : (
         <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
@@ -148,7 +164,7 @@ export default function OrgRegistry() {
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-100">
-              {data.orgs.map((o) => (
+              {(data?.orgs ?? []).map((o) => (
                 <tr key={o.org_id}>
                   <td className="px-4 py-3 font-mono text-xs text-gray-700">{o.org_id}</td>
                   <td className="px-4 py-3 text-xs text-gray-600">{o.label || "-"}</td>

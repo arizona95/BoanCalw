@@ -6,12 +6,26 @@ import { orgSettingsApi, workstationApi } from "../api";
 // 백엔드가 VM 정지 → Custom Image 생성 → VM 재시작 (약 10-20분 소요).
 // 이후 신규 사용자 VM 은 이 이미지로 프로비저닝되어 관리자가 설치해둔
 // 파일 / 폴더 / endpoint agent 가 그대로 들어있음.
+type GoldImageJobStatus = {
+  id: string;
+  status: "running" | "success" | "failed";
+  stage: string;
+  started_at: string;
+  finished_at?: string | null;
+  elapsed_seconds: number;
+  image_name?: string;
+  image_uri?: string;
+  error?: string;
+};
+
 function GoldenImagePanel() {
   const [uri, setUri] = useState<string>("");
   const [capturedAt, setCapturedAt] = useState<string>("");
   const [source, setSource] = useState<string>("");
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string>("");
+  const [jobID, setJobID] = useState<string>("");
+  const [jobStatus, setJobStatus] = useState<GoldImageJobStatus | null>(null);
 
   const refresh = () => {
     orgSettingsApi.get()
@@ -25,19 +39,64 @@ function GoldenImagePanel() {
   };
   useEffect(() => { refresh(); const t = setInterval(refresh, 15_000); return () => clearInterval(t); }, []);
 
+  // job 진행상황 5초마다 poll — 실행 중일 때만.
+  useEffect(() => {
+    if (!jobID) return;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const r = await fetch(`/api/admin/workstation/image/status?job_id=${encodeURIComponent(jobID)}`, {
+          credentials: "include",
+        });
+        if (!r.ok) return;
+        const data = (await r.json()) as GoldImageJobStatus;
+        if (cancelled) return;
+        setJobStatus(data);
+        if (data.status !== "running") {
+          // 끝나면 polling 중단 + org_settings refresh.
+          refresh();
+        }
+      } catch { /* ignore network blips */ }
+    };
+    poll();
+    const t = setInterval(() => {
+      if (jobStatus && jobStatus.status !== "running") {
+        clearInterval(t);
+        return;
+      }
+      void poll();
+    }, 5000);
+    return () => { cancelled = true; clearInterval(t); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobID]);
+
   const capture = async () => {
-    if (!confirm("현재 본인(소유자) VM 을 Custom Image 로 스냅샷합니다.\nVM 이 10-20분간 재부팅되며 그 동안 Personal Computer 를 쓸 수 없습니다. 계속할까요?")) return;
+    if (!confirm(
+      "현재 본인(소유자) VM 을 GCP Custom Image 로 스냅샷합니다.\n\n" +
+      "진행 단계:\n" +
+      "  1) VM 정지 (약 1-2분)\n" +
+      "  2) 이미지 생성 (Windows boot disk 복제, 약 5-10분)\n" +
+      "  3) VM 재시작 (약 2-3분)\n\n" +
+      "그 동안 Personal Computer (RDP 원격 접속) 세션은 끊어집니다.\n" +
+      "계속할까요?"
+    )) return;
     setBusy(true); setMsg("");
+    setJobStatus(null);
     try {
       const r = await workstationApi.captureGoldenImage();
-      setMsg(`✓ 시작됨 (job=${r.job_id}) — ${r.hint}`);
-      // 15초 뒤 자동 refresh
-      setTimeout(refresh, 15_000);
+      setJobID(r.job_id);
+      setMsg(`✓ 시작됨 (job=${r.job_id})`);
     } catch (e) {
       setMsg(`✗ 실패: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setBusy(false);
     }
+  };
+
+  const fmtElapsed = (s: number) => {
+    const m = Math.floor(s / 60);
+    const ss = s % 60;
+    return m > 0 ? `${m}분 ${ss}초` : `${ss}초`;
   };
 
   return (
@@ -68,6 +127,57 @@ function GoldenImagePanel() {
         </button>
       </div>
       {msg && <div className="mt-2 text-xs text-indigo-900 bg-white border border-indigo-200 rounded px-2 py-1">{msg}</div>}
+      {jobStatus && (
+        <div className="mt-3 rounded-lg border border-indigo-300 bg-white p-3">
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2 text-sm font-semibold">
+              <span>
+                {jobStatus.status === "running" && "⏳"}
+                {jobStatus.status === "success" && "✅"}
+                {jobStatus.status === "failed" && "❌"}
+              </span>
+              <span
+                className={
+                  jobStatus.status === "success"
+                    ? "text-green-700"
+                    : jobStatus.status === "failed"
+                      ? "text-red-700"
+                      : "text-indigo-700"
+                }
+              >
+                {jobStatus.stage}
+              </span>
+            </div>
+            <div className="text-xs text-gray-500 font-mono">경과 {fmtElapsed(jobStatus.elapsed_seconds)}</div>
+          </div>
+          {/* 진행 바 — 15분(900초) 기준 % 추정. 완료 시 100%. */}
+          <div className="mt-2 h-2 bg-indigo-100 rounded-full overflow-hidden">
+            <div
+              className={`h-full transition-all ${
+                jobStatus.status === "success"
+                  ? "bg-green-500"
+                  : jobStatus.status === "failed"
+                    ? "bg-red-500"
+                    : "bg-indigo-500"
+              }`}
+              style={{
+                width:
+                  jobStatus.status === "running"
+                    ? `${Math.min(95, (jobStatus.elapsed_seconds / 900) * 100)}%`
+                    : "100%",
+              }}
+            />
+          </div>
+          {jobStatus.error && (
+            <div className="mt-2 text-xs text-red-700 font-mono">에러: {jobStatus.error}</div>
+          )}
+          {jobStatus.image_uri && (
+            <div className="mt-2 text-xs text-green-700">
+              생성됨: <code className="bg-green-50 px-1 rounded">{jobStatus.image_uri}</code>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -129,8 +239,23 @@ export default function Users() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email }),
     });
-    if (res.ok) { setMsg("삭제됨"); load(); }
-    else { const d = await res.json(); setMsg(d.error ?? "오류"); }
+    // 에러가 나도 항상 refetch — 삭제 자체는 로컬/VM 까지는 성공했을 수
+    // 있기 때문. UI 가 stale 상태로 남으면 "삭제된 유령 유저" 로 보임.
+    const ok = res.ok;
+    let msg = "삭제됨";
+    if (!ok) {
+      try {
+        const d = await res.json();
+        msg = d.error ?? "오류";
+      } catch { msg = "오류"; }
+    } else {
+      try {
+        const d = await res.json();
+        if (d.warning) msg = `삭제됨 (참고: ${d.warning})`;
+      } catch { /* noop */ }
+    }
+    setMsg(msg);
+    load();
   };
 
   const pendingCount = users.filter((u) => u.status === "pending").length;

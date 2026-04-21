@@ -481,6 +481,11 @@ export default function MyGCP({ alwaysActive = false }: MyGCPProps = {}) {
         return;
       }
       injectTextToRemote(result.normalized_text || text);
+      // 버퍼 전송 끝에 Enter 자동 부여 — 여러 줄 입력 (Alt+Enter 로 \n 끼운 경우)
+      // 이든 한 줄이든 동일하게, 원격 쪽에서 "input submit" 이 되도록.
+      // injectTextToRemote 자체는 Enter 를 자동 안 붙임 (clipboard paste 등 다른
+      // 호출자는 Enter 없이 단순 type 만 해야 함).
+      injectImmediateKeyToRemote("Enter");
       setBuffer("");
       setGateStatus("입력이 검사를 통과했고 원격 화면에 전달되었습니다.");
       focusGateInputDeferred();

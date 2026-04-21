@@ -44,6 +44,10 @@ export default function Credentials() {
   const [passthroughValue, setPassthroughValue] = useState("");
   const [adding, setAdding] = useState(false);
   const [addingPassthrough, setAddingPassthrough] = useState(false);
+  // 개인용 credential 직접 등록 폼 (추천 외).
+  const [personalName, setPersonalName] = useState("");
+  const [personalKey, setPersonalKey] = useState("");
+  const [personalBusy, setPersonalBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
 
@@ -85,6 +89,29 @@ export default function Credentials() {
       setError(e instanceof Error ? e.message : "추가 실패");
     } finally {
       setAdding(false);
+    }
+  };
+
+  // Personal credential 직접 등록 — 추천(credRequests) 없어도 사용자가 자기
+  // 필요에 따라 credential 을 만들 수 있게. 자동으로 personal-{emailPrefix}-{name}
+  // 네이밍으로 저장 → 내 계정 전용임이 role 이름에 드러남.
+  const handleAddPersonal = async () => {
+    const n = personalName.trim();
+    const k = personalKey.trim();
+    if (!n) { setError("credential 이름을 입력하세요."); return; }
+    if (!k) { setError("API 키 값을 입력하세요."); return; }
+    if (!emailPrefix) { setError("이메일을 확인할 수 없습니다 (세션 문제)."); return; }
+    setError(null); setSuccess(null); setPersonalBusy(true);
+    try {
+      const role = personalRoleFor(n);
+      await credentialApi.add(role, k);
+      setPersonalName(""); setPersonalKey("");
+      setSuccess(`"${role}" 이(가) credential-filter 에 저장되었습니다.`);
+      load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "등록 실패");
+    } finally {
+      setPersonalBusy(false);
     }
   };
 
@@ -296,15 +323,51 @@ export default function Credentials() {
         </>
       ) : tab === "personal" ? (
         <div className="space-y-4">
+          {/* 1) 본인 키 직접 등록 — 추천 없어도 사용자 자기 필요 */}
+          <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+            <h2 className="text-lg font-semibold mb-1">내 Credential 추가</h2>
+            <p className="text-xs text-gray-500 mb-3">
+              개인용 API 키 / 토큰을 직접 등록합니다. 자동으로 <code className="bg-gray-100 px-1 rounded">personal-{emailPrefix}-&lt;이름&gt;</code> 네이밍으로 저장되어 본인 계정 전용이 됩니다.
+            </p>
+            <div className="grid gap-2 md:grid-cols-[1fr,2fr,auto]">
+              <input
+                value={personalName}
+                onChange={(e) => setPersonalName(e.target.value)}
+                placeholder="이름 (e.g. github-pat)"
+                className="px-3 py-2 border border-gray-300 rounded-lg text-xs font-mono"
+              />
+              <input
+                type="password"
+                value={personalKey}
+                onChange={(e) => setPersonalKey(e.target.value)}
+                placeholder="API 키 / 토큰 값"
+                className="px-3 py-2 border border-gray-300 rounded-lg text-xs font-mono"
+              />
+              <button
+                onClick={handleAddPersonal}
+                disabled={personalBusy || !personalName.trim() || !personalKey.trim()}
+                className="px-4 py-2 text-xs rounded-lg bg-boan-600 text-white hover:bg-boan-700 disabled:bg-gray-300"
+              >
+                {personalBusy ? "저장 중..." : "+ 등록"}
+              </button>
+            </div>
+            {personalName.trim() && (
+              <p className="text-[11px] text-gray-400 mt-2">
+                저장될 role: <code className="bg-gray-100 px-1 rounded">{personalRoleFor(personalName.trim())}</code>
+              </p>
+            )}
+          </div>
+
+          {/* 2) 추천 / 내 personal 목록 */}
           <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
             <h2 className="text-lg font-semibold mb-1">My Credentials</h2>
             <p className="text-xs text-gray-500 mb-4">
-              조직 소유자가 추천한 credential 목록. 빨간색은 아직 내가 등록하지 않은 항목 — 등록 안 해도 기본 기능은 동작하지만, 등록하면 더 정상적으로 작동합니다.
+              조직 소유자가 추천한 credential 목록 + 내가 등록한 개인 credential. 빨간색은 추천받았지만 아직 등록 안 한 항목입니다.
             </p>
             {loading ? (
               <p className="text-sm text-gray-500">로딩 중...</p>
             ) : credRequests.length === 0 && creds.filter((c) => c.role.startsWith(`personal-${emailPrefix}-`)).length === 0 ? (
-              <p className="text-sm text-gray-400 py-8 text-center">소유자가 추천한 credential 이 없습니다.</p>
+              <p className="text-sm text-gray-400 py-8 text-center">등록된 credential 이 없습니다. 위에서 직접 추가하거나, 소유자의 추천을 기다리세요.</p>
             ) : (
               <div className="space-y-2">
                 {/* 추천 목록 — 각 사용자별 fulfillment 상태 확인 */}
@@ -369,6 +432,31 @@ export default function Credentials() {
                     </div>
                   );
                 })}
+                {/* 추천 목록과 연관 없이 직접 등록한 personal credential 표시. */}
+                {creds
+                  .filter((c) => {
+                    if (!emailPrefix) return false;
+                    if (!c.role.startsWith(`personal-${emailPrefix}-`)) return false;
+                    // 추천과 매칭된 건 위에서 이미 표시함 → 중복 제외.
+                    const tail = c.role.slice(`personal-${emailPrefix}-`.length);
+                    return !credRequests.some((cr) => cr.role_name === tail);
+                  })
+                  .map((c) => (
+                    <div key={c.role} className="px-4 py-3 rounded-lg border border-gray-200 bg-white">
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <span className="text-sm font-mono font-semibold text-gray-800">{c.role}</span>
+                          <span className="ml-2 text-xs text-green-600">✓ 등록됨 (개인)</span>
+                        </div>
+                        <button
+                          onClick={() => handleRevoke(c.role)}
+                          className="text-xs text-red-500 hover:underline"
+                        >
+                          삭제
+                        </button>
+                      </div>
+                    </div>
+                  ))}
               </div>
             )}
           </div>

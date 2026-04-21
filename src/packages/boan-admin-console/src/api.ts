@@ -578,19 +578,6 @@ export const chatApi = {
     }),
 };
 
-export const computerUseApi = {
-  type: (text: string) =>
-    request<{ ok: boolean; result: string }>("/api/computer-use/type", {
-      method: "POST",
-      body: JSON.stringify({ text }),
-    }),
-  key: (name: string) =>
-    request<{ ok: boolean; result: string }>("/api/computer-use/key", {
-      method: "POST",
-      body: JSON.stringify({ name }),
-    }),
-};
-
 export const dashboardApi = {
   stats: async (): Promise<DashboardStats> => {
     try {

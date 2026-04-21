@@ -57,7 +57,10 @@ resource "google_cloud_run_v2_service" "org_llm_proxy" {
   template {
     service_account = google_service_account.org_llm_proxy.email
     scaling {
-      min_instance_count = 0
+      # min=1 : 항상 warm — G2/G3 가드레일 cold-start 제거.
+      # 비용: 1 인스턴스 × 1 vCPU × 730h × $0.000024/s ≈ $8-10/월.
+      # prod 에서 cold-start 로 인한 G2 타임아웃 경험 후 기본값을 1 로 올림.
+      min_instance_count = 1
       max_instance_count = 5
     }
     containers {

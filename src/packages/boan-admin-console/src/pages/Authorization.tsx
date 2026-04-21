@@ -1,26 +1,30 @@
 import { useState, useEffect } from "react";
-import { useLocation, useNavigate } from "react-router-dom";
+import { useLocation, useNavigate, Navigate } from "react-router-dom";
 import Users from "./Users";
 import SSOSettings from "./SSOSettings";
-import OrgRegistry from "./OrgRegistry";
 
-// Authorization — Users, SSO, Orgs 통합 화면.
-// URL pattern: /authorization?tab=users (default) | tab=sso | tab=orgs
-type Tab = "users" | "sso" | "orgs";
+// Authorization — Users + SSO 통합 화면.
+// 옛 "🏢 조직" 탭은 사이드바의 "Organization" 메뉴로 분리됨 (호스트 ↔ 조직서버
+// 연결은 user/SSO 관리와 다른 layer 라서). tab=orgs 로 들어오면 redirect.
+type Tab = "users" | "sso";
 
 export default function Authorization() {
   const location = useLocation();
   const navigate = useNavigate();
   const params = new URLSearchParams(location.search);
-  const initialTab: Tab = ["sso", "orgs"].includes(params.get("tab") ?? "")
-    ? (params.get("tab") as Tab)
-    : "users";
+  const requested = params.get("tab") ?? "";
+  const initialTab: Tab = requested === "sso" ? "sso" : "users";
   const [tab, setTab] = useState<Tab>(initialTab);
 
   useEffect(() => {
     const t = new URLSearchParams(location.search).get("tab");
-    if (t === "sso" || t === "users" || t === "orgs") setTab(t);
+    if (t === "sso" || t === "users") setTab(t);
   }, [location.search]);
+
+  // 옛 deep-link 호환: /authorization?tab=orgs → /organization
+  if (requested === "orgs") {
+    return <Navigate to="/organization" replace />;
+  }
 
   const switchTab = (next: Tab) => {
     setTab(next);
@@ -38,7 +42,6 @@ export default function Authorization() {
         {([
           { id: "users", label: "👥 Users", desc: "조직 멤버 + 권한" },
           { id: "sso", label: "🔐 SSO", desc: "OTP / OAuth 등 인증 공급자" },
-          { id: "orgs", label: "🏢 조직", desc: "연결된 조직서버 (URL + 토큰)" },
         ] as const).map((t) => (
           <button
             key={t.id}
@@ -55,7 +58,7 @@ export default function Authorization() {
         ))}
       </div>
 
-      {tab === "users" ? <Users /> : tab === "sso" ? <SSOSettings /> : <OrgRegistry />}
+      {tab === "users" ? <Users /> : <SSOSettings />}
     </div>
   );
 }

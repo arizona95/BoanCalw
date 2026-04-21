@@ -36,7 +36,16 @@ type Incident = {
   requester?: string;
 };
 
-type User = { email: string; role?: string; workstation?: { instance_id?: string } };
+type User = {
+  email: string;
+  role?: string;
+  // /api/admin/users 는 flat instance_id 필드로 반환 (workstation 객체 X).
+  // ?include_workstation=1 파라미터 붙여야 workstation 포함하지만 현재 UI 는
+  // 기본 호출만 사용 → flat 필드 체크로 호환.
+  instance_id?: string;
+  workstation_status?: string;
+  workstation?: { instance_id?: string };
+};
 
 export default function KillChain() {
   const [tab, setTab] = useState<"rules" | "incidents">("incidents");
@@ -52,7 +61,7 @@ export default function KillChain() {
       const [r1, r2, r3] = await Promise.all([
         fetch("/api/kill-chain/rules").then((r) => r.json()),
         fetch("/api/kill-chain/incidents?limit=200").then((r) => r.json()),
-        fetch("/api/admin/users").then((r) => r.json()).catch(() => []),
+        fetch("/api/admin/users?include_workstation=1").then((r) => r.json()).catch(() => []),
       ]);
       setRules(Array.isArray(r1) ? r1 : []);
       setIncidents(Array.isArray(r2) ? r2 : []);
@@ -310,8 +319,12 @@ function IncidentsTab({
   const [targetEmail, setTargetEmail] = useState("");
   const [reason, setReason] = useState("");
 
+  // flat instance_id (기본 응답) 또는 nested workstation.instance_id 둘 다 수용.
   const eligible = useMemo(
-    () => users.filter((u) => u.workstation && u.workstation.instance_id),
+    () =>
+      users.filter(
+        (u) => (u.instance_id && u.instance_id.length > 0) || (u.workstation && u.workstation.instance_id),
+      ),
     [users],
   );
 
@@ -361,11 +374,15 @@ function IncidentsTab({
             className="rounded border border-red-300 bg-white px-2 py-1.5 text-sm"
           >
             <option value="">— 대상 VM 선택 —</option>
-            {eligible.map((u) => (
-              <option key={u.email} value={u.email}>
-                {u.email} {u.workstation?.instance_id ? `(${u.workstation.instance_id})` : ""}
-              </option>
-            ))}
+            {eligible.map((u) => {
+              const inst = u.instance_id || u.workstation?.instance_id || "";
+              const short = inst ? inst.split("/").pop() : "";
+              return (
+                <option key={u.email} value={u.email}>
+                  {u.email} {short ? `(${short})` : ""}
+                </option>
+              );
+            })}
           </select>
           <input
             value={reason}

@@ -18,6 +18,7 @@ import MyBoanClaw from "./pages/MyBoanClaw";
 import MyGCP from "./pages/MyGCP";
 import WikiGraph from "./pages/WikiGraph";
 import KillChain from "./pages/KillChain";
+import Organization from "./pages/Organization";
 
 const ROLE_COLOR: Record<string, string> = {
   owner: "bg-blue-100 text-blue-800",
@@ -120,14 +121,16 @@ function Shell() {
         { path: "/observability", label: "Observability", icon: "🔭" },
         { path: "/kill-chain", label: "Kill Chain", icon: "☠️" },
         { path: "/wiki-graph", label: "G3 Folder Wiki", icon: "📂" },
-        { path: "/my-boanclaw", label: "BoanClaw", icon: "🦞", separator: true },
+        { path: "/organization", label: "Organization", icon: "🏢", separator: true },
+        { path: "/my-boanclaw", label: "BoanClaw", icon: "🦞" },
         { path: "/files", label: "File Manager", icon: "📂" },
         { path: "/my-gcp", label: "Personal Computer", icon: "🖥️" },
       ]
     : [
         { path: "/org-overview", label: "조직 설정 확인", icon: "🏢" },
         { path: "/credentials", label: "Credentials", icon: "🔑" },
-        { path: "/my-boanclaw", label: "BoanClaw", icon: "🦞", separator: true },
+        { path: "/organization", label: "Organization", icon: "🏢", separator: true },
+        { path: "/my-boanclaw", label: "BoanClaw", icon: "🦞" },
         { path: "/files", label: "File Manager", icon: "📂" },
         { path: "/my-gcp", label: "Personal Computer", icon: "🖥️" },
       ];
@@ -291,6 +294,7 @@ function Shell() {
               <Route path="/approvals" element={canEdit ? <Approvals /> : <ReadOnly />} />
               <Route path="/observability" element={canEdit ? <Observability /> : <ReadOnly />} />
               <Route path="/kill-chain" element={canEdit ? <KillChain /> : <ReadOnly />} />
+              <Route path="/organization" element={<Organization />} />
               <Route path="/wiki" element={<Navigate to="/wiki-graph" replace />} />
               <Route path="/wiki-graph" element={canEdit ? <WikiGraph /> : <ReadOnly />} />
               <Route path="/authorization" element={canEdit ? <Authorization /> : <ReadOnly />} />
