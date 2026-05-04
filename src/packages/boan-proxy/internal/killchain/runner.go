@@ -15,11 +15,13 @@ import (
 // updates the incident record so the UI can stream progress via polling.
 //
 // Sequence:
-//  1. isolate-network      — add boan-quarantine tag (egress deny).
-//  2. ram-dump              — (best-effort) skipped in v1; logs as "skipped".
-//  3. forensic-disk-snapshot — GCP Custom Image.
-//  4. stop-instance         — VM STOP (RAM truly evaporates).
-//  5. delete-instance       — VM DELETE.
+//  1. isolate-network         — add boan-quarantine tag (egress deny).
+//  2. ram-dump                 — (best-effort) skipped in v1; logs as "skipped".
+//  3. forensic-disk-snapshot   — GCP Custom Image.
+//  4. stop-instance            — VM STOP (RAM truly evaporates).
+//  5. delete-instance          — VM DELETE.
+//  6. provision-replacement    — 같은 user 자리에 골든이미지로 새 VM spawn,
+//                                 users.json workstation 갱신. owner 도 동일 처리.
 //
 // If any step fails, the incident is marked "partial" and subsequent steps
 // continue (delete still happens even if snapshot fails — we prioritize
@@ -27,6 +29,7 @@ import (
 type Runner struct {
 	Store *Store
 	Prov  workstation.Provisioner
+	Users *userstore.Store
 }
 
 // Run — kicks off the sequence in the background. Returns the incident
@@ -40,11 +43,11 @@ func (r *Runner) Run(ctx context.Context, inc Incident, ws *userstore.Workstatio
 	if err != nil {
 		return Incident{}, err
 	}
-	go r.execute(context.Background(), created.ID, ws)
+	go r.execute(context.Background(), created.ID, created.TargetEmail, ws)
 	return created, nil
 }
 
-func (r *Runner) execute(ctx context.Context, incidentID string, ws *userstore.Workstation) {
+func (r *Runner) execute(ctx context.Context, incidentID, targetEmail string, ws *userstore.Workstation) {
 	log.Printf("[killchain] starting incident=%s target=%s", incidentID, instanceName(ws))
 	failures := 0
 
@@ -88,6 +91,34 @@ func (r *Runner) execute(ctx context.Context, incidentID string, ws *userstore.W
 			return "", err
 		}
 		return "VM deleted", nil
+	}, &failures)
+
+	// 6) provision replacement VM (golden image). 모든 user 동일 처리 — owner 예외 없음.
+	r.runStep(ctx, incidentID, "provision-replacement", func(ctx context.Context) (string, error) {
+		if r.Users == nil {
+			return "", fmt.Errorf("user store not wired into killchain runner")
+		}
+		if strings.TrimSpace(targetEmail) == "" {
+			return "", fmt.Errorf("incident has no target_email; cannot reprovision")
+		}
+		user, err := r.Users.Get(targetEmail)
+		if err != nil || user == nil {
+			return "", fmt.Errorf("user not found: %s", targetEmail)
+		}
+		// 기존 stale workstation 정리 (provisioner 가 같은 이름 instance lookup 안 하도록).
+		_ = r.Users.AssignWorkstation(targetEmail, nil)
+		newWS, err := r.Prov.Ensure(ctx, targetEmail, user.OrgID, nil)
+		if err != nil {
+			return "", err
+		}
+		if err := r.Users.AssignWorkstation(targetEmail, newWS); err != nil {
+			return "", err
+		}
+		host := ""
+		if newWS != nil {
+			host = newWS.RemoteHost
+		}
+		return fmt.Sprintf("new VM=%s host=%s", instanceName(newWS), host), nil
 	}, &failures)
 
 	// finalize incident status

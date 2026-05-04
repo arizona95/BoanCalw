@@ -38,6 +38,19 @@ type Provisioner interface {
 
 	// StopInstance — VM 전원 끔. RAM 증발. disk 는 유지.
 	StopInstance(ctx context.Context, current *userstore.Workstation) error
+
+	// ListManagedInstances — janitor 가 사용. boanclaw 가 만든 VM 만 (label `boanclaw-user-email`)
+	// 모두 반환. 각 entry 는 (instance name, label email, creation time). VM 의 사용자가 더 이상
+	// 존재하지 않으면 reaper 가 Delete 호출. noop provisioner 는 빈 list.
+	ListManagedInstances(ctx context.Context) ([]ManagedInstance, error)
+}
+
+// ManagedInstance — janitor 가 보는 VM 정보. 의도적으로 작게 유지.
+type ManagedInstance struct {
+	Name         string    // GCP instance name (예: "boan-win-dowoo-baik")
+	Email        string    // label `boanclaw-user-email` 의 normalized 형태 (`@` → `-`)
+	OrgID        string    // label `boanclaw-org-id` 의 normalized 형태
+	CreationTime time.Time // VM 생성 시각 (grace period 계산용)
 }
 
 // ErrKillChainUnsupported — non-GCP provisioner 에서 kill chain 호출 시.
@@ -109,6 +122,10 @@ func (p *noopProvisioner) ForensicDiskSnapshot(_ context.Context, _ *userstore.W
 
 func (p *noopProvisioner) StopInstance(_ context.Context, _ *userstore.Workstation) error {
 	return ErrKillChainUnsupported
+}
+
+func (p *noopProvisioner) ListManagedInstances(_ context.Context) ([]ManagedInstance, error) {
+	return nil, nil
 }
 
 var slugRe = regexp.MustCompile(`[^a-z0-9]+`)

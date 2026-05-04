@@ -33,9 +33,23 @@ export default function Credentials() {
   const [fulfillKey, setFulfillKey] = useState<Record<string, string>>({});
 
   const emailPrefix = (user?.email ?? "").split("@")[0];
-  const personalRoleFor = (roleName: string) => `personal-${emailPrefix}-${roleName}`;
+  // backend (boan-credential-filter) 가 role 이름 정규화 시 dot 을 underscore 로 바꿈.
+  // 예: "genaisec.ssc" → "genaisec_ssc". 그래서 등록/필터/tail 추출 모두 정규화된 형태 사용해야
+  // 일관. dot/space/특수문자는 underscore — backend Sanitize 와 같은 규칙.
+  const sanitize = (s: string) => s.toLowerCase().replace(/[^a-z0-9-]/g, "_");
+  const sanitizedEmailPrefix = sanitize(emailPrefix);
+  const personalPrefix = `personal-${sanitizedEmailPrefix}-`;
+  const personalRoleFor = (roleName: string) => `${personalPrefix}${sanitize(roleName)}`;
   const isRecommendationFulfilled = (roleName: string) =>
-    creds.some((c) => c.role === personalRoleFor(roleName));
+    creds.some((c) => c.role.toLowerCase() === personalRoleFor(roleName).toLowerCase());
+
+  // Org 탭은 조직 공용 credential 만. Personal-prefix 는 그 사용자의 Personal 탭에서만 보여야.
+  // (이전엔 Org 탭이 모든 cred 를 보여줘서 사용자가 "personal 등록했는데 org 로 갔다" 라고 혼란.)
+  const orgCreds = creds.filter((c) => !c.role.toLowerCase().startsWith("personal-"));
+  // 본인 personal credential 만. role 이 `personal-<sanitized prefix>-...` 로 시작하는 것.
+  const myPersonalCreds = creds.filter(
+    (c) => sanitizedEmailPrefix && c.role.toLowerCase().startsWith(personalPrefix)
+  );
   const [loading, setLoading] = useState(true);
   const [name, setName] = useState("");
   const [key, setKey] = useState("");
@@ -260,9 +274,9 @@ export default function Credentials() {
             </div>
             {loading ? (
               <p className="p-6 text-sm text-gray-500">로딩 중...</p>
-            ) : creds.length === 0 ? (
+            ) : orgCreds.length === 0 ? (
               <p className="p-6 text-sm text-gray-400">
-                등록된 Credential이 없습니다.
+                등록된 조직 Credential 이 없습니다. Personal 탭은 따로 확인하세요.
               </p>
             ) : (
               <table className="w-full text-sm">
@@ -286,7 +300,7 @@ export default function Credentials() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-100">
-                  {creds.map((c) => (
+                  {orgCreds.map((c) => (
                     <tr key={c.role} className="hover:bg-gray-50">
                       <td className="px-6 py-3 font-mono font-medium">
                         {c.role}
@@ -366,7 +380,7 @@ export default function Credentials() {
             </p>
             {loading ? (
               <p className="text-sm text-gray-500">로딩 중...</p>
-            ) : credRequests.length === 0 && creds.filter((c) => c.role.startsWith(`personal-${emailPrefix}-`)).length === 0 ? (
+            ) : credRequests.length === 0 && myPersonalCreds.length === 0 ? (
               <p className="text-sm text-gray-400 py-8 text-center">등록된 credential 이 없습니다. 위에서 직접 추가하거나, 소유자의 추천을 기다리세요.</p>
             ) : (
               <div className="space-y-2">
@@ -433,13 +447,11 @@ export default function Credentials() {
                   );
                 })}
                 {/* 추천 목록과 연관 없이 직접 등록한 personal credential 표시. */}
-                {creds
+                {myPersonalCreds
                   .filter((c) => {
-                    if (!emailPrefix) return false;
-                    if (!c.role.startsWith(`personal-${emailPrefix}-`)) return false;
                     // 추천과 매칭된 건 위에서 이미 표시함 → 중복 제외.
-                    const tail = c.role.slice(`personal-${emailPrefix}-`.length);
-                    return !credRequests.some((cr) => cr.role_name === tail);
+                    const tail = c.role.slice(personalPrefix.length);
+                    return !credRequests.some((cr) => sanitize(cr.role_name) === tail);
                   })
                   .map((c) => (
                     <div key={c.role} className="px-4 py-3 rounded-lg border border-gray-200 bg-white">

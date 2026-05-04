@@ -8,6 +8,7 @@ import SelectOrg from "./pages/SelectOrg";
 import OrgSettings from "./pages/OrgSettings";
 import OrgOverview from "./pages/OrgOverview";
 import Policies from "./pages/Policies";
+import Guardrail from "./pages/Guardrail";
 import LLMRegistry from "./pages/LLMRegistry";
 import Credentials from "./pages/Credentials";
 import Approvals from "./pages/Approvals";
@@ -16,8 +17,8 @@ import FileManager from "./pages/FileManager";
 import Observability from "./pages/Observability";
 import MyBoanClaw from "./pages/MyBoanClaw";
 import MyGCP from "./pages/MyGCP";
-import WikiGraph from "./pages/WikiGraph";
 import KillChain from "./pages/KillChain";
+import ThreatLeader from "./pages/ThreatLeader";
 import Organization from "./pages/Organization";
 
 const ROLE_COLOR: Record<string, string> = {
@@ -115,12 +116,14 @@ function Shell() {
     ? [
         { path: "/authorization", label: "Authorization", icon: "🔐" },
         { path: "/llm-registry", label: "LLM Registry", icon: "🤖" },
-        { path: "/gateway", label: "Gateway Policies", icon: "🛡️" },
+        { path: "/gateway", label: "Gateway Policies", icon: "🌐" },
+        { path: "/guardrail", label: "Guardrail", icon: "🛡️" },
         { path: "/credentials", label: "Credentials", icon: "🔑" },
         { path: "/approvals", label: "Approvals", icon: "✅" },
         { path: "/observability", label: "Observability", icon: "🔭" },
         { path: "/kill-chain", label: "Kill Chain", icon: "☠️" },
-        { path: "/wiki-graph", label: "G3 Folder Wiki", icon: "📂" },
+        { path: "/threat-leader", label: "Threat Leader", icon: "🐲" },
+        // G3 Folder Wiki 는 사이드바에서 제거 — Gateway Policies > Guardrail > G3 로 이전.
         { path: "/organization", label: "Organization", icon: "🏢", separator: true },
         { path: "/my-boanclaw", label: "BoanClaw", icon: "🦞" },
         { path: "/files", label: "File Manager", icon: "📂" },
@@ -135,7 +138,7 @@ function Shell() {
         { path: "/my-gcp", label: "Personal Computer", icon: "🖥️" },
       ];
 
-  const fullBleed = location.pathname === "/my-boanclaw" || location.pathname === "/my-gcp" || location.pathname === "/wiki-graph";
+  const fullBleed = location.pathname === "/my-boanclaw" || location.pathname === "/my-gcp";
   // FileManager needs a wider content area — ~1.3x default max-w-7xl
   const wideContent = location.pathname === "/files";
   const isUsage = mode === "usage";
@@ -287,6 +290,7 @@ function Shell() {
               <Route path="/org" element={canEdit ? <OrgSettings /> : <ReadOnly />} />
               <Route path="/org-overview" element={<OrgOverview />} />
               <Route path="/gateway" element={canEdit ? <Policies /> : <ReadOnly />} />
+              <Route path="/guardrail" element={canEdit ? <Guardrail /> : <ReadOnly />} />
               <Route path="/policies" element={<Navigate to="/gateway" replace />} />
               <Route path="/llm-registry" element={<LLMRegistry />} />
               <Route path="/audit" element={<Navigate to="/observability" replace />} />
@@ -294,9 +298,11 @@ function Shell() {
               <Route path="/approvals" element={canEdit ? <Approvals /> : <ReadOnly />} />
               <Route path="/observability" element={canEdit ? <Observability /> : <ReadOnly />} />
               <Route path="/kill-chain" element={canEdit ? <KillChain /> : <ReadOnly />} />
+              <Route path="/threat-leader" element={canEdit ? <ThreatLeader /> : <ReadOnly />} />
               <Route path="/organization" element={<Organization />} />
-              <Route path="/wiki" element={<Navigate to="/wiki-graph" replace />} />
-              <Route path="/wiki-graph" element={canEdit ? <WikiGraph /> : <ReadOnly />} />
+              {/* G3 Folder Wiki 는 Guardrail > G3 로 이전. 기존 /wiki-graph, /wiki 북마크는 redirect. */}
+              <Route path="/wiki" element={<Navigate to="/guardrail?sub=G3" replace />} />
+              <Route path="/wiki-graph" element={<Navigate to="/guardrail?sub=G3" replace />} />
               <Route path="/authorization" element={canEdit ? <Authorization /> : <ReadOnly />} />
               <Route path="/users" element={<Navigate to="/authorization?tab=users" replace />} />
               <Route path="/sso" element={<Navigate to="/authorization?tab=sso" replace />} />

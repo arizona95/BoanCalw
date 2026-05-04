@@ -9,6 +9,7 @@ import (
 
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/auth"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/killchain"
+	"github.com/samsung-sds/boanclaw/boan-proxy/internal/roles"
 )
 
 // registerKillChainEndpoints — mount kill chain HTTP surface.
@@ -256,6 +257,8 @@ func killChainCORS(w http.ResponseWriter, r *http.Request) bool {
 }
 
 // requireOwner — admin 작업용 guard. 세션이 owner / primary_owner 인지 확인.
+// testmode 빌드에선 tester role 도 통과 (testerCanEdit() == true).
+// release 빌드는 그대로 owner 만.
 func (s *Server) requireOwner(w http.ResponseWriter, r *http.Request) bool {
 	sess, err := auth.SessionFromRequest(r, s.authProv)
 	if err != nil || sess == nil {
@@ -263,6 +266,9 @@ func (s *Server) requireOwner(w http.ResponseWriter, r *http.Request) bool {
 	}
 	role := strings.ToLower(string(sess.Role))
 	if role == "owner" || role == "primary_owner" {
+		return true
+	}
+	if role == "tester" && roles.CanEdit(roles.Tester) {
 		return true
 	}
 	http.Error(w, "owner role required", http.StatusForbidden)

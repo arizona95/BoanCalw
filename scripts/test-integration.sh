@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════
-# BoanClaw — 통합 테스트 러너
+# BoanClaw — API 통합 테스트 러너 (category: api test)
 #
-# 호스트에서 실행. 각 UI 기능을 실제 API 호출로 검증.
-# 모든 변경은 항상 cleanup. computer-use 관련 기능은 제외.
+# 이 스크립트는 **testmode 빌드** 에서만 동작. release 바이너리는 `/api/test/*`
+# 엔드포인트가 없어서 세션 발급 자체가 불가. 실행 시작 시 `/api/admin/debug/build-info`
+# 로 mode 를 확인하고 release 면 즉시 abort.
 #
-# 전제: BoanClaw 가 이미 떠 있고 admin-console 이 :19080 헬스체크 통과.
-#       sandbox 컨테이너가 TEST=true 로 부트되어 /api/test/* 가 활성화됨.
+# 프로젝트의 두 가지 테스트 카테고리:
+#   • api test (이 파일)  — bash + curl, 쉽고 빠름, testmode 전용.
+#   • ui real test        — 실제 Chrome 으로 UI 클릭, test/Report/ 에 시나리오별
+#                           markdown. release/testmode 빌드 모두 대상.
 #
 # 사용:
-#   ./scripts/test-integration.sh                       # 전부 실행
+#   ./scripts/test-integration.sh                       # 전부
 #   ./scripts/test-integration.sh test_network_policy   # 한 함수만
 #   FAIL_FAST=1 ./scripts/test-integration.sh           # 첫 실패에서 stop
 #   VERBOSE=1 ./scripts/test-integration.sh             # API 응답 print
@@ -63,6 +66,22 @@ resp_field() {
 
 require_jq() {
   command -v jq >/dev/null 2>&1 || { echo "jq 가 필요합니다 (apt install jq)"; exit 2; }
+}
+
+require_testmode() {
+  # 서버가 testmode 빌드인지 /api/admin/debug/build-info 로 확인.
+  # release 면 /api/test/* 가 없어서 이 러너가 동작 불가. 즉시 abort.
+  local info code
+  info=$(curl -sf "${BASE}/api/admin/debug/build-info" 2>/dev/null || echo '{}')
+  code=$(echo "$info" | jq -r '.mode // "unknown"' 2>/dev/null)
+  if [ "$code" != "testmode" ]; then
+    printf "${R}✗${N} 서버가 testmode 빌드가 아님 (mode=$code).\n"
+    printf "  이 스크립트는 'api test' 카테고리 — testmode 빌드 전용.\n"
+    printf "  dev rebuild: BOAN_BUILD_TAG=testmode scripts/rebuild.sh\n"
+    printf "  release 빌드에서 회귀를 돌리려면 ui real test (test/Report/) 쪽을 사용.\n"
+    exit 2
+  fi
+  log_ok "build mode: testmode"
 }
 
 assert_eq() {
@@ -146,7 +165,7 @@ test_user_access_level_change() {
   trap "api POST /api/test/cleanup-user '{\"email\":\"$email\"}' >/dev/null 2>&1 || true; api POST /api/test/cleanup-user '{\"email\":\"$owner_email\"}' >/dev/null 2>&1 || true" RETURN
 
   api POST /api/test/session "{\"email\":\"$email\",\"role\":\"user\",\"access_level\":\"allow\"}" >/dev/null
-  api POST /api/test/session "{\"email\":\"$owner_email\",\"role\":\"owner\",\"access_level\":\"allow\"}" >/dev/null
+  api POST /api/test/session "{\"email\":\"$owner_email\",\"role\":\"tester\",\"access_level\":\"allow\"}" >/dev/null
 
   local code; code=$(api GET /api/admin/users)
   assert_eq 200 "$code" "GET /api/admin/users (owner)" || return 1
@@ -338,7 +357,7 @@ test_audit_traces_endpoint() {
   local email="${TEST_EMAIL_PREFIX}-audit@example.com"
   trap "api POST /api/test/cleanup-user '{\"email\":\"$email\"}' >/dev/null 2>&1 || true" RETURN
 
-  api POST /api/test/session "{\"email\":\"$email\",\"role\":\"owner\",\"access_level\":\"allow\"}" >/dev/null
+  api POST /api/test/session "{\"email\":\"$email\",\"role\":\"tester\",\"access_level\":\"allow\"}" >/dev/null
 
   local code; code=$(api GET /api/observability/traces)
   assert_eq 200 "$code" "GET /api/observability/traces" || return 1
@@ -403,7 +422,7 @@ test_credential_lifecycle() {
   local email="${TEST_EMAIL_PREFIX}-cred@example.com"
   trap "api POST /api/test/cleanup-user '{\"email\":\"$email\"}' >/dev/null 2>&1 || true" RETURN
 
-  api POST /api/test/session "{\"email\":\"$email\",\"role\":\"owner\",\"access_level\":\"allow\"}" >/dev/null
+  api POST /api/test/session "{\"email\":\"$email\",\"role\":\"tester\",\"access_level\":\"allow\"}" >/dev/null
 
   local role="bc-test-cred-$(date +%s)"
   local key="sk-test-cred-abcdef1234567890"
@@ -504,6 +523,7 @@ test_input_gate_paste_safe() {
 # ═══════════════════════════════════════════════════════════════════════
 
 require_jq
+require_testmode
 
 ALL_TESTS=(
   # 1. sanity

@@ -285,6 +285,18 @@ func (s *Store) load() error {
 	return nil
 }
 
+// Reload re-reads users.json from disk into the in-memory map.
+// Required when multiple boan-proxy processes share /data/users (e.g. the
+// standalone proxy container + the sandbox-embedded proxy): writes from one
+// process don't notify the other, so its janitor would see a stale user list
+// and incorrectly reap freshly-created VMs as orphans.
+func (s *Store) Reload() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.users = make(map[string]*User)
+	return s.load()
+}
+
 func (s *Store) save() error {
 	list := make([]*User, 0, len(s.users))
 	for _, u := range s.users {

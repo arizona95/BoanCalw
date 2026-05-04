@@ -55,7 +55,7 @@ LogStep "Wazuh Agent MSI 다운로드: $InstallerUrl"
 Invoke-WebRequest -Uri $InstallerUrl -OutFile $InstallerPath -UseBasicParsing
 
 # 3) 설치 + 등록
-LogStep "Wazuh Agent 설치 (manager=$ManagerHost:$ManagerPort, group=$GroupName)"
+LogStep "Wazuh Agent 설치 (manager=${ManagerHost}:${ManagerPort}, group=${GroupName})"
 $msiArgs = @(
     "/i", "`"$InstallerPath`"",
     "/q",
@@ -70,7 +70,52 @@ if ($proc.ExitCode -ne 0) {
     throw "MSI install failed with exit code $($proc.ExitCode)"
 }
 
-# 4) 서비스 시작
+# 4a) Sysmon 설치 — Windows 기본 process audit 은 부족. Sysmon event 1 (process
+# create) 가 boan_killchain_rules.xml 의 매칭 source.
+# 이미 깔려있으면 skip. config 는 SwiftOnSecurity 의 sysmonconfig-export.xml 사용
+# (process create + network connect + image load 광범위 수집 — boanclaw 에 충분).
+LogStep "Sysmon 설치 확인..."
+$sysmonInstalled = Get-Service -Name "Sysmon64" -ErrorAction SilentlyContinue
+if (-not $sysmonInstalled) {
+    $sysmonZip = "$env:TEMP\Sysmon.zip"
+    $sysmonDir = "$env:TEMP\Sysmon"
+    LogStep "  download Sysmon (sysinternals)"
+    Invoke-WebRequest -Uri "https://download.sysinternals.com/files/Sysmon.zip" -OutFile $sysmonZip -UseBasicParsing
+    if (Test-Path $sysmonDir) { Remove-Item -Recurse -Force $sysmonDir }
+    Expand-Archive -Path $sysmonZip -DestinationPath $sysmonDir -Force
+    $sysmonExe = Join-Path $sysmonDir "Sysmon64.exe"
+    $configUrl = "https://raw.githubusercontent.com/SwiftOnSecurity/sysmon-config/master/sysmonconfig-export.xml"
+    $configPath = "$env:TEMP\sysmonconfig.xml"
+    LogStep "  download sysmon config (SwiftOnSecurity baseline)"
+    Invoke-WebRequest -Uri $configUrl -OutFile $configPath -UseBasicParsing
+    LogStep "  install Sysmon64 with config"
+    & $sysmonExe -accepteula -i $configPath | Out-Null
+} else {
+    LogStep "  Sysmon64 이미 설치됨 — skip"
+}
+
+# 4b) Wazuh agent ossec.conf 에 Microsoft-Windows-Sysmon/Operational 채널 추가.
+# 기본은 안 들어있어서 sysmon event 가 manager 로 안 감.
+$ossecConf = "C:\Program Files (x86)\ossec-agent\ossec.conf"
+if (Test-Path $ossecConf) {
+    $cfg = Get-Content $ossecConf -Raw
+    if ($cfg -notmatch "Microsoft-Windows-Sysmon/Operational") {
+        LogStep "ossec.conf 에 Sysmon eventchannel 추가"
+        $sysmonBlock = @"
+  <localfile>
+    <location>Microsoft-Windows-Sysmon/Operational</location>
+    <log_format>eventchannel</log_format>
+  </localfile>
+"@
+        # </ossec_config> 직전 삽입
+        $cfg = $cfg -replace "</ossec_config>", "$sysmonBlock`n</ossec_config>"
+        Set-Content -Path $ossecConf -Value $cfg -Encoding UTF8
+    } else {
+        LogStep "  Sysmon eventchannel 이미 등록됨"
+    }
+}
+
+# 5) 서비스 시작
 LogStep "Wazuh 서비스 시작..."
 Start-Service -Name "Wazuh"
 Start-Sleep -Seconds 3

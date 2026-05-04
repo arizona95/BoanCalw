@@ -171,6 +171,19 @@ type DialogTurn struct {
 	Role     string   `json:"role"` // "llm" | "human"
 	Content  string   `json:"content"`
 	Examples []string `json:"examples,omitempty"`
+
+	// Action — 이 LLM 턴이 어떤 종류의 응답인지 기록 (rehydration 용).
+	// "ASK_FOLLOWUP" | "REQUEST_LABEL_FIX" | "UPDATE_WIKI" | "CLOSE_AND_FIND_NEW"
+	// human 턴에는 빈 문자열.
+	Action string `json:"action,omitempty"`
+
+	// LabelFixTarget — legacy 단일 제안 (호환). 새 응답은 LabelFixBatch 사용.
+	LabelFixTarget map[string]any `json:"label_fix_target,omitempty"`
+
+	// LabelFixBatch — REQUEST_LABEL_FIX 턴이 여러 항목을 한 번에 제안할 때.
+	// 각 항목: {decision_id, decision_text, current_label: "allow"|"deny",
+	// suggested_label: "allow"|"deny", reason}. UI 는 행마다 토글 + 일괄 적용.
+	LabelFixBatch []map[string]any `json:"label_fix_batch,omitempty"`
 }
 type ClarificationDialog struct {
 	ID          string       `json:"id,omitempty"`
@@ -926,13 +939,14 @@ func RunAgenticIterate(ctx context.Context, gc *GraphClient, llm LLMConfig, dial
 //
 // LLM 은 OpenAI 호환 chat endpoint 호출 (role=g3 또는 agentic_iterate).
 type ChatContinueResult struct {
-	Action         string                 `json:"action"`
-	Message        string                 `json:"message"`
-	Examples       []string               `json:"examples,omitempty"`
-	WikiUpdate     *AgenticIterateResult  `json:"wiki_update,omitempty"`
-	LabelFixTarget map[string]interface{} `json:"label_fix_target,omitempty"`
-	LLMRaw         string                 `json:"llm_raw,omitempty"`
-	Errors         []string               `json:"errors,omitempty"`
+	Action         string                   `json:"action"`
+	Message        string                   `json:"message"`
+	Examples       []string                 `json:"examples,omitempty"`
+	WikiUpdate     *AgenticIterateResult    `json:"wiki_update,omitempty"`
+	LabelFixTarget map[string]interface{}   `json:"label_fix_target,omitempty"`
+	LabelFixBatch  []map[string]interface{} `json:"label_fix_batch,omitempty"`
+	LLMRaw         string                   `json:"llm_raw,omitempty"`
+	Errors         []string                 `json:"errors,omitempty"`
 }
 
 func RunChatContinue(ctx context.Context, gc *GraphClient, llm LLMConfig, dialogID string) (*ChatContinueResult, error) {
@@ -977,7 +991,12 @@ func RunChatContinue(ctx context.Context, gc *GraphClient, llm LLMConfig, dialog
 		if len(txt) > 80 {
 			txt = txt[:80] + "..."
 		}
-		fmt.Fprintf(&decSummary, "  - [%s] %q (id=%s)\n", d.Decision, txt, d.ID)
+		// 옛 "approve" 데이터는 LLM 에 보낼 때 "allow" 로 정규화 — 코드베이스 전반의 단일 어휘.
+		label := d.Decision
+		if strings.EqualFold(label, "approve") {
+			label = "allow"
+		}
+		fmt.Fprintf(&decSummary, "  - [%s] %q (id=%s)\n", label, txt, d.ID)
 	}
 
 	system := "You are the organization's guardrail wiki curator. You are having an ongoing " +
@@ -986,15 +1005,18 @@ func RunChatContinue(ctx context.Context, gc *GraphClient, llm LLMConfig, dialog
 		"You MUST pick ONE of these 4 actions:\n" +
 		"  1. ASK_FOLLOWUP       — the answer is good but something is still unclear.\n" +
 		"                          Ask ONE concrete follow-up question.\n" +
-		"  2. REQUEST_LABEL_FIX  — ★PROACTIVE★: scan 'RECENT DECISIONS' list yourself. If any\n" +
-		"                          past decision contradicts the rule that was just clarified\n" +
-		"                          (e.g. something was approved but the new rule says it should\n" +
-		"                          be deny), flag it. **You must ASK, not apply.** Phrase your\n" +
-		"                          message as a question with Accept/Reject framing, e.g.:\n" +
-		"                          \"'X' 결정이 방금 확립된 기준과 어긋나 보입니다. deny 로\n" +
-		"                           고치는 게 맞을까요? (아래 Accept/Reject 버튼 클릭)\"\n" +
+		"  2. REQUEST_LABEL_FIX  — ★BATCH PROACTIVE★: scan 'RECENT DECISIONS'. Flag **EVERY**\n" +
+		"                          past decision that contradicts the rule just clarified —\n" +
+		"                          do NOT ask one-by-one. Return them as an array in\n" +
+		"                          'label_fix_batch'. Each item has decision_id (must EXACTLY\n" +
+		"                          match an id from RECENT DECISIONS — no fabrication),\n" +
+		"                          decision_text, current_label, suggested_label (allow|deny),\n" +
+		"                          reason. **You must ASK, not apply.** Phrase your message as\n" +
+		"                          a question with Accept/Reject framing, e.g.:\n" +
+		"                          \"~~ 기준에 따르면 다음 라벨들이 수정이 필요해 보입니다.\n" +
+		"                           아래 항목별 토글로 allow/deny 정한 후 Accept 누르세요.\"\n" +
 		"                          Do NOT write '고치겠습니다' or anything that implies the LLM\n" +
-		"                          already applied the fix — user decides by clicking the button.\n" +
+		"                          already applied the fix.\n" +
 		"  3. UPDATE_WIKI        — the conversation reached a clear, actionable rule.\n" +
 		"                          Ready to update the wiki. (The server will run agentic_iterate\n" +
 		"                          right after to apply the edits.)\n" +
@@ -1003,18 +1025,22 @@ func RunChatContinue(ctx context.Context, gc *GraphClient, llm LLMConfig, dialog
 		"DECISION PRIORITY (when multiple criteria match):\n" +
 		"  Whenever you successfully 'UPDATE_WIKI' in a previous turn, **the next turn should\n" +
 		"  first look for REQUEST_LABEL_FIX candidates** in RECENT DECISIONS before choosing\n" +
-		"  CLOSE_AND_FIND_NEW. That way admin gets to accept/reject relabeling proactively.\n\n" +
+		"  CLOSE_AND_FIND_NEW. Bundle them all into one batch — don't drip them.\n\n" +
 		"Reply with STRICT JSON ONLY, no markdown, no code fence:\n" +
 		"{\n" +
 		"  \"action\": \"ASK_FOLLOWUP|REQUEST_LABEL_FIX|UPDATE_WIKI|CLOSE_AND_FIND_NEW\",\n" +
-		"  \"message\": \"<Korean reply, 1-3 sentences — question form for REQUEST_LABEL_FIX>\",\n" +
+		"  \"message\": \"<Korean reply, 1-3 sentences>\",\n" +
 		"  \"examples\": [\"(optional) supporting bullet\"],\n" +
-		"  \"label_fix\": { \"decision_id\": \"<id from RECENT DECISIONS>\", \"decision_text\": \"<exact text>\", \"current_label\": \"approve|deny\", \"suggested_label\": \"approve|deny\", \"reason\": \"<why this violates the new rule>\" }\n" +
+		"  \"label_fix_batch\": [\n" +
+		"    { \"decision_id\": \"<id from RECENT DECISIONS>\", \"decision_text\": \"<exact text>\", \"current_label\": \"allow|deny\", \"suggested_label\": \"allow|deny\", \"reason\": \"<why>\" },\n" +
+		"    { \"decision_id\": \"<id>\", \"decision_text\": \"<exact text>\", \"current_label\": \"allow|deny\", \"suggested_label\": \"allow|deny\", \"reason\": \"<why>\" }\n" +
+		"  ]\n" +
 		"}\n\n" +
 		"Rules:\n" +
 		"  • Korean replies. Short, natural conversational tone.\n" +
-		"  • REQUEST_LABEL_FIX 일 때만 label_fix 필드 작성. 아니면 생략.\n" +
-		"  • label_fix.decision_id MUST exactly match an id from RECENT DECISIONS.\n" +
+		"  • REQUEST_LABEL_FIX 일 때만 label_fix_batch 작성. 아니면 생략.\n" +
+		"  • label_fix_batch[].decision_id MUST exactly match an id from RECENT DECISIONS — never invent IDs.\n" +
+		"  • Labels are 'allow' or 'deny' only. Legacy 'approve' on input → treat as 'allow'.\n" +
 		"  • 단일 answer 로 규칙 명확해졌으면 UPDATE_WIKI 선택 (연속으로 질문만 계속 하지 말 것).\n" +
 		"  • CLOSE_AND_FIND_NEW 는 REQUEST_LABEL_FIX 후보가 없을 때만.\n"
 
@@ -1038,10 +1064,11 @@ func RunChatContinue(ctx context.Context, gc *GraphClient, llm LLMConfig, dialog
 		}, nil
 	}
 	var parsed struct {
-		Action   string   `json:"action"`
-		Message  string   `json:"message"`
-		Examples []string `json:"examples"`
-		LabelFix map[string]interface{} `json:"label_fix"`
+		Action        string                   `json:"action"`
+		Message       string                   `json:"message"`
+		Examples      []string                 `json:"examples"`
+		LabelFix      map[string]interface{}   `json:"label_fix"`
+		LabelFixBatch []map[string]interface{} `json:"label_fix_batch"`
 	}
 	if jerr := json.Unmarshal([]byte(jsonStr), &parsed); jerr != nil {
 		return &ChatContinueResult{
@@ -1059,12 +1086,41 @@ func RunChatContinue(ctx context.Context, gc *GraphClient, llm LLMConfig, dialog
 		LLMRaw:   raw,
 	}
 
-	// 3) 새 LLM 턴을 dialog 에 append
-	target.Turns = append(target.Turns, DialogTurn{
+	// 3) 새 LLM 턴을 dialog 에 append — action/target 를 함께 기록해서
+	// 페이지 새로고침 후에도 UI 가 말풍선 바로 아래 Accept/Reject 버튼을
+	// 재렌더할 수 있게 한다.
+	newTurn := DialogTurn{
 		Role:     "llm",
 		Content:  parsed.Message,
 		Examples: parsed.Examples,
-	})
+		Action:   strings.ToUpper(strings.TrimSpace(parsed.Action)),
+	}
+	if newTurn.Action == "REQUEST_LABEL_FIX" {
+		// 1) batch 우선 — LLM 이 label_fix_batch 로 여러 항목 보냈으면 그대로.
+		// 2) legacy 단일 label_fix 만 있으면 batch 의 첫 원소로 승격.
+		batch := parsed.LabelFixBatch
+		if len(batch) == 0 && len(parsed.LabelFix) > 0 {
+			batch = []map[string]interface{}{parsed.LabelFix}
+		}
+		// 라벨 정규화: legacy "approve" → "allow".
+		for i := range batch {
+			for _, k := range []string{"current_label", "suggested_label"} {
+				if v, ok := batch[i][k].(string); ok && strings.EqualFold(strings.TrimSpace(v), "approve") {
+					batch[i][k] = "allow"
+				}
+			}
+		}
+		newTurn.LabelFixBatch = batch
+		// 호환: UI 가 legacy LabelFixTarget 만 보던 경우 첫 원소를 함께 채움.
+		if len(batch) > 0 {
+			newTurn.LabelFixTarget = batch[0]
+		}
+		result.LabelFixBatch = batch
+		if len(batch) > 0 {
+			result.LabelFixTarget = batch[0]
+		}
+	}
+	target.Turns = append(target.Turns, newTurn)
 
 	// 4) action 별 side effect
 	switch result.Action {
@@ -1081,7 +1137,6 @@ func RunChatContinue(ctx context.Context, gc *GraphClient, llm LLMConfig, dialog
 		if ferr != nil {
 			result.Errors = append(result.Errors, "find_ambiguous: "+ferr.Error())
 		} else if fa != nil && len(fa.DialogsCreated) > 0 {
-			// 방금 생성된 dialog id 들을 전체 조회해서 첫 번째의 마지막 LLM 턴을 이관.
 			allAfter, _ := gc.ListDialogsRaw(ctx, 200)
 			var firstNewDialog *ClarificationDialog
 			for i := range allAfter {
@@ -1098,12 +1153,14 @@ func RunChatContinue(ctx context.Context, gc *GraphClient, llm LLMConfig, dialog
 			if firstNewDialog != nil && len(firstNewDialog.Turns) > 0 {
 				last := firstNewDialog.Turns[len(firstNewDialog.Turns)-1]
 				target.Turns = append(target.Turns, DialogTurn{
-					Role:     "llm",
-					Content:  last.Content,
-					Examples: last.Examples,
+					Role:           "llm",
+					Content:        last.Content,
+					Examples:       last.Examples,
+					Action:         last.Action,
+					LabelFixTarget: last.LabelFixTarget,
+					LabelFixBatch:  last.LabelFixBatch,
 				})
 			}
-			// find_ambiguous 가 만든 sub-dialog 전부 정리.
 			for _, id := range fa.DialogsCreated {
 				if id != "" && id != dialogID {
 					_ = gc.DeleteDialog(ctx, id)
@@ -1111,10 +1168,9 @@ func RunChatContinue(ctx context.Context, gc *GraphClient, llm LLMConfig, dialog
 			}
 		}
 	case "REQUEST_LABEL_FIX":
-		result.LabelFixTarget = parsed.LabelFix
-		// 실제 HITL 승인 큐 항목 생성은 proxy 레벨에서 수행 (wikiskills 는 policy-server 만 다룸).
+		// 위에서 batch + 정규화 + Target 까지 채워둠. 추가 작업 없음.
 	case "ASK_FOLLOWUP":
-		// 아무 side effect 없음, message 만 추가됨.
+		// message 만 추가, side effect 없음
 	default:
 		result.Action = "ASK_FOLLOWUP"
 		result.Errors = append(result.Errors, "unknown action returned; defaulted to ASK_FOLLOWUP")

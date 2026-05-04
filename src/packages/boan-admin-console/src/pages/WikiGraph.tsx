@@ -292,23 +292,72 @@ export default function WikiGraph() {
     }
   }, []);
 
-  const loadRaw = useCallback(async () => {
+  const loadDecisions = useCallback(async () => {
     try {
-      const [ds, dlgs] = await Promise.all([
-        wikiGraphApi.listDecisions(200),
-        wikiGraphApi.listDialogs(100),
-      ]);
+      const ds = await wikiGraphApi.listDecisions(200);
       setDecisions(ds);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    }
+  }, []);
+  const loadDialogsOnly = useCallback(async () => {
+    try {
+      const dlgs = await wikiGraphApi.listDialogs(100);
       setDialogs(dlgs);
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
     }
   }, []);
+  // loadRaw — 양쪽(raw + dialog) 다 필요할 때만 사용. chat_continue 후에는
+  // loadDialogsOnly 만 쓰자 — 200 개 decision 을 Cloud Run 에서 매번 끌어오면
+  // cold-start + 큰 payload 때문에 UI 가 자주 타임아웃.
+  const loadRaw = useCallback(async () => {
+    await Promise.all([loadDecisions(), loadDialogsOnly()]);
+  }, [loadDecisions, loadDialogsOnly]);
 
   useEffect(() => { loadNodes(); }, [loadNodes]);
   useEffect(() => {
-    if (tab === "raw" || tab === "dialog") loadRaw();
-  }, [tab, loadRaw]);
+    if (tab === "raw") {
+      void loadDecisions();
+      void loadDialogsOnly();
+    } else if (tab === "dialog") {
+      void loadDialogsOnly();
+    }
+  }, [tab, loadDecisions, loadDialogsOnly]);
+
+  // submitHumanReply — "답변 + 🤖" 버튼 / HITL Accept-Reject / Enter 키가 공통
+  // 으로 쓰는 dialog-advance 헬퍼.
+  //
+  // 낙관적 업데이트: human 턴은 API 응답을 기다리지 않고 즉시 UI 에 표시.
+  // LLM 이 생각하는 동안에는 `iterating=true` 로 세팅 → dialog 하단에 "..."
+  // typing-indicator 말풍선 렌더. 서버 응답 오면 dialog 전체를 reload 해서
+  // 최종 턴들로 교체.
+  const submitHumanReply = useCallback(async (answer: string) => {
+    const primary = dialogs[0];
+    if (!primary || !answer.trim()) return;
+    const optimistic = {
+      ...primary,
+      turns: [...primary.turns, { role: "human" as const, content: answer }],
+    };
+    // 낙관적 렌더 — human 말풍선 즉시 표시.
+    setDialogs([optimistic, ...dialogs.slice(1)]);
+    setIterating(true);
+    setErr(null);
+    try {
+      await wikiGraphApi.upsertDialog(optimistic);
+      const res = await wikiGraphApi.chatContinue(primary.id!);
+      setLastAction(res);
+      // Dialog 탭에서는 dialog list 만 다시 가져오면 됨. 200 개 decision 은
+      // Raw 탭 켰을 때만 땡긴다 (Cloud Run cold-start 부담 방지).
+      await loadDialogsOnly();
+      if (res.action === "UPDATE_WIKI") await loadNodes();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+      await loadDialogsOnly();
+    } finally {
+      setIterating(false);
+    }
+  }, [dialogs, loadNodes, loadDialogsOnly]);
 
   const tree = useMemo(() => buildTree(nodes), [nodes]);
   const selectedNode = useMemo(
@@ -556,13 +605,13 @@ export default function WikiGraph() {
                   {decisions.length === 0 ? (
                     <tr><td colSpan={5} className="text-center py-12 text-gray-400">아직 라벨링된 결정이 없습니다.</td></tr>
                   ) : decisions.map((d) => (
-                    <tr key={d.id} className={d.decision === "approve" ? "" : "bg-red-50/30"}>
+                    <tr key={d.id} className={(d.decision === "allow" || d.decision === "approve") ? "" : "bg-red-50/30"}>
                       <td className="px-3 py-2 text-[10px] text-gray-400 font-mono">
                         {d.timestamp ? new Date(d.timestamp).toLocaleString("ko-KR", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "-"}
                       </td>
                       <td className="px-3 py-2">
                         <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${
-                          d.decision === "approve" ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"
+                          (d.decision === "allow" || d.decision === "approve") ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"
                         }`}>{d.decision}</span>
                       </td>
                       <td className="px-3 py-2 text-gray-600 text-[11px]">{d.reason}</td>
@@ -578,47 +627,155 @@ export default function WikiGraph() {
 
         {/* ── Dialog 탭 ── */}
         {tab === "dialog" && (() => {
-          // ── 단일 통합 대화 (primary) ────────────────────────────
-          // 여러 dialog 이 있으면 첫 번째를 primary 로 사용 (나머지는 backend
-          // CLOSE_AND_FIND_NEW 가 자동 정리). UI 는 하나의 연속된 chat.
           const primary = dialogs[0];
+          const turns = primary?.turns ?? [];
+          // 가장 최근 LLM 턴 index — Accept/Reject 버튼은 이 턴 바로 아래에만 붙임.
+          let lastLLMIdx = -1;
+          for (let i = turns.length - 1; i >= 0; i--) {
+            if (turns[i].role === "llm") { lastLLMIdx = i; break; }
+          }
+          // 가장 최근 턴이 human 이면 LLM 차례 → "LLM 먼저 물어보기" 버튼 안내.
+          const lastTurn = turns[turns.length - 1];
+          const llmTurnReady =
+            !primary || !lastTurn || lastTurn.role === "human"
+              ? false
+              : true;
+          // 첫 질문을 LLM 이 먼저 내게 하는 핸들러. primary 있으면 chat_continue
+          // 를 호출해서 LLM 이 다음 애매한 케이스를 찾아내도록 함. 없으면
+          // find_ambiguous 로 새 dialog 생성.
+          const askLLMFirst = async () => {
+            setIterating(true);
+            setErr(null);
+            setMsg(null);
+            try {
+              if (!primary) {
+                await findAmbiguous();
+                return;
+              }
+              // primary 가 있으면 조용히 "다음 애매한 케이스 제기해주세요" 힌트를
+              // human 턴으로 붙이고 chat_continue 호출.
+              await wikiGraphApi.upsertDialog({
+                ...primary,
+                turns: [
+                  ...primary.turns,
+                  {
+                    role: "human",
+                    content: "(시스템) 아직 결정이 안 난 애매한 케이스를 찾아서 먼저 제기해주세요.",
+                  },
+                ],
+              });
+              const res = await wikiGraphApi.chatContinue(primary.id!);
+              setLastAction(res);
+              await loadRaw();
+              if (res.action === "UPDATE_WIKI") await loadNodes();
+            } catch (e) {
+              setErr(e instanceof Error ? e.message : String(e));
+            } finally {
+              setIterating(false);
+            }
+          };
           return (
             <div className="flex-1 min-h-0 flex flex-col bg-white border border-gray-200 rounded-xl overflow-hidden">
-              <div className="px-4 py-2 border-b border-gray-100 flex items-center justify-between">
+              <div className="px-4 py-2 border-b border-gray-100 flex items-center justify-between gap-2">
                 <div className="min-w-0">
                   <div className="text-sm font-medium text-gray-700">💬 G3 Wiki 대화 (agentic loop)</div>
                   <div className="text-[10px] text-gray-500">
                     {primary
-                      ? `${primary.turns.length} 턴 · LLM 이 애매한 경계를 찾고 당신 답변을 반영 → wiki 진화. ASK / FIX / UPDATE / CLOSE 분기`
-                      : "대화 없음. 아래 버튼으로 첫 질문을 LLM 이 생성하도록 요청"}
+                      ? `${turns.length} 턴 · LLM 이 애매한 경계를 찾고 당신 답변을 반영 → wiki 진화.`
+                      : "대화 없음. 아래 '🔍 LLM 이 먼저 묻기' 로 첫 질문 생성"}
                   </div>
                 </div>
-                {!primary && (
-                  <button
-                    onClick={findAmbiguous}
-                    disabled={finding}
-                    className="text-xs px-3 py-1.5 bg-boan-600 text-white rounded hover:bg-boan-700 disabled:opacity-40 font-medium"
-                  >
-                    {finding ? "🔍 분석 중..." : "🔍 첫 질문 생성"}
-                  </button>
-                )}
+                <button
+                  onClick={askLLMFirst}
+                  disabled={iterating || finding}
+                  title="LLM 이 과거 결정 중 애매한 케이스를 찾아 먼저 질문하게 합니다"
+                  className="text-xs px-3 py-1.5 bg-boan-600 text-white rounded hover:bg-boan-700 disabled:opacity-40 font-medium whitespace-nowrap"
+                >
+                  {iterating || finding ? "🔍 분석 중..." : "🔍 LLM 이 먼저 묻기"}
+                </button>
               </div>
               <div className="flex-1 overflow-y-auto p-4 space-y-3">
                 {primary ? (
-                  primary.turns.map((t, i) => <DialogTurnView key={i} turn={t} />)
+                  turns.map((t, i) => {
+                    // batch 우선 — 여러 항목 제안 시 LabelFixBatchProposal, 아니면 legacy 단일.
+                    const turnBatch = (t as { label_fix_batch?: Array<Record<string, unknown>> }).label_fix_batch;
+                    const lastBatch = (lastAction as { label_fix_batch?: Array<Record<string, unknown>> } | null | undefined)?.label_fix_batch;
+                    const batch = turnBatch ?? lastBatch;
+                    const target = t.label_fix_target ?? (lastAction?.label_fix_target as Record<string, unknown> | undefined);
+                    const isLabelFixTurn =
+                      i === lastLLMIdx &&
+                      ((t.action === "REQUEST_LABEL_FIX" && (target || (batch && batch.length))) ||
+                        (lastAction?.action === "REQUEST_LABEL_FIX" && (target || (batch && batch.length))));
+                    return (
+                      <div key={i}>
+                        <DialogTurnView turn={t} />
+                        {isLabelFixTurn && (
+                          <div className="mt-2 ml-6">
+                            {batch && batch.length > 1 ? (
+                              <LabelFixBatchProposal
+                                items={batch}
+                                onApplied={async () => {
+                                  await loadRaw();
+                                  setLastAction(null);
+                                }}
+                                onDismiss={() => setLastAction(null)}
+                                onHumanReply={submitHumanReply}
+                              />
+                            ) : target || (batch && batch.length === 1) ? (
+                              <LabelFixProposal
+                                target={(target ?? batch![0]) as Record<string, unknown>}
+                                onApplied={async () => {
+                                  await loadRaw();
+                                  setLastAction(null);
+                                }}
+                                onDismiss={() => setLastAction(null)}
+                                onHumanReply={submitHumanReply}
+                              />
+                            ) : null}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })
                 ) : (
                   <div className="h-full flex items-center justify-center text-sm text-gray-400 text-center">
-                    아직 대화가 없습니다. 상단 '🔍 첫 질문 생성' 을 누르면 LLM 이 과거 decision 중 애매한 경계를 찾아 첫 질문을 만듭니다.
+                    아직 대화가 없습니다. 상단 '🔍 LLM 이 먼저 묻기' 를 누르면 LLM 이 과거 결정 중 애매한 경계를 찾아 먼저 질문합니다.
                   </div>
                 )}
-                {iterating && <div className="text-[10px] text-gray-400 italic">LLM 이 응답 생성 중...</div>}
+                {iterating && <DialogTypingIndicator />}
+                {llmTurnReady && !iterating && lastTurn?.role === "llm" && lastTurn.action !== "REQUEST_LABEL_FIX" && (
+                  <div className="text-center pt-2">
+                    <button
+                      onClick={askLLMFirst}
+                      disabled={iterating}
+                      className="text-[11px] px-3 py-1 bg-gray-100 text-gray-600 border border-gray-200 rounded hover:bg-gray-200 disabled:opacity-40"
+                    >
+                      → LLM 에게 다음 애매한 케이스 찾아달라고 하기
+                    </button>
+                  </div>
+                )}
               </div>
               {primary && (
                 <div className="border-t border-gray-100 p-3 flex gap-2">
                   <textarea
                     value={userMsg}
                     onChange={(e) => setUserMsg(e.target.value)}
-                    placeholder="답변 입력... (LLM 이 action 결정: ASK / FIX / UPDATE / CLOSE_AND_NEW)"
+                    onKeyDown={(e) => {
+                      // Enter → 전송, Shift+Enter → 줄바꿈.
+                      // IME 조합 중(한글 등) 엔터는 confirm 용이므로 무시.
+                      if (
+                        e.key === "Enter" &&
+                        !e.shiftKey &&
+                        !e.nativeEvent.isComposing
+                      ) {
+                        e.preventDefault();
+                        const answer = userMsg.trim();
+                        if (!answer || iterating) return;
+                        setUserMsg("");
+                        void submitHumanReply(answer);
+                      }
+                    }}
+                    placeholder="답변 입력 후 Enter (Shift+Enter 는 줄바꿈) — LLM action: ASK / FIX / UPDATE / CLOSE"
                     rows={2}
                     className="flex-1 text-xs border border-gray-200 rounded px-2 py-1 resize-none"
                   />
@@ -627,18 +784,7 @@ export default function WikiGraph() {
                     onClick={async () => {
                       const answer = userMsg.trim();
                       setUserMsg("");
-                      setIterating(true);
-                      try {
-                        await wikiGraphApi.upsertDialog({ ...primary, turns: [...primary.turns, { role: "human", content: answer }] });
-                        const res = await wikiGraphApi.chatContinue(primary.id!);
-                        setLastAction(res);
-                        await loadRaw();
-                        if (res.action === "UPDATE_WIKI") await loadNodes();
-                      } catch (e) {
-                        setErr(e instanceof Error ? e.message : String(e));
-                      } finally {
-                        setIterating(false);
-                      }
+                      await submitHumanReply(answer);
                     }}
                     className="text-xs px-4 py-1 bg-boan-600 text-white rounded hover:bg-boan-700 disabled:opacity-40 self-end"
                   >
@@ -663,18 +809,6 @@ export default function WikiGraph() {
                   })()}
                 </div>
               )}
-              {/* REQUEST_LABEL_FIX 제안 카드 — Accept/Reject 로 사용자 결정 받아야 실제 적용 */}
-              {lastAction && lastAction.action === "REQUEST_LABEL_FIX" && lastAction.label_fix_target && (
-                <LabelFixProposal
-                  target={lastAction.label_fix_target as Record<string, unknown>}
-                  onApplied={async () => {
-                    await loadRaw();
-                    setLastAction(null);
-                  }}
-                  onDismiss={() => setLastAction(null)}
-                />
-              )}
-              {/* UPDATE_WIKI 후 큰 변경 — 자동 개정 제안이 Approvals 에 등록됨 */}
               {lastAction && Array.isArray(lastAction.pending_amendment) && lastAction.pending_amendment.length > 0 && (
                 <div className="mx-4 my-3 rounded-lg border-2 border-blue-300 bg-blue-50 p-3 text-xs">
                   <div className="font-semibold text-blue-800 mb-1">
@@ -682,7 +816,6 @@ export default function WikiGraph() {
                   </div>
                   <div className="text-blue-700 mb-2">
                     G1 (정규식) / G2 (헌법) 개정 diff 가 <strong>Approvals 탭</strong> 에 pending 으로 등록됐습니다.
-                    내용 확인 후 수락하면 정책 버전 ++.
                   </div>
                   <div className="flex gap-1 flex-wrap text-[10px] font-mono">
                     {lastAction.pending_amendment.map((id, i) => (
@@ -697,6 +830,30 @@ export default function WikiGraph() {
             </div>
           );
         })()}
+      </div>
+    </div>
+  );
+}
+
+// DialogTypingIndicator — LLM 이 응답 생성 중인 동안 말풍선 자리에 뜨는
+// "..." 애니메이션. DialogTurnView 와 같은 좌측 LLM 말풍선 레이아웃을 유지.
+function DialogTypingIndicator() {
+  return (
+    <div className="flex justify-start">
+      <div className="max-w-[80%] rounded-lg px-3 py-2 text-xs bg-boan-50 border border-boan-200 text-gray-800">
+        <div className="text-[10px] font-semibold mb-1 text-boan-700">🤖 LLM</div>
+        <div className="flex items-center gap-1 text-boan-500">
+          <span className="inline-block h-1.5 w-1.5 rounded-full bg-boan-400 animate-bounce" />
+          <span
+            className="inline-block h-1.5 w-1.5 rounded-full bg-boan-400 animate-bounce"
+            style={{ animationDelay: "0.15s" }}
+          />
+          <span
+            className="inline-block h-1.5 w-1.5 rounded-full bg-boan-400 animate-bounce"
+            style={{ animationDelay: "0.3s" }}
+          />
+          <span className="ml-2 text-[10px] italic opacity-70">생각 중...</span>
+        </div>
       </div>
     </div>
   );
@@ -733,15 +890,22 @@ function DialogTurnView({ turn }: { turn: DialogTurn }) {
 }
 
 // LabelFixProposal — LLM 이 REQUEST_LABEL_FIX 로 제안한 decision 재라벨을
-// 사용자가 Accept/Reject 하는 카드. Accept 시에만 실제 decision store 수정.
+// 사용자가 Accept/Reject 하는 카드.
+//
+// 수락/거절 클릭 자체가 human 응답으로 취급되어, 클릭 직후 synthesized human
+// turn 이 dialog 에 append 되고 chat_continue 가 자동 호출돼 LLM 이 다음 턴을
+// 이어간다. 사용자가 따로 "수락했어" 라고 또 타이핑할 필요 없음.
 function LabelFixProposal({
   target,
   onApplied,
   onDismiss,
+  onHumanReply,
 }: {
   target: Record<string, unknown>;
   onApplied: () => void | Promise<void>;
   onDismiss: () => void;
+  /** HITL 버튼 클릭을 사용자 답변으로 간주해서 LLM 에게 자동 전달 */
+  onHumanReply: (text: string) => void | Promise<void>;
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -754,6 +918,8 @@ function LabelFixProposal({
 
   const canApply = Boolean(decisionID && (suggestedLabel === "approve" || suggestedLabel === "deny"));
 
+  const shortText = decisionText ? (decisionText.length > 40 ? decisionText.slice(0, 40) + "…" : decisionText) : decisionID;
+
   const handleAccept = async () => {
     if (!canApply) {
       setError("decision_id 또는 suggested_label 누락 — LLM 응답 확인 필요");
@@ -763,8 +929,22 @@ function LabelFixProposal({
     try {
       await wikiGraphApi.labelFixApply(decisionID, suggestedLabel as "approve" | "deny", reason);
       await onApplied();
+      // 버튼 클릭 자체가 human 답변. LLM 이 자동으로 다음 턴 이어감.
+      const summary = `(HITL 수락) '${shortText}' 라벨을 ${currentLabel} → ${suggestedLabel} 로 변경했습니다. 다음 애매한 케이스 찾아주세요.`;
+      void onHumanReply(summary);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleReject = async () => {
+    setBusy(true); setError(null);
+    try {
+      onDismiss();
+      const summary = `(HITL 거절) '${shortText}' 현재 라벨 ${currentLabel} 유지. 다른 애매한 케이스를 찾아주세요.`;
+      await onHumanReply(summary);
     } finally {
       setBusy(false);
     }
@@ -780,7 +960,7 @@ function LabelFixProposal({
           onClick={onDismiss}
           disabled={busy}
           className="text-orange-600 hover:text-orange-800 text-[10px]"
-          title="닫기 (적용 안 함)"
+          title="닫기 (아무 action 안 함 — LLM 에도 전달 안 됨)"
         >
           ✕
         </button>
@@ -804,15 +984,176 @@ function LabelFixProposal({
           disabled={busy || !canApply}
           className="px-3 py-1.5 rounded bg-orange-600 text-white text-[11px] font-medium hover:bg-orange-700 disabled:opacity-50"
         >
-          {busy ? "적용 중..." : "✓ 수락 — 적용"}
+          {busy ? "적용 중..." : "✓ 수락 — 적용하고 LLM 계속"}
         </button>
         <button
-          onClick={onDismiss}
+          onClick={handleReject}
           disabled={busy}
           className="px-3 py-1.5 rounded border border-gray-300 bg-white text-gray-700 text-[11px] hover:bg-gray-50"
         >
-          거절
+          {busy ? "..." : "거절 — LLM 에게 다른 케이스 찾게"}
         </button>
+      </div>
+      <div className="mt-2 text-[10px] text-orange-600">
+        두 버튼 다 자동으로 다음 LLM 응답을 트리거합니다 (따로 답변 타이핑 불필요).
+      </div>
+    </div>
+  );
+}
+
+// LabelFixBatchProposal — LLM 이 한 번에 여러 항목을 재라벨 제안한 경우의 카드.
+// 각 행마다 토글 (allow/deny) 후 일괄 적용. 부분 거절 시 거절된 항목은 적용 안 됨.
+function LabelFixBatchProposal({
+  items,
+  onApplied,
+  onDismiss,
+  onHumanReply,
+}: {
+  items: Array<Record<string, unknown>>;
+  onApplied: () => void | Promise<void>;
+  onDismiss: () => void;
+  onHumanReply: (text: string) => void | Promise<void>;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  // 각 항목의 사용자 결정: applied label (allow|deny) + include 여부.
+  const [rows, setRows] = useState(() =>
+    items.map((it) => ({
+      decisionID: String(it.decision_id ?? ""),
+      decisionText: String(it.decision_text ?? it.decision_id ?? ""),
+      currentLabel: String(it.current_label ?? "?"),
+      // 기본값: LLM 의 suggested_label 그대로 (사용자가 토글로 바꿀 수 있음).
+      chosenLabel: String(it.suggested_label ?? "deny") as "allow" | "deny",
+      include: true,
+      reason: String(it.reason ?? ""),
+      status: "pending" as "pending" | "applied" | "skipped" | "failed",
+      detail: "",
+    }))
+  );
+
+  const toggleLabel = (i: number) => {
+    setRows((prev) => prev.map((r, idx) => (idx === i ? { ...r, chosenLabel: r.chosenLabel === "allow" ? "deny" : "allow" } : r)));
+  };
+  const toggleInclude = (i: number) => {
+    setRows((prev) => prev.map((r, idx) => (idx === i ? { ...r, include: !r.include } : r)));
+  };
+
+  const handleApplyAll = async () => {
+    setBusy(true);
+    setError(null);
+    let applied = 0;
+    let failed = 0;
+    const next = [...rows];
+    for (let i = 0; i < next.length; i++) {
+      const r = next[i];
+      if (!r.include) {
+        next[i] = { ...r, status: "skipped" };
+        continue;
+      }
+      if (!r.decisionID) {
+        next[i] = { ...r, status: "failed", detail: "decision_id 없음" };
+        failed++;
+        continue;
+      }
+      try {
+        await wikiGraphApi.labelFixApply(r.decisionID, r.chosenLabel, r.reason);
+        next[i] = { ...r, status: "applied" };
+        applied++;
+      } catch (e) {
+        next[i] = { ...r, status: "failed", detail: e instanceof Error ? e.message : String(e) };
+        failed++;
+      }
+    }
+    setRows(next);
+    setBusy(false);
+    await onApplied();
+    const summary = `(HITL 일괄 적용) 시도 ${rows.filter((r) => r.include).length}건 중 적용 ${applied}건 / 실패 ${failed}건. 다음 라운드의 애매한 케이스 더 찾아주세요.`;
+    void onHumanReply(summary);
+  };
+
+  const handleRejectAll = async () => {
+    setBusy(true);
+    onDismiss();
+    setBusy(false);
+    void onHumanReply(`(HITL 일괄 거절) ${rows.length}건 모두 현재 라벨 유지. 다른 애매한 케이스를 찾아주세요.`);
+  };
+
+  return (
+    <div className="rounded-lg border-2 border-orange-300 bg-orange-50 p-3 text-xs space-y-2">
+      <div className="flex items-start justify-between gap-2 mb-1">
+        <div className="font-semibold text-orange-800">
+          🏷️ LLM 재라벨 일괄 제안 ({items.length}건) — 항목별 토글 후 Accept
+        </div>
+        <button onClick={onDismiss} disabled={busy} className="text-orange-600 hover:text-orange-800 text-[10px]">
+          ✕
+        </button>
+      </div>
+      <div className="divide-y divide-orange-200 rounded border border-orange-200 bg-white">
+        {rows.map((r, i) => {
+          const shortText = r.decisionText.length > 60 ? r.decisionText.slice(0, 60) + "…" : r.decisionText;
+          return (
+            <div key={i} className="px-2 py-1.5 flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={r.include}
+                onChange={() => toggleInclude(i)}
+                disabled={busy || r.status === "applied"}
+                className="shrink-0"
+                title="이 항목 적용 포함"
+              />
+              <code className="flex-1 font-mono text-[10px] text-gray-800 truncate" title={r.decisionText}>
+                {shortText}
+              </code>
+              <span className="text-gray-400 text-[10px]">→</span>
+              <button
+                onClick={() => toggleLabel(i)}
+                disabled={busy || r.status === "applied"}
+                className={`px-2 py-0.5 rounded text-[10px] font-semibold transition-colors ${
+                  r.chosenLabel === "deny"
+                    ? "bg-red-200 text-red-800 hover:bg-red-300"
+                    : "bg-green-200 text-green-800 hover:bg-green-300"
+                } ${!r.include ? "opacity-40" : ""}`}
+                title="클릭하면 allow ↔ deny 토글"
+              >
+                {r.chosenLabel}
+              </button>
+              <span
+                className={`shrink-0 text-[10px] w-14 text-right ${
+                  r.status === "applied"
+                    ? "text-green-600"
+                    : r.status === "failed"
+                      ? "text-red-600"
+                      : r.status === "skipped"
+                        ? "text-gray-400"
+                        : "text-gray-300"
+                }`}
+                title={r.detail}
+              >
+                {r.status === "pending" ? "대기" : r.status === "applied" ? "✓ 적용" : r.status === "skipped" ? "skip" : "✗ 실패"}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+      {error && <div className="text-red-700 text-[11px]">{error}</div>}
+      <div className="flex gap-2">
+        <button
+          onClick={handleApplyAll}
+          disabled={busy}
+          className="px-3 py-1.5 rounded bg-orange-600 text-white text-[11px] font-medium hover:bg-orange-700 disabled:opacity-50"
+        >
+          {busy ? "적용 중..." : `✓ 일괄 적용 (${rows.filter((r) => r.include).length}건)`}
+        </button>
+        <button
+          onClick={handleRejectAll}
+          disabled={busy}
+          className="px-3 py-1.5 rounded border border-gray-300 bg-white text-gray-700 text-[11px] hover:bg-gray-50"
+        >
+          전체 거절
+        </button>
+      </div>
+      <div className="text-[10px] text-orange-600">
+        체크박스로 개별 항목 제외 가능. 라벨 버튼 클릭으로 allow ↔ deny 토글. 적용 후 LLM 이 다음 케이스 자동 검색.
       </div>
     </div>
   );

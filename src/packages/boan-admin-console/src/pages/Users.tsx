@@ -193,8 +193,15 @@ interface UserRow {
 }
 
 const ROLE_BADGE: Record<string, string> = {
-  owner: "bg-blue-100 text-blue-700",
-  user: "bg-gray-100 text-gray-600",
+  owner:  "bg-blue-100 text-blue-700",
+  user:   "bg-gray-100 text-gray-600",
+  tester: "bg-purple-100 text-purple-700",
+};
+
+const ROLE_LABEL: Record<string, string> = {
+  owner:  "소유자",
+  user:   "사용자",
+  tester: "🧪 테스터",
 };
 
 const ACCESS_LEVEL_STYLE: Record<string, { label: string; bg: string }> = {
@@ -296,11 +303,14 @@ export default function Users() {
             </thead>
             <tbody className="divide-y divide-gray-100">
               {users.map((u) => (
-                <tr key={u.email} className={u.status === "pending" ? "bg-yellow-50" : ""}>
+                <tr key={u.email} className={
+                  u.role === "tester" ? "bg-purple-50" :
+                  u.status === "pending" ? "bg-yellow-50" : ""
+                }>
                   <td className="px-4 py-3 font-mono text-xs text-gray-700">{u.email}</td>
                   <td className="px-4 py-3">
                     <span className={`text-xs font-medium px-2 py-1 rounded-full ${ROLE_BADGE[u.role] ?? "bg-gray-100 text-gray-600"}`}>
-                      {u.role === "owner" ? "소유자" : "사용자"}
+                      {ROLE_LABEL[u.role] ?? "사용자"}
                     </span>
                   </td>
                   <td className="px-4 py-3">
@@ -341,6 +351,14 @@ export default function Users() {
                   <td className="px-4 py-3 text-right">
                     {u.role === "owner" ? (
                       <span className="text-xs text-gray-300">고정</span>
+                    ) : u.role === "tester" ? (
+                      <button
+                        onClick={() => remove(u.email)}
+                        className="text-xs text-purple-500 hover:text-purple-700"
+                        title="테스트 세션 정리"
+                      >
+                        정리
+                      </button>
                     ) : (
                       <button
                         onClick={() => remove(u.email)}

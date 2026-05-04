@@ -48,7 +48,11 @@ func NewWithToken(baseURL, token string) *Client {
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		token:   token,
-		client:  &http.Client{Timeout: 10 * time.Second},
+		// Cloud Run cold-start 는 Go 앱 기준 10–30 초 까지 걸리고, 200+ 개 decision
+		// list 조회처럼 페이로드가 큰 GET 은 응답 헤더 자체가 늦게 온다. 10 s 는
+		// 이런 케이스에서 수시로 timeout 내서 UI 에 "context deadline exceeded" 가
+		// 뜨던 원인. 60 s 로 여유를 두되 개별 호출이 얼마나 걸리든 상한은 잡는다.
+		client: &http.Client{Timeout: 60 * time.Second},
 	}
 }
 
@@ -227,6 +231,29 @@ func (c *Client) UpdatePolicy(orgID string, update map[string]any) error {
 		return nil
 	}
 	return c.doJSON(http.MethodPut, fmt.Sprintf("%s/org/%s/v1/policy", c.baseURL, orgID), update)
+}
+
+// GetPolicy — 조직 policy 전체 (guardrail config 포함) 조회.
+// amendment 제안 생성 시 헌법/G1 패턴을 얻기 위해 proxy-local 경로에서 사용.
+func (c *Client) GetPolicy(orgID string) (map[string]any, error) {
+	if !c.Enabled() {
+		return nil, fmt.Errorf("org server not configured")
+	}
+	url := fmt.Sprintf("%s/org/%s/v1/policy", c.baseURL, orgID)
+	resp, err := c.authedGet(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return nil, fmt.Errorf("get-policy returned %d: %s", resp.StatusCode, string(body))
+	}
+	var out map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *Client) GetTrainingLog(orgID string) ([]map[string]any, error) {

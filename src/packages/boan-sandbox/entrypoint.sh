@@ -100,6 +100,33 @@ mkdir -p /tmp/boan/users /tmp/boan/registry /tmp/boan/credentials
 mkdir -p /data/users /data/registry /data/credentials
 chown -R boan:boan /workspace /tmp/boan /data /home/boan 2>/dev/null || true
 
+# git: S1/S2 mount 디렉토리를 정상 git repo 로 인정 (host bind mount → uid 일치
+# 안 할 때 dubious ownership 경고 회피).
+as_boan git config --global --add safe.directory /home/boan/Desktop/boanclaw 2>/dev/null || true
+as_boan git config --global --add safe.directory /home/boan/Desktop/boanclaw-gcp 2>/dev/null || true
+
+# git credential helper 자동 등록 — vault 슬롯이 등록되어 있으면 git push/fetch 가
+# PAT 를 평문으로 저장하지 않고 매 호출마다 vault 에서 받아오게.
+# BOAN_GIT_CREDENTIAL_MAP="repo_url=slot,repo_url=slot" 으로 추가 매핑 가능.
+register_git_credential() {
+    repo_url=$1
+    slot=$2
+    username=${3:-arizona95}
+    as_boan git config --global "credential.${repo_url}.helper" "boanclaw ${slot} ${username}" 2>/dev/null || true
+    echo "[boan-sandbox] git credential helper: ${repo_url} → vault slot '${slot}' (user=${username})"
+}
+register_git_credential "https://github.com/arizona95/BoanClawS2Git.git" "s2-github-pat"
+register_git_credential "https://github.com/arizona95/BoanClawS1Git.git" "s1-github-pat"
+if [ -n "${BOAN_GIT_CREDENTIAL_MAP:-}" ]; then
+    OLDIFS=$IFS; IFS=','
+    for entry in ${BOAN_GIT_CREDENTIAL_MAP}; do
+        [ -z "$entry" ] && continue
+        url=${entry%=*}; slot=${entry#*=}
+        register_git_credential "$url" "$slot"
+    done
+    IFS=$OLDIFS
+fi
+
 # credential-filter는 독립 컨테이너(S4)에서 실행 — sandbox 내부 실행 제거
 # BOAN_CREDENTIAL_FILTER_URL=http://boan-credential-filter:8082 로 외부 접근
 echo "[boan-sandbox] credential-filter: external container (http://boan-credential-filter:8082)"

@@ -1,6 +1,9 @@
 #!/bin/sh
 
-REAL_GIT="/usr/bin/git-real"
+# /usr/lib/git-core/git is the unrenamed git binary — calling /usr/bin/git-real
+# triggers git's multi-call dispatch (interprets "real" as a subcommand → fails
+# with "cannot handle real as a builtin"). Use the libexec path instead.
+REAL_GIT="/usr/lib/git-core/git"
 AUDIT_LOG="/tmp/boan-audit.log"
 SESSION_ID="${BOAN_SESSION_ID:-default}"
 BRANCH="boanclaw/${SESSION_ID}"

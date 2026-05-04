@@ -891,7 +891,7 @@ func (s *Server) StartAdmin() {
 			"sso_providers":         []map[string]any{},
 			"redirect_url":          callbackURL(r),
 			"allowed_email_domains": splitCSV(s.cfg.AllowedEmailDomains),
-			"test_mode":             s.cfg.TestMode,
+			"test_mode":             TestModeEnabled,
 			"owner_email":           s.cfg.OwnerEmail,
 		})
 	})
@@ -2191,10 +2191,9 @@ func (s *Server) StartAdmin() {
 			return
 		}
 		// TEST 모드 — 모든 사용자가 OTP 없이 바로 로그인됨.
-		// 이전에는 owner 만 우회했지만, 다중 사용자 시나리오 (예: dowoo.baik 으로 로그인해서
-		// 가드레일/whitelist 검증) 를 빠르게 돌리기 위해 모든 등록된 사용자도 같이 우회.
-		// production 환경(s.cfg.TestMode == false)에서는 이 분기 자체가 실행 안 됨.
-		if s.cfg.TestMode {
+		// TestModeEnabled 는 build tag 로 정해지는 const — release 빌드에서는
+		// `false` 로 컴파일되어 아래 블록 전체가 dead-code eliminated 된다.
+		if TestModeEnabled {
 			isOwner := ownerMatch(body.Email)
 			loginType := "test_user"
 			if isOwner {
@@ -2692,10 +2691,29 @@ func (s *Server) StartAdmin() {
 					workstation = toOrgWorkstation(ws)
 				}
 			}
-			if err := s.orgs.ClientFor(defaultOrgID).UpdateUser(defaultOrgID, body.Email, role, status, body.AccessLevel, workstation, machineID, machineName); err != nil {
-				w.WriteHeader(http.StatusBadGateway)
-				json.NewEncoder(w).Encode(map[string]string{"error": "조직 서버 반영 실패: " + err.Error()})
-				return
+			// UpdateUser 는 PATCH — Cloud Run org server 에 해당 email 이 없으면 404.
+			// (예: 다른 프록시에서 등록된 유저가 삭제됐거나, 로컬에만 있던 유저를
+			// 처음 수정하는 경우.) 이 경우 "존재하지 않으니 패치 불가" 가 아니라
+			// 현재 상태로 upsert = RegisterUserWithState 로 만들어낸다.
+			orgClient := s.orgs.ClientFor(defaultOrgID)
+			if err := orgClient.UpdateUser(defaultOrgID, body.Email, role, status, body.AccessLevel, workstation, machineID, machineName); err != nil {
+				// 404 만 upsert 로 복구, 그 외 에러는 그대로 전파.
+				if strings.Contains(err.Error(), "404") {
+					regStatus := status
+					if regStatus == "" {
+						regStatus = string(userstore.StatusApproved)
+					}
+					if regErr := orgClient.RegisterUserWithState(defaultOrgID, body.Email, "", role, regStatus, machineID, machineName); regErr != nil {
+						w.WriteHeader(http.StatusBadGateway)
+						json.NewEncoder(w).Encode(map[string]string{"error": "조직 서버 반영 실패 (register fallback): " + regErr.Error()})
+						return
+					}
+					log.Printf("[user-patch] %s not on org server — registered via upsert fallback", body.Email)
+				} else {
+					w.WriteHeader(http.StatusBadGateway)
+					json.NewEncoder(w).Encode(map[string]string{"error": "조직 서버 반영 실패: " + err.Error()})
+					return
+				}
 			}
 			json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 			return
@@ -2771,33 +2789,34 @@ func (s *Server) StartAdmin() {
 		http.NotFound(w, r)
 	})
 
-	// POST /api/admin/propose-amendment — wiki가 헌법 개정안 생성 → approval 큐에 등록
+	// POST /api/admin/propose-amendment — wiki가 헌법 개정안 생성 → approval 큐에 등록.
+	// proxy-local 경로: LLM Registry 의 agentic_iterate/g3 바인딩을 org-llm-proxy 를 통해 호출.
+	// policy-server 의 /v1/guardrail/propose-amendment 는 더 이상 사용하지 않는다
+	// (모든 LLM 호출은 반드시 org-llm-proxy 단일 egress 를 경유해야 하므로).
 	mux.HandleFunc("/api/admin/propose-amendment", func(w http.ResponseWriter, r *http.Request) {
 		if cors(w, r) { return }
 		if r.Method != http.MethodPost {
 			http.NotFound(w, r)
 			return
 		}
-		proposal, err := s.orgs.ClientFor(defaultOrgID).ProposeAmendment(defaultOrgID)
+		orgClient := s.orgs.ClientFor(defaultOrgID)
+		proposal, err := s.proposeAmendmentLocal(r.Context(), orgClient, defaultOrgID)
 		if err != nil {
 			w.WriteHeader(http.StatusBadGateway)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}
-		diff, _ := proposal["diff"].(string)
-		reasoning, _ := proposal["reasoning"].(string)
-		if diff == "" {
-			json.NewEncoder(w).Encode(map[string]string{"status": "no_amendment", "reasoning": reasoning})
+		if strings.TrimSpace(proposal.Diff) == "" {
+			json.NewEncoder(w).Encode(map[string]string{"status": "no_amendment", "reasoning": proposal.Reasoning})
 			return
 		}
-		// approval 큐에 등록
 		id := fmt.Sprintf("apr-%s", randomMachineID()[:12])
 		approvalsMu.Lock()
 		approvalsStore = append(approvalsStore, map[string]any{
 			"id":          id,
 			"sessionId":   "constitution",
 			"command":     "constitution-amendment:review",
-			"args":        []string{"diff=" + diff, "reasoning=" + reasoning},
+			"args":        []string{"diff=" + proposal.Diff, "reasoning=" + proposal.Reasoning},
 			"requester":   "wiki-guardrail",
 			"org_id":      defaultOrgID,
 			"requestedAt": time.Now().UTC().Format(time.RFC3339),
@@ -2807,23 +2826,22 @@ func (s *Server) StartAdmin() {
 		json.NewEncoder(w).Encode(map[string]string{"status": "proposed", "approval_id": id})
 	})
 
-	// POST /api/admin/propose-g1-amendment — wiki가 G1 패턴 개정안 생성 → approval 큐에 등록
+	// POST /api/admin/propose-g1-amendment — proxy-local 경로로 G1 개정안 생성.
 	mux.HandleFunc("/api/admin/propose-g1-amendment", func(w http.ResponseWriter, r *http.Request) {
 		if cors(w, r) { return }
 		if r.Method != http.MethodPost {
 			http.NotFound(w, r)
 			return
 		}
-		proposal, err := s.orgs.ClientFor(defaultOrgID).ProposeG1Amendment(defaultOrgID)
+		orgClient := s.orgs.ClientFor(defaultOrgID)
+		proposal, err := s.proposeG1AmendmentLocal(r.Context(), orgClient, defaultOrgID)
 		if err != nil {
 			w.WriteHeader(http.StatusBadGateway)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}
-		diff, _ := proposal["diff"].(string)
-		reasoning, _ := proposal["reasoning"].(string)
-		if diff == "" {
-			json.NewEncoder(w).Encode(map[string]string{"status": "no_amendment", "reasoning": reasoning})
+		if strings.TrimSpace(proposal.Diff) == "" {
+			json.NewEncoder(w).Encode(map[string]string{"status": "no_amendment", "reasoning": proposal.Reasoning})
 			return
 		}
 		id := fmt.Sprintf("apr-%s", randomMachineID()[:12])
@@ -2832,7 +2850,7 @@ func (s *Server) StartAdmin() {
 			"id":          id,
 			"sessionId":   "g1-patterns",
 			"command":     "g1-amendment:review",
-			"args":        []string{"diff=" + diff, "reasoning=" + reasoning},
+			"args":        []string{"diff=" + proposal.Diff, "reasoning=" + proposal.Reasoning},
 			"requester":   "wiki-guardrail",
 			"org_id":      defaultOrgID,
 			"requestedAt": time.Now().UTC().Format(time.RFC3339),
@@ -3526,25 +3544,20 @@ func (s *Server) StartAdmin() {
 
 			// ── Part B: UPDATE_WIKI 후 "큰 변화" 이면 자동 개정 제안 체크 ──
 			// actions_planned >= 2 (2 개 이상 노드 변경) 을 임계치로 잡음.
-			// 조건 맞으면 background goroutine 으로 policy-server 에 propose-amendment
-			// + propose-g1-amendment 호출. 결과가 있으면 approvalsStore 에 pending
-			// 으로 쌓이고, 응답에 pending_amendment_check 플래그로 UI 에 알림.
+			// proxy-local 경로로 호출 → LLM Registry 의 agentic_iterate/g3 바인딩을
+			// org-llm-proxy 를 통해 호출한다 (단일 egress 원칙).
 			pendingAmend := []string{}
 			if res.Action == "UPDATE_WIKI" && res.WikiUpdate != nil && res.WikiUpdate.ActionsPlanned >= 2 {
-				// 동기 호출 — 너무 오래 걸리면 chat_continue 응답 지연될 수 있으나
-				// propose-amendment 는 LLM 1 회 호출이라 5-10 초. 응답에 결과를
-				// 담아서 UI 가 바로 "Approvals 확인" 배지 보이게 함.
 				orgClient := s.orgs.ClientFor(orgID)
-				if prop, perr := orgClient.ProposeAmendment(orgID); perr == nil {
-					if diff, _ := prop["diff"].(string); strings.TrimSpace(diff) != "" {
-						reasoning, _ := prop["reasoning"].(string)
+				if prop, perr := s.proposeAmendmentLocal(r.Context(), orgClient, orgID); perr == nil {
+					if strings.TrimSpace(prop.Diff) != "" {
 						id := fmt.Sprintf("apr-%s", randomMachineID()[:12])
 						approvalsMu.Lock()
 						approvalsStore = append(approvalsStore, map[string]any{
 							"id":          id,
 							"sessionId":   "constitution",
 							"command":     "constitution-amendment:review",
-							"args":        []string{"diff=" + diff, "reasoning=" + reasoning},
+							"args":        []string{"diff=" + prop.Diff, "reasoning=" + prop.Reasoning},
 							"requester":   "g3-wiki-chat-auto",
 							"org_id":      orgID,
 							"requestedAt": time.Now().UTC().Format(time.RFC3339),
@@ -3554,18 +3567,17 @@ func (s *Server) StartAdmin() {
 						pendingAmend = append(pendingAmend, "constitution:"+id)
 					}
 				} else {
-					log.Printf("[chat_continue auto-amendment] ProposeAmendment failed: %v", perr)
+					log.Printf("[chat_continue auto-amendment] proposeAmendmentLocal failed: %v", perr)
 				}
-				if prop, perr := orgClient.ProposeG1Amendment(orgID); perr == nil {
-					if diff, _ := prop["diff"].(string); strings.TrimSpace(diff) != "" {
-						reasoning, _ := prop["reasoning"].(string)
+				if prop, perr := s.proposeG1AmendmentLocal(r.Context(), orgClient, orgID); perr == nil {
+					if strings.TrimSpace(prop.Diff) != "" {
 						id := fmt.Sprintf("apr-%s", randomMachineID()[:12])
 						approvalsMu.Lock()
 						approvalsStore = append(approvalsStore, map[string]any{
 							"id":          id,
 							"sessionId":   "g1-patterns",
 							"command":     "g1-amendment:review",
-							"args":        []string{"diff=" + diff, "reasoning=" + reasoning},
+							"args":        []string{"diff=" + prop.Diff, "reasoning=" + prop.Reasoning},
 							"requester":   "g3-wiki-chat-auto",
 							"org_id":      orgID,
 							"requestedAt": time.Now().UTC().Format(time.RFC3339),
@@ -3575,7 +3587,7 @@ func (s *Server) StartAdmin() {
 						pendingAmend = append(pendingAmend, "g1:"+id)
 					}
 				} else {
-					log.Printf("[chat_continue auto-amendment] ProposeG1Amendment failed: %v", perr)
+					log.Printf("[chat_continue auto-amendment] proposeG1AmendmentLocal failed: %v", perr)
 				}
 			}
 
@@ -4293,20 +4305,47 @@ func (s *Server) StartAdmin() {
 		})
 	})
 
+	// approvalCategory — command 이름으로 페이지 카테고리 도출.
+	// guardrail: 헌법/G1 개정안, 크리티컬 input-gate 차단 HITL.
+	// killchain: kill chain manual trigger / threat leader 제안.
+	// user: 그 외 모두 (가입 승인, credential register, agent action 등).
+	approvalCategory := func(cmd string) string {
+		switch {
+		case strings.HasPrefix(cmd, "constitution-amendment"),
+			strings.HasPrefix(cmd, "g1-amendment"),
+			strings.HasPrefix(cmd, "critical-guardrail"):
+			return "guardrail"
+		case strings.HasPrefix(cmd, "kill-chain"),
+			strings.HasPrefix(cmd, "threat-leader"):
+			return "killchain"
+		default:
+			return "user"
+		}
+	}
+
 	mux.HandleFunc("/api/approvals", func(w http.ResponseWriter, r *http.Request) {
 		if cors(w, r) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
+		// 카테고리 query 로 페이지별 분리: ?category=user|guardrail|killchain.
+		// 미지정 시 모두 반환 (legacy 호환). 각 entry 에 category 필드 자동 부여.
+		wantCat := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("category")))
 		approvalsMu.Lock()
-		list := make([]map[string]any, len(approvalsStore))
-		copy(list, approvalsStore)
+		raw := make([]map[string]any, len(approvalsStore))
+		copy(raw, approvalsStore)
 		approvalsMu.Unlock()
-		if list == nil {
-			list = []map[string]any{}
+		out := make([]map[string]any, 0, len(raw))
+		for _, a := range raw {
+			cmd, _ := a["command"].(string)
+			cat := approvalCategory(cmd)
+			a["category"] = cat
+			if wantCat == "" || wantCat == cat {
+				out = append(out, a)
+			}
 		}
-		json.NewEncoder(w).Encode(list)
+		json.NewEncoder(w).Encode(out)
 	})
 
 	mux.HandleFunc("/api/approvals/", func(w http.ResponseWriter, r *http.Request) {
@@ -4323,6 +4362,8 @@ func (s *Server) StartAdmin() {
 			var found map[string]any
 			for _, a := range approvalsStore {
 				if a["id"] == id {
+					cmd, _ := a["command"].(string)
+					a["category"] = approvalCategory(cmd)
 					found = a
 					break
 				}
@@ -4428,36 +4469,85 @@ func (s *Server) StartAdmin() {
 		delete(pendingCredentialApprovals, id)
 		approvalsMu.Unlock()
 
-		// constitution-amendment 승인 시 실제 정책에 반영
+		// constitution-amendment 승인 시 실제 정책에 반영.
+		// args 는 approvalsStore 에 []string 또는 []any 로 들어올 수 있으니 두 케이스 모두 처리.
 		approvalsMu.Lock()
 		for _, a := range approvalsStore {
 			if a["id"] == id && status == "approved" {
 				cmd, _ := a["command"].(string)
 				if cmd == "constitution-amendment:review" || cmd == "g1-amendment:review" {
-					if args, ok := a["args"].([]any); ok {
-						var diffText string
-						for _, arg := range args {
-							s := fmt.Sprint(arg)
-							if strings.HasPrefix(s, "diff=") {
-								diffText = strings.TrimPrefix(s, "diff=")
-							}
+					var argList []string
+					switch v := a["args"].(type) {
+					case []string:
+						argList = v
+					case []any:
+						for _, x := range v {
+							argList = append(argList, fmt.Sprint(x))
 						}
-						if diffText != "" && orgID != "" {
-							// Apply amendment: send diff to policy server as update
-							if cmd == "constitution-amendment:review" {
-								// G2 constitution diff — extract new text from diff
-								go func() {
-									newConstitution := applyConstitutionDiff(diffText)
-									if newConstitution != "" {
-										s.orgs.ClientFor(orgID).UpdatePolicy(orgID, map[string]any{
-											"guardrail": map[string]any{"constitution": newConstitution},
-										})
-										log.Printf("[amendment] G2 constitution applied from diff")
+					}
+					var diffText, reasoning string
+					for _, arg := range argList {
+						if strings.HasPrefix(arg, "diff=") {
+							diffText = strings.TrimPrefix(arg, "diff=")
+						} else if strings.HasPrefix(arg, "reasoning=") {
+							reasoning = strings.TrimPrefix(arg, "reasoning=")
+						}
+					}
+					_ = reasoning
+					if diffText != "" && orgID != "" {
+						if cmd == "constitution-amendment:review" {
+							// G2 constitution diff — extract new text from diff.
+							go func() {
+								newConstitution := applyConstitutionDiff(diffText)
+								if newConstitution != "" {
+									if err := s.orgs.ClientFor(orgID).UpdatePolicy(orgID, map[string]any{
+										"guardrail": map[string]any{"constitution": newConstitution},
+									}); err != nil {
+										log.Printf("[amendment] G2 UpdatePolicy failed: %v", err)
+									} else {
+										log.Printf("[amendment] G2 constitution applied (len=%d)", len(newConstitution))
 									}
-								}()
-							}
-							log.Printf("[amendment] %s approved and applied", cmd)
+								} else {
+									log.Printf("[amendment] G2 applyConstitutionDiff returned empty — diff: %.200q", diffText)
+								}
+							}()
+						} else if cmd == "g1-amendment:review" {
+							// G1 patterns diff — 현재 정책 조회 후 기존 패턴에 병합해 업데이트.
+							go func() {
+								added := applyG1Diff(diffText)
+								if len(added) == 0 {
+									log.Printf("[amendment] G1 applyG1Diff parsed 0 patterns — diff: %.200q", diffText)
+									return
+								}
+								orgClient := s.orgs.ClientFor(orgID)
+								existing, err := orgClient.GetPolicy(orgID)
+								if err != nil {
+									log.Printf("[amendment] G1 GetPolicy failed: %v", err)
+									return
+								}
+								var current []map[string]any
+								if g, ok := existing["guardrail"].(map[string]any); ok {
+									if raw, ok := g["g1_custom_patterns"].([]any); ok {
+										for _, item := range raw {
+											if m, ok := item.(map[string]any); ok {
+												current = append(current, m)
+											}
+										}
+									}
+								}
+								merged := append(current, added...)
+								if err := orgClient.UpdatePolicy(orgID, map[string]any{
+									"guardrail": map[string]any{"g1_custom_patterns": merged},
+								}); err != nil {
+									log.Printf("[amendment] G1 UpdatePolicy failed: %v", err)
+								} else {
+									log.Printf("[amendment] G1 patterns applied (+%d, total=%d)", len(added), len(merged))
+								}
+							}()
 						}
+						log.Printf("[amendment] %s approved and apply dispatched", cmd)
+					} else {
+						log.Printf("[amendment] %s approved but diff empty or orgID missing (diff_len=%d, orgID=%q)", cmd, len(diffText), orgID)
 					}
 				}
 				break
@@ -4657,12 +4747,22 @@ func (s *Server) StartAdmin() {
 	// NDJSON 스트리밍으로 각 단계(스크린샷, AI 응답, 액션 실행 결과)를 실시간 전송
 	// Kill Chain — endpoint detection automated response.
 	s.registerKillChainEndpoints(mux)
+	s.registerThreatLeaderHandlers(mux)
 
-	// TEST 모드 전용 endpoint — cfg.TestMode 가 true 일 때만 등록.
-	// (test_endpoints.go) — prod 에서는 TEST 환경변수 미설정 → 등록 자체 안 됨.
-	if s.cfg.TestMode {
-		s.registerTestEndpoints(mux)
-	}
+	// TEST 모드 전용 endpoint — build tag `testmode` 가 없으면 (release 빌드)
+	// registerTestEndpoints 가 no-op stub 이 되어 `/api/test/*` 자체가 없음.
+	// env 변수 gating 아님: compile-time 결정.
+	s.registerTestEndpoints(mux)
+
+	// build-info — UI 배지 / 테스트 스크립트가 mode 확인용으로 참조.
+	mux.HandleFunc("/api/admin/debug/build-info", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		json.NewEncoder(w).Encode(map[string]any{
+			"mode":              BuildMode,
+			"test_mode_enabled": TestModeEnabled,
+		})
+	})
 
 	srv := &http.Server{
 		Addr:              s.cfg.AdminListen,
@@ -5179,15 +5279,58 @@ func (s *Server) dlpRulesLoaded() int {
 	return s.dlpEng.RulesCount()
 }
 
+// applyG1Diff — "+pattern | description | mode" 형식의 G1 제안 diff 를 파싱해
+// G1CustomPattern list 로 반환. propose-g1-amendment 의 시스템 프롬프트 포맷에 맞춤.
+// "-" 로 시작하는 줄은 제거 제안으로 간주하지만 현재는 무시 (단순 append 모드).
+func applyG1Diff(diff string) []map[string]any {
+	var out []map[string]any
+	for _, raw := range strings.Split(diff, "\n") {
+		line := strings.TrimSpace(raw)
+		if !strings.HasPrefix(line, "+") || strings.HasPrefix(line, "+++") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "+")
+		line = strings.TrimSpace(line)
+		parts := strings.Split(line, "|")
+		if len(parts) < 2 {
+			continue
+		}
+		pattern := strings.TrimSpace(parts[0])
+		desc := strings.TrimSpace(parts[1])
+		mode := "block"
+		if len(parts) >= 3 {
+			mode = strings.TrimSpace(parts[2])
+		}
+		if pattern == "" {
+			continue
+		}
+		out = append(out, map[string]any{
+			"pattern":     pattern,
+			"description": desc,
+			"mode":        mode,
+		})
+	}
+	return out
+}
+
 // applyConstitutionDiff — unified diff에서 + 줄만 추출하여 새 헌법 텍스트 생성.
 // 완전한 diff 파서가 아닌 간이 처리: diff가 전체 교체 형태면 + 줄이 새 헌법.
+// "--- a/..." / "+++ b/..." / "@@ ..." 같은 unified-diff 헤더 줄은 스킵한다.
 func applyConstitutionDiff(diff string) string {
 	lines := strings.Split(diff, "\n")
 	var result []string
 	for _, l := range lines {
-		if strings.HasPrefix(l, "+") && !strings.HasPrefix(l, "+++") {
+		switch {
+		case strings.HasPrefix(l, "+++"),
+			strings.HasPrefix(l, "---"),
+			strings.HasPrefix(l, "@@"):
+			continue
+		case strings.HasPrefix(l, "+"):
 			result = append(result, strings.TrimPrefix(l, "+"))
-		} else if !strings.HasPrefix(l, "-") && !strings.HasPrefix(l, "---") && !strings.HasPrefix(l, "@@") {
+		case strings.HasPrefix(l, "-"):
+			// 제거 줄은 건너뜀
+			continue
+		default:
 			result = append(result, l)
 		}
 	}

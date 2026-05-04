@@ -1,30 +1,65 @@
 <!--
-  BoanClaw Kill Chain detection rules — Wazuh manager 에 배포.
-  manager 컨테이너에서 /var/ossec/etc/rules/local_rules.xml 에 append 하거나
-  custom ruleset 으로 마운트.
+  BoanClaw Kill Chain detection rules — Wazuh manager.
 
-  Wazuh 는 process 감지를 위해 sysmon / sysmon-event / audit 중 하나가 설치돼
-  있어야 한다. Windows 기본 agent 는 process 이벤트를 일부만 수집 —
-  sysmon + wazuh-agent + custom command(osquery 등) 조합이 표준.
+  배포 방법: docker-compose 의 wazuh-manager volume 으로 이 파일을
+  /var/ossec/etc/rules/local_rules.xml 에 마운트 (또는 추가 ruleset 로).
 
-  아래 규칙은 최소한의 예시 — process_name 이 rule.description 에 포함되도록
-  hardcoded. 실제 운영에서는 data.win.eventdata.processName 같은 구체 필드로
-  match 를 조여야 한다.
+  매칭 시: level=12 → ossec.conf 의 active-response 가 boan-killchain-event.sh
+  실행 → boan-proxy /api/kill-chain/event 로 webhook → kill chain 발동.
+
+  Sysmon event 1 (process create) 가 source. agent VM 에 sysmon 설치 + Wazuh 가
+  Microsoft-Windows-Sysmon/Operational 수집 필수.
 -->
-<group name="boanclaw_killchain,">
-  <!-- 100200 : catchall for Windows process creation (Sysmon event 1) -->
+<group name="boanclaw_killchain,sysmon_event1,">
+
+  <!-- ────────────────────────────────────────────────────────────────────
+       100200 — admin 정의 의심 process 카테고리 (high-risk runtime).
+       Threat Leader 가 OSV.dev 에서 추천한 vulnerable 패키지의 runtime
+       (npm→node, PyPI→python 등) 또는 직접 차단 대상 (claude CLI).
+
+       매칭 시 active-response 로 webhook → boan-proxy 가 KillChain rule
+       table 에서 정확한 matching 후 auto=true 일 때만 실제 chain 발동.
+       (즉 manager 는 broad detection, proxy 는 narrow gating.)
+  ──────────────────────────────────────────────────────────────────── -->
   <rule id="100200" level="12">
     <if_group>sysmon_event1</if_group>
-    <field name="win.eventdata.image">(?i)\\\\claude(\\.exe)?$</field>
-    <description>BoanClaw Kill Chain: Claude CLI 실행 감지</description>
+    <field name="win.eventdata.originalFileName" type="pcre2">(?i)^(claude|node|python|pythonw|npm|pip|java|ruby|php|go)(\.exe)?$</field>
+    <description>BoanClaw Kill Chain: 의심 runtime/CLI process 감지 ($(win.eventdata.originalFileName))</description>
     <group>boan_killchain_match,</group>
   </rule>
 
-  <!-- 100201 : generic process name catchall for rules 관리자 추가용 -->
-  <rule id="100201" level="12">
+  <!-- ────────────────────────────────────────────────────────────────────
+       100201 — 패키지 매니저 invocation (npm install / pip install).
+       공급망 공격은 install 단계에서 postinstall hook 로 발동되는 경우 많음.
+  ──────────────────────────────────────────────────────────────────── -->
+  <rule id="100201" level="11">
     <if_group>sysmon_event1</if_group>
-    <match>process_name</match>
-    <description>BoanClaw Kill Chain: 관리자 정의 금지 프로세스 감지</description>
+    <field name="win.eventdata.originalFileName" type="pcre2">(?i)^(npm|pip|pip3|yarn|pnpm)(\.exe)?$</field>
+    <field name="win.eventdata.commandLine" type="pcre2">(?i)(install|add|fetch)</field>
+    <description>BoanClaw Kill Chain: 패키지 매니저 install 호출 — supply chain risk</description>
+    <group>boan_killchain_pkg_install,</group>
+  </rule>
+
+  <!-- ────────────────────────────────────────────────────────────────────
+       100202 — Wazuh 자체 비활성화 / log forwarding tampering 시도.
+       공격자가 EDR 끄려는 흔한 패턴.
+  ──────────────────────────────────────────────────────────────────── -->
+  <rule id="100202" level="14">
+    <if_group>sysmon_event1</if_group>
+    <field name="win.eventdata.commandLine" type="pcre2">(?i)(stop-service|sc\s+stop|net\s+stop)\s+(wazuh|ossec)</field>
+    <description>BoanClaw Kill Chain: EDR (Wazuh) 서비스 중단 시도</description>
+    <group>boan_killchain_evasion,</group>
+  </rule>
+
+  <!-- ────────────────────────────────────────────────────────────────────
+       100250 — calc.exe E2E probe. 사용자 RDP 후 계산기 실행 → manager
+       감지 → AR → proxy webhook → kill chain auto-trigger 검증용.
+  ──────────────────────────────────────────────────────────────────── -->
+  <rule id="100250" level="12">
+    <if_group>sysmon_event1</if_group>
+    <field name="win.eventdata.originalFileName" type="pcre2">(?i)^(calc|calculator|win32calc|calculatorapp)(\.exe)?$</field>
+    <description>BoanClaw Kill Chain: Calculator E2E probe ($(win.eventdata.originalFileName))</description>
     <group>boan_killchain_match,</group>
   </rule>
+
 </group>

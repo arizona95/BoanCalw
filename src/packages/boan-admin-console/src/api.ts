@@ -189,11 +189,11 @@ export const registryApi = {
     request<LLMEntry>(`${REGISTRY_BASE}/v1/llms/${name}/bind-security-lmm`, {
       method: "POST",
     }),
-  bindRole: (name: string, role: "chat" | "g2" | "g3") =>
+  bindRole: (name: string, role: "chat" | "vision" | "g2" | "g3") =>
     request<{ status: string; name: string; role: string }>(`${REGISTRY_BASE}/v1/llms/${name}/bind-role/${role}`, {
       method: "POST",
     }),
-  unbindRole: (name: string, role: "chat" | "g2" | "g3") =>
+  unbindRole: (name: string, role: "chat" | "vision" | "g2" | "g3") =>
     request<{ status: string; name: string; role: string }>(`${REGISTRY_BASE}/v1/llms/${name}/unbind-role/${role}`, {
       method: "POST",
     }),
@@ -262,6 +262,8 @@ export const credentialRequestApi = {
     request<void>(`/api/credential-requests/${id}`, { method: "DELETE" }),
 };
 
+export type ApprovalCategory = "user" | "guardrail" | "killchain";
+
 export interface ApprovalRequest {
   id: string;
   sessionId: string;
@@ -272,10 +274,13 @@ export interface ApprovalRequest {
   status: "pending" | "approved" | "rejected";
   decidedBy?: string;
   decidedAt?: string;
+  /** 페이지별 분리: backend 가 command 로부터 자동 도출. */
+  category?: ApprovalCategory;
 }
 
 export const approvalApi = {
-  list: () => request<ApprovalRequest[]>(APPROVAL_BASE),
+  list: (category?: ApprovalCategory) =>
+    request<ApprovalRequest[]>(category ? `${APPROVAL_BASE}?category=${category}` : APPROVAL_BASE),
   get: (id: string) => request<ApprovalRequest>(`${APPROVAL_BASE}/${id}`),
   approve: (id: string) =>
     request<void>(`${APPROVAL_BASE}/${id}/approve`, { method: "POST" }),
@@ -435,7 +440,7 @@ export interface WikiEdge {
 export interface WikiDecision {
   id?: string;
   input: string;
-  decision: "approve" | "deny";
+  decision: "allow" | "approve" | "deny";
   reason?: string;
   labeler?: string;
   timestamp?: string;
@@ -454,6 +459,10 @@ export interface DialogTurn {
   role: "llm" | "human";
   content: string;
   examples?: string[];
+  /** LLM 턴의 action 분류 (rehydration 용). human 턴은 빈 문자열. */
+  action?: "ASK_FOLLOWUP" | "REQUEST_LABEL_FIX" | "UPDATE_WIKI" | "CLOSE_AND_FIND_NEW" | "";
+  /** REQUEST_LABEL_FIX 턴에만 채워짐. UI 가 말풍선 바로 아래 Accept/Reject 렌더. */
+  label_fix_target?: Record<string, unknown>;
 }
 
 export interface ClarificationDialog {
@@ -534,7 +543,7 @@ export const wikiGraphApi = {
     }),
   // HITL 사용자가 REQUEST_LABEL_FIX 제안 Accept 시 호출. Reject 는 UI 측에서
   // dismiss 만 — 이 API 자체는 Accept 경로 전용.
-  labelFixApply: (decision_id: string, new_label: "approve" | "deny", reason: string) =>
+  labelFixApply: (decision_id: string, new_label: "allow" | "approve" | "deny", reason: string) =>
     request<{ status: string; decision: unknown }>("/api/wiki-graph/skill/label_fix_apply", {
       method: "POST",
       body: JSON.stringify({ decision_id, new_label, reason }),

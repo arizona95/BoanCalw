@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { ApprovalQueue } from "../components/ApprovalQueue";
 
 // KillChain — EDR (Wazuh / custom webhook) 가 금지 프로세스를 감지하면
 // 네트워크 격리 → forensic disk snapshot → VM STOP → DELETE 순서로 대응.
@@ -48,7 +49,7 @@ type User = {
 };
 
 export default function KillChain() {
-  const [tab, setTab] = useState<"rules" | "incidents">("incidents");
+  const [tab, setTab] = useState<"rules" | "incidents" | "hitl">("incidents");
   const [rules, setRules] = useState<Rule[]>([]);
   const [incidents, setIncidents] = useState<Incident[]>([]);
   const [users, setUsers] = useState<User[]>([]);
@@ -99,7 +100,7 @@ export default function KillChain() {
       )}
 
       <div className="flex gap-2 border-b border-slate-200">
-        {(["incidents", "rules"] as const).map((t) => (
+        {(["incidents", "rules", "hitl"] as const).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -109,7 +110,11 @@ export default function KillChain() {
                 : "text-slate-500 hover:text-slate-700"
             }`}
           >
-            {t === "incidents" ? `Incidents (${incidents.length})` : `Rules (${rules.length})`}
+            {t === "incidents"
+              ? `Incidents (${incidents.length})`
+              : t === "rules"
+                ? `Rules (${rules.length})`
+                : "HITL"}
           </button>
         ))}
       </div>
@@ -126,6 +131,16 @@ export default function KillChain() {
           onChange={refresh}
           onError={setErr}
         />
+      )}
+      {tab === "hitl" && (
+        <div className="space-y-3">
+          <p className="text-xs text-slate-500">
+            Kill Chain manual trigger 승인 + Threat Leader (공급망 공격 정보) 가 자동 제안한
+            새 rule. Approve 시 즉시 실행 (트리거) 또는 rule 추가. 사용자 가입 같은 일반 승인은{" "}
+            <a href="/approvals" className="text-blue-600 underline">User Actions</a> 에서.
+          </p>
+          <ApprovalQueue category="killchain" emptyText="대기 중인 Kill Chain 승인이 없습니다." />
+        </div>
       )}
     </div>
   );

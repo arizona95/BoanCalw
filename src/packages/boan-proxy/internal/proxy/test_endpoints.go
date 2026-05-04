@@ -1,13 +1,14 @@
+//go:build testmode
+
 package proxy
 
-// test_endpoints.go — TEST 모드에서만 등록되는 보조 endpoint 들.
+// test_endpoints.go — testmode 빌드에서만 컴파일되는 보조 endpoint 들.
 //
 // ⚠️  보안 경고:
 //   여기 있는 endpoint 들은 인증 우회/임의 shell 실행 등 매우 강력한 권한.
-//   반드시 cfg.TestMode == true (env: TEST=true 또는 BOAN_TEST_MODE=true) 일 때만
-//   StartAdmin 에서 등록되며, prod compose 에서는 TEST 환경변수를 빼면 자동으로 사라진다.
-//
-// 등록 위치: admin.go StartAdmin 의 마지막 mux.HandleFunc 호출 직후.
+//   `go build -tags=testmode` 로 빌드해야 이 파일이 바이너리에 포함됨. 기본 (태그
+//   없음) = release — 이 파일은 컴파일 대상에서 아예 제외되고 `/api/test/*` 는
+//   존재하지 않음.
 
 import (
 	"context"
@@ -29,6 +30,11 @@ import (
 func (s *Server) registerTestEndpoints(mux *http.ServeMux) {
 	// 부트 시 한 번 명시적으로 로그 — 운영자가 실수로 prod 에 띄웠는지 알아챌 수 있게.
 	log.Printf("[boan-proxy] ⚠️  TEST mode endpoints registered (/api/test/*) — DO NOT enable in production")
+
+	// tester 자동 만료 — testmode 한정. /api/test/session 으로 만든 tester 가 cleanup
+	// 안 된 채 admin UI 에 쌓이는 cost/clutter 문제를 방지. 1 시간 이상 된 tester 는
+	// 5 분 주기로 deleteUserFully (VM + local + bound + cloud org 모두 정리).
+	s.startTesterJanitor(context.Background())
 
 	// ── /api/test/status ────────────────────────────────────────────────
 	// 단순한 ping. test runner 가 "test 모드 활성 상태?" 를 첫 단계로 검사할 때 사용.
@@ -65,8 +71,18 @@ func (s *Server) registerTestEndpoints(mux *http.ServeMux) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "email required"})
 			return
 		}
+		// /api/test/session 은 role=user 또는 role=tester 만 허용.
+		//   • user   — 일반 사용자 권한 (admin 엔드포인트 접근 불가).
+		//   • tester — testmode 전용 admin-권한 테스터 (owner 와 동등).
+		// role=owner / 기타 값은 거부. "테스트 소유자" 가짜 레코드가 남을 여지 zero.
 		if body.Role == "" {
-			body.Role = "user"
+			body.Role = string(roles.Tester)
+		}
+		if body.Role != string(roles.User) && body.Role != string(roles.Tester) {
+			writeJSON(w, http.StatusForbidden, map[string]string{
+				"error": "/api/test/session 은 role=user 또는 role=tester 만 발급. 'owner' 는 거부됩니다. admin 기능 테스트는 role=tester 를 사용하세요.",
+			})
+			return
 		}
 		if body.AccessLevel == "" {
 			body.AccessLevel = "ask"
@@ -146,12 +162,18 @@ func (s *Server) registerTestEndpoints(mux *http.ServeMux) {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "cannot delete owner via test endpoint"})
 			return
 		}
-		err := s.users.Delete(body.Email)
-		if err != nil && err != userstore.ErrNotFound {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		// 과거: s.users.Delete(...) 만 호출해서 GCP VM 이 그대로 남는 cost leak 발생.
+		// 지금: admin DELETE 와 동일한 deleteUserFully 경로 — VM + local + bound_user + org server 모두 정리.
+		warning, derr := s.deleteUserFully(r.Context(), body.Email, "")
+		if derr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": derr.Error()})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		resp := map[string]any{"ok": true}
+		if warning != "" {
+			resp["warning"] = warning
+		}
+		writeJSON(w, http.StatusOK, resp)
 	})
 
 	// ── /api/test/sandbox-exec ──────────────────────────────────────────

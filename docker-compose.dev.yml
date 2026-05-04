@@ -163,10 +163,13 @@ services:
     profiles: ["legacy-host"]
     build:
       context: src/packages/boan-proxy
+      args:
+        # dev compose 는 기본 testmode — /api/test/* + OTP 우회 + Tester role 활성.
+        # prod/release 빌드가 필요하면 BOAN_BUILD_TAG=release 로 override.
+        BOAN_BUILD_TAG: ${BOAN_BUILD_TAG:-testmode}
     env_file:
       - deploy/config/gcp.env
     environment:
-      - TEST=true
       - BOAN_LISTEN=:18080
       - BOAN_ADMIN_LISTEN=:18081
       - BOAN_ADMIN_PASSWORD=boan-admin
@@ -192,6 +195,9 @@ services:
       - BOAN_GUACAMOLE_BASE_PATH=/remote
       - BOAN_OPENCLAW_GATEWAY_TOKEN=boan-openclaw-local
       - GOOGLE_APPLICATION_CREDENTIALS=/var/run/gcp/service-account.json
+      - BOAN_WAZUH_MANAGER_HOST=${BOAN_WAZUH_MANAGER_HOST:-34.47.99.52}
+      - BOAN_WAZUH_AGENT_GROUP=${BOAN_WAZUH_AGENT_GROUP:-boanclaw-default}
+      - BOAN_TESTER_TTL_MINUTES=${BOAN_TESTER_TTL_MINUTES:-240}
     volumes:
       - boan-user-data:/data/users
       - ${BOAN_GCP_SERVICE_ACCOUNT_KEY_PATH:-${HOME}/.config/gcp/boanclaw-terraform-sa.json}:/var/run/gcp/service-account.json:ro
@@ -230,10 +236,11 @@ services:
       args:
         - BOAN_UID=${BOAN_UID:-1000}
         - BOAN_GID=${BOAN_GID:-1000}
+        # dev compose 는 기본 testmode — sandbox 안의 embedded proxy 도 test 엔드포인트 활성.
+        - BOAN_BUILD_TAG=${BOAN_BUILD_TAG:-testmode}
     env_file:
       - deploy/config/gcp.env
     environment:
-      - TEST=true
       - HTTP_PROXY=http://localhost:18080
       - HTTPS_PROXY=http://localhost:18080
       - NO_PROXY=localhost,127.0.0.1,boan-proxy,boan-policy-server,boan-guacamole,boan-audit-agent,boan-credential-filter,boan-llm-registry,boan-whitelist-proxy,boan-org-llm-proxy,.run.app
@@ -263,6 +270,14 @@ services:
       - BOAN_DEVICE_KEY_PATH=/data/boan-device/identity.json
       - BOAN_USER_DATA_DIR=/data/users
       - BOAN_CREDENTIAL_DATA_DIR=/tmp/boan/credentials
+      # Wazuh manager — 신규 사용자 VM 부팅 시 agent 가 등록할 manager.
+      # 비어있으면 agent 자동 설치 skip.
+      - BOAN_WAZUH_MANAGER_HOST=${BOAN_WAZUH_MANAGER_HOST:-34.47.99.52}
+      - BOAN_WAZUH_AGENT_GROUP=${BOAN_WAZUH_AGENT_GROUP:-boanclaw-default}
+      # sandbox-embedded proxy 는 standalone 의 users.json 을 못 읽어 신규 VM 을 잘못
+      # reap 하던 버그 방지 — janitor 는 standalone proxy 에서만 돈다.
+      - BOAN_DISABLE_VM_JANITOR=1
+      - BOAN_TESTER_TTL_MINUTES=${BOAN_TESTER_TTL_MINUTES:-240}
       - BOAN_GUACAMOLE_URL=http://boan-guacamole:8080
       - BOAN_GUACAMOLE_USERNAME=guacadmin
       - BOAN_GUACAMOLE_PASSWORD=guacadmin
@@ -303,66 +318,16 @@ services:
     depends_on: [boan-policy-server, boan-audit-agent, boan-guacamole, boan-credential-filter, boan-org-llm-proxy]
 
   # ─────────────────────────────────────────────────────────────────────
-  # Wazuh manager — 조직 EDR 중앙 서버.
-  # 사용자 VM (Windows Golden Image) 안의 Wazuh agent 가 이 manager 로
-  # 이벤트 (FIM, 프로세스, 레지스트리, MITRE ATT&CK 매핑 alert) 를 보냄.
-  # Manager 가 룰 평가 → alert 을 /var/ossec/logs/alerts/alerts.json 에
-  # 찍고, Fluent Bit 가 tail 해서 조직 로그서버로 forwarding.
+  # NOTE: Wazuh manager + Fluent Bit 는 admin host 에서 제거됨 (2026-05-01).
+  # 조직 EDR central server 는 admin 노트북이 아니라 GCP per-org instance 에
+  # 두는 게 맞음. policy-server / org-llm-proxy / credential-gate 처럼.
   #
-  # 포트:
-  #   1514/udp   — agent → manager 이벤트 채널 (syslog)
-  #   1515/tcp   — agent 등록 (enrollment)
-  #   55000/tcp  — Wazuh REST API
+  # 후속 phase (별도 deploy 작업):
+  #   - GCP Compute Engine VM `boan-wazuh-manager-<org>` 1 대 per org
+  #   - 1514/udp + 1515/tcp + 55000/tcp 외부 노출
+  #   - rule + active-response 자산은 deploy/wazuh/ 그대로 재사용
+  #     (entrypoint-hook.sh 가 manager VM docker compose 에서 동작)
   # ─────────────────────────────────────────────────────────────────────
-  boan-wazuh-manager:
-    image: wazuh/wazuh-manager:4.7.5
-    container_name: boanclaw-boan-wazuh-manager-1
-    hostname: boan-wazuh-manager
-    restart: unless-stopped
-    ulimits:
-      memlock: {soft: -1, hard: -1}
-      nofile: {soft: 655360, hard: 655360}
-    ports:
-      - "1514:1514/udp"
-      - "1515:1515"
-      - "55000:55000"
-    environment:
-      - INDEXER_URL=
-      - INDEXER_USERNAME=
-      - INDEXER_PASSWORD=
-      - FILEBEAT_SSL_VERIFICATION_MODE=none
-      - API_USERNAME=wazuh-wui
-      - API_PASSWORD=BoanWazuh2026!
-    volumes:
-      # logs 만 share (Fluent Bit 이 alerts.json tail 하려면 필요).
-      # etc/queue/var 등은 container 내부 — default config 가 entrypoint 에
-      # 의해 자동 populate 되므로 volume 마운트로 덮어쓰지 않는다.
-      - boan-wazuh-logs:/var/ossec/logs
-    networks: [boanclaw]
-
-  # ─────────────────────────────────────────────────────────────────────
-  # Fluent Bit — Wazuh alert 를 조직 로그서버로 forwarding.
-  # tail 로 /var/ossec/logs/alerts/alerts.json 읽고, http out 으로
-  # BOAN_LOG_FORWARD_URL 에 전송. 환경변수 없으면 stdout 으로만.
-  # ─────────────────────────────────────────────────────────────────────
-  boan-fluent-bit:
-    image: fluent/fluent-bit:2.2.2
-    container_name: boanclaw-boan-fluent-bit-1
-    hostname: boan-fluent-bit
-    restart: unless-stopped
-    volumes:
-      - ./deploy/fluent-bit/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
-      - ./deploy/fluent-bit/parsers.conf:/fluent-bit/etc/parsers.conf:ro
-      - boan-wazuh-logs:/var/ossec/logs:ro
-    environment:
-      - BOAN_ORG_ID=${BOAN_ORG_ID:-sds-corp}
-      - BOAN_LOG_FORWARD_URL=${BOAN_LOG_FORWARD_URL:-}
-      - BOAN_LOG_FORWARD_TOKEN=${BOAN_LOG_FORWARD_TOKEN:-}
-      - BOAN_LOG_FORWARD_HOST=${BOAN_LOG_FORWARD_HOST:-}
-      - BOAN_LOG_FORWARD_PORT=${BOAN_LOG_FORWARD_PORT:-443}
-      - BOAN_LOG_FORWARD_PATH=${BOAN_LOG_FORWARD_PATH:-/ingest}
-    networks: [boanclaw]
-    depends_on: [boan-wazuh-manager]
 
 volumes:
   boan-guac-db:
@@ -374,5 +339,3 @@ volumes:
   boan-user-data:
   boan-rdp-transfer:
   boan-device-key:  # P3: Ed25519 device identity (private key)
-  # Wazuh alert 로그 — Fluent Bit 가 tail 해야 하므로 share.
-  boan-wazuh-logs:

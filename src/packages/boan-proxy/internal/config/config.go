@@ -11,7 +11,8 @@ import (
 type Config struct {
 	Listen                    string        `json:"listen"`
 	AdminListen               string        `json:"admin_listen"`
-	TestMode                  bool          `json:"test_mode"`
+	// TestMode 는 삭제됨 — testmode/release 는 이제 compile-time build tag 로 결정.
+	// `proxy.TestModeEnabled` const 참조.
 	OrgID                     string        `json:"org_id"`
 	PolicyURL                 string        `json:"policy_url"`
 	OrgToken                  string        `json:"org_token"`
@@ -69,6 +70,11 @@ type Config struct {
 	WorkstationNetworkTags    string        `json:"workstation_network_tags"`
 	WorkstationServiceAccount string        `json:"workstation_service_account"`
 	WorkstationRootVolumeGiB  int           `json:"workstation_root_volume_gib"`
+	// WazuhManagerHost — 신규 사용자 VM 부팅 시 Wazuh agent 가 등록할 manager IP/host.
+	// 비어있으면 Wazuh agent 자동 설치 skip. 권장: GCP Compute Engine 의 manager VM public IP
+	// (예: 34.47.105.194). 또는 hostname.
+	WazuhManagerHost          string        `json:"wazuh_manager_host"`
+	WazuhAgentGroup           string        `json:"wazuh_agent_group"`
 	GuacamoleURL              string        `json:"guacamole_url"`
 	GuacamoleUsername         string        `json:"guacamole_username"`
 	GuacamolePassword         string        `json:"guacamole_password"`
@@ -81,7 +87,6 @@ func Load() (*Config, error) {
 	cfg := &Config{
 		Listen:                    env("BOAN_LISTEN", ":18080"),
 		AdminListen:               env("BOAN_ADMIN_LISTEN", ":18081"),
-		TestMode:                  envBool("TEST", false) || envBool("BOAN_TEST_MODE", false),
 		OrgID:                     env("BOAN_ORG_ID", ""),
 		PolicyURL:                 env("BOAN_POLICY_URL", ""),
 		OrgToken:                  env("BOAN_ORG_TOKEN", ""),
@@ -132,6 +137,8 @@ func Load() (*Config, error) {
 		WorkstationImageProject:   env("BOAN_WORKSTATION_IMAGE_PROJECT", "windows-cloud"),
 		WorkstationImageFamily:    env("BOAN_WORKSTATION_IMAGE_FAMILY", "windows-2022"),
 		WorkstationSubnetwork:     env("BOAN_WORKSTATION_SUBNETWORK", ""),
+		WazuhManagerHost:          env("BOAN_WAZUH_MANAGER_HOST", ""),
+		WazuhAgentGroup:           env("BOAN_WAZUH_AGENT_GROUP", "boanclaw-default"),
 		WorkstationNetworkTags:    env("BOAN_WORKSTATION_NETWORK_TAGS", ""),
 		WorkstationServiceAccount: env("BOAN_WORKSTATION_SERVICE_ACCOUNT", ""),
 		WorkstationRootVolumeGiB:  envInt("BOAN_WORKSTATION_ROOT_VOLUME_GIB", 100),

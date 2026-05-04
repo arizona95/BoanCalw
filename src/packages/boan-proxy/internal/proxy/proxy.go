@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -34,6 +35,7 @@ import (
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/router"
 	boantls "github.com/samsung-sds/boanclaw/boan-proxy/internal/tls"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/killchain"
+	"github.com/samsung-sds/boanclaw/boan-proxy/internal/threatleader"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/userstore"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/workstation"
 )
@@ -59,8 +61,10 @@ type Server struct {
 	guardrail    *guardrail.Client
 	declinedFPs  *declinedFingerprintStore
 	device       *devicekey.Identity
-	killchain    *killchain.Store
-	killchainRun *killchain.Runner
+	killchain     *killchain.Store
+	killchainRun  *killchain.Runner
+	threatLeader  *threatleader.Store
+	threatRefresh *threatleader.Refresher
 }
 
 func New(cfg *config.Config) (*Server, error) {
@@ -190,7 +194,32 @@ func New(cfg *config.Config) (*Server, error) {
 	// optional. 실패 시 runner nil → UI 가 기능 비활성화.
 	if kcStore, err := killchain.NewStore(userDataDir); err == nil {
 		s.killchain = kcStore
-		s.killchainRun = &killchain.Runner{Store: kcStore, Prov: s.workstations}
+		s.killchainRun = &killchain.Runner{Store: kcStore, Prov: s.workstations, Users: s.users}
+	}
+	// Threat Leader store + refresher (24h cron + 즉시 트리거).
+	// userDataDir 가 host bind mount (uid 1000) 라 proxy uid 100 이 못 쓰는 경우가 있음.
+	// /tmp/boan 은 컨테이너 ephemeral 이지만 proxy uid 가 항상 쓸 수 있고, 매일 fetch 라 재시작
+	// 시 재구축 OK. 별도 영구 volume 은 phase v3 에 추가.
+	tlDir := os.Getenv("BOAN_THREAT_LEADER_DIR")
+	if tlDir == "" {
+		tlDir = "/tmp/boan/threat-leader"
+	}
+	if tlStore, err := threatleader.NewStore(tlDir); err == nil {
+		s.threatLeader = tlStore
+		s.threatRefresh = threatleader.NewRefresher(tlStore)
+		s.threatRefresh.Start(context.Background())
+	} else {
+		log.Printf("[threat-leader] init failed: %v (feature disabled)", err)
+	}
+	// 고아 GCP VM reaper — cleanup-user 가 한 번 더 빠뜨려도 비용이 영원히 누적되지
+	// 않도록 하는 안전망. context.Background 사용 — 프로세스 lifetime 내내 동작.
+	// BOAN_DISABLE_VM_JANITOR=1 로 끌 수 있다 — 같은 /data/users 를 공유하는
+	// sandbox-embedded proxy 에서 standalone 컨테이너의 users.json (mode 0600)
+	// 을 못 읽어 신규 VM 을 잘못 reap 하던 사고 (v10/v11) 회피용.
+	if os.Getenv("BOAN_DISABLE_VM_JANITOR") != "1" {
+		s.startVMJanitor(context.Background())
+	} else {
+		log.Printf("[vm-janitor] disabled (BOAN_DISABLE_VM_JANITOR=1)")
 	}
 	return s, nil
 }
@@ -325,10 +354,70 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	proxy.ServeHTTP(w, r)
 }
 
+// handleTunnel — HTTPS CONNECT tunnel. 기본 정책: 모든 raw CONNECT 차단 (HTTPS egress
+// 는 inspect 가능한 path 로만). 단, network whitelist 에 host:port 가 등록되고 method 에
+// "CONNECT" 가 명시된 경우만 raw forward 허용 — body inspection 은 양보하지만 host/port
+// gate 와 audit log 는 유지.
+//
+// 사용 사례: github.com:443 같은 vendor API. credential vault 와 함께 git/MCP tool 이
+// 동작할 수 있게 하는 안전한 tunnel path.
 func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
-	reason := "raw CONNECT tunnel disabled: HTTPS egress must use an inspected, policy-managed path"
-	http.Error(w, reason, http.StatusForbidden)
-	s.logEvent(r, "block:connect", dlp.SLevel1, reason, nil)
+	host := r.Host
+	if host == "" {
+		host = r.URL.Host
+	}
+	bareHost, portStr, err := net.SplitHostPort(host)
+	if err != nil {
+		bareHost, portStr = host, "443"
+	}
+	port, _ := strconv.Atoi(portStr)
+	if port == 0 {
+		port = 443
+	}
+
+	// fail-closed: gate 미초기화면 모든 CONNECT 거부.
+	if s.gate == nil {
+		reason := "raw CONNECT tunnel disabled: gate not initialized (fail-closed)"
+		http.Error(w, reason, http.StatusForbidden)
+		return
+	}
+	if err := s.gate.AllowWithPort(bareHost, http.MethodConnect, port); err != nil {
+		reason := "raw CONNECT tunnel disabled: " + err.Error() +
+			" (whitelist 에 host:port + methods=[CONNECT] 등록 필요)"
+		http.Error(w, reason, http.StatusForbidden)
+		s.logEvent(r, "block:connect", dlp.SLevel1, reason, nil)
+		return
+	}
+
+	// Whitelist 통과 → raw byte tunnel.
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "hijack unsupported", http.StatusInternalServerError)
+		return
+	}
+	clientConn, _, err := hj.Hijack()
+	if err != nil {
+		http.Error(w, "hijack failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer clientConn.Close()
+
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	upstream, err := dialer.Dial("tcp", net.JoinHostPort(bareHost, strconv.Itoa(port)))
+	if err != nil {
+		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		s.logEvent(r, "block:connect-dial", dlp.SLevel1, err.Error(), nil)
+		return
+	}
+	defer upstream.Close()
+
+	// 200 응답 후 raw stream
+	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	s.logEvent(r, "allow:connect", dlp.SLevel1, "tunneled (no body inspection)", nil)
+
+	// bidirectional pipe
+	go io.Copy(upstream, clientConn) //nolint:errcheck
+	io.Copy(clientConn, upstream)    //nolint:errcheck
 }
 
 func (s *Server) logEvent(r *http.Request, action string, level dlp.SLevel, reason string, body []byte) {

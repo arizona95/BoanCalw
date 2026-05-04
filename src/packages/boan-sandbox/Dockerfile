@@ -6,12 +6,17 @@ RUN go mod download 2>/dev/null || true
 RUN CGO_ENABLED=0 GOOS=linux go build -o /boan-onecli .
 
 FROM golang:1.25-alpine AS proxy-builder
+# sandbox 에 박히는 boan-proxy 도 testmode/release 동일하게 분기. 기본 release.
+ARG BOAN_BUILD_TAG=release
 WORKDIR /app
 COPY boan-proxy/go.mod boan-proxy/go.sum ./
 RUN go mod download
 COPY boan-proxy/ .
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /boan-proxy ./cmd/proxy
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /boan-audit ./cmd/audit
+RUN set -eux; \
+    if [ "$BOAN_BUILD_TAG" = "testmode" ]; then TAGS=testmode; else TAGS=""; fi; \
+    CGO_ENABLED=0 GOOS=linux go build -tags="$TAGS" -ldflags="-s -w" -o /boan-proxy ./cmd/proxy; \
+    CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /boan-audit ./cmd/audit; \
+    echo "sandbox-embedded boan-proxy build mode: ${BOAN_BUILD_TAG}"
 
 FROM golang:1.23-alpine AS cred-builder
 WORKDIR /app
@@ -77,7 +82,8 @@ COPY --from=plugin-build /build/src/plugin.json /opt/boanclaw/plugin.json
 COPY --from=plugin-build /build/src/plugin.json /opt/boanclaw/openclaw.plugin.json
 
 COPY boan-sandbox/git-guard.sh /usr/local/bin/git-guard
-RUN chmod +x /usr/local/bin/git-guard /usr/local/bin/boan-onecli && \
+COPY boan-sandbox/scripts/git-credential-boanclaw /usr/local/bin/git-credential-boanclaw
+RUN chmod +x /usr/local/bin/git-guard /usr/local/bin/boan-onecli /usr/local/bin/git-credential-boanclaw && \
     mv /usr/bin/git /usr/bin/git-real && \
     ln -s /usr/local/bin/git-guard /usr/local/bin/git
 

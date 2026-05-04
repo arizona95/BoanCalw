@@ -60,6 +60,51 @@ export default function MyGCP({ alwaysActive = false }: MyGCPProps = {}) {
   const [buffer, setBuffer] = useState("");
   const [gateBusy, setGateBusy] = useState(false);
   const [gateStatus, setGateStatus] = useState<string>("키보드는 보안 입력 바를 통해서만 전달됩니다.");
+
+  // BoanClaw Input 패널 드래그 위치. localStorage 에 저장해서 새로고침 후에도 유지.
+  const [inputOffset, setInputOffset] = useState<{ x: number; y: number }>(() => {
+    if (typeof window === "undefined") return { x: 0, y: 0 };
+    try {
+      const raw = window.localStorage.getItem("boanclawInputOffset");
+      if (!raw) return { x: 0, y: 0 };
+      const parsed = JSON.parse(raw);
+      if (typeof parsed?.x === "number" && typeof parsed?.y === "number") {
+        return { x: parsed.x, y: parsed.y };
+      }
+    } catch { /* ignore */ }
+    return { x: 0, y: 0 };
+  });
+  const dragRef = useRef<{ startX: number; startY: number; baseX: number; baseY: number } | null>(null);
+  const [dragging, setDragging] = useState(false);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try { window.localStorage.setItem("boanclawInputOffset", JSON.stringify(inputOffset)); } catch { /* ignore */ }
+  }, [inputOffset]);
+  const startInputDrag = (e: React.PointerEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    dragRef.current = { startX: e.clientX, startY: e.clientY, baseX: inputOffset.x, baseY: inputOffset.y };
+    setDragging(true);
+  };
+  const onInputDragMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!dragRef.current) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setInputOffset({
+      x: dragRef.current.baseX + (e.clientX - dragRef.current.startX),
+      y: dragRef.current.baseY + (e.clientY - dragRef.current.startY),
+    });
+  };
+  const endInputDrag = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!dragRef.current) return;
+    e.preventDefault();
+    e.stopPropagation();
+    try { (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId); } catch { /* ignore */ }
+    dragRef.current = null;
+    setDragging(false);
+  };
+  const resetInputPosition = () => setInputOffset({ x: 0, y: 0 });
   const [capturedRemoteClipboard, setCapturedRemoteClipboard] = useState<string>("");
   const [openclawUrl, setOpenclawUrl] = useState<string>("");
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
@@ -1260,7 +1305,35 @@ export default function MyGCP({ alwaysActive = false }: MyGCPProps = {}) {
           <div className="pointer-events-none absolute inset-x-0 bottom-0 z-30 flex justify-center px-4 pb-4">
             <div
               className="pointer-events-auto w-full max-w-3xl overflow-hidden rounded-2xl border border-cyan-400/20 bg-slate-950/92 shadow-2xl backdrop-blur outline-none focus:border-cyan-300 focus:ring-2 focus:ring-cyan-400/30"
+              style={{
+                transform: `translate(${inputOffset.x}px, ${inputOffset.y}px)`,
+                transition: dragging ? "none" : "transform 80ms linear",
+              }}
             >
+              {/* 드래그 핸들 — 상단 바. 이 영역만 잡고 끌면 패널 전체가 움직임. */}
+              <div
+                onPointerDown={startInputDrag}
+                onPointerMove={onInputDragMove}
+                onPointerUp={endInputDrag}
+                onPointerCancel={endInputDrag}
+                onDoubleClick={resetInputPosition}
+                className={`flex items-center justify-between gap-2 border-b border-cyan-400/10 bg-slate-900/60 px-3 py-1 text-[10px] uppercase tracking-[0.2em] text-cyan-300/70 select-none ${dragging ? "cursor-grabbing" : "cursor-grab"}`}
+                title="드래그로 위치 이동 / 더블클릭으로 원위치"
+              >
+                <span className="flex items-center gap-2">
+                  <span aria-hidden className="text-cyan-300/50">⠿⠿</span>
+                  <span>BoanClaw Input · drag</span>
+                </span>
+                {(inputOffset.x !== 0 || inputOffset.y !== 0) && (
+                  <button
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={resetInputPosition}
+                    className="text-[10px] tracking-normal normal-case text-cyan-300/60 hover:text-cyan-100"
+                  >
+                    원위치
+                  </button>
+                )}
+              </div>
               <div className="flex items-center gap-3 px-4 py-3">
                 <div className="min-w-0 flex-1 rounded-xl border border-cyan-400/15 bg-slate-900/80 px-4 py-3">
                   <div className="mb-1 flex items-center gap-2 text-[10px] uppercase tracking-[0.2em]">

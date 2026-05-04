@@ -345,7 +345,7 @@ func (p *gcpProvisioner) createInstance(ctx context.Context, email, orgID, remot
 			"items": []metadataItem{
 				{
 					Key:   "windows-startup-script-ps1",
-					Value: startupScript(remoteUser, remotePass),
+					Value: startupScript(remoteUser, remotePass) + wazuhAgentSnippet(p.cfg.WazuhManagerHost, p.cfg.WazuhAgentGroup, email),
 				},
 			},
 		},
@@ -400,6 +400,23 @@ func (p *gcpProvisioner) createInstance(ctx context.Context, email, orgID, remot
 	}
 	var op gcpOperation
 	_ = json.NewDecoder(resp.Body).Decode(&op)
+
+	// Poll until instance is RUNNING with an external IP — otherwise
+	// toWorkstation() saves an empty RemoteHost and Guacamole RDP fails.
+	// Bound at 3 minutes; if still provisioning, fall back to placeholder
+	// (Repair/manual reload will re-fetch later).
+	deadline := time.Now().Add(3 * time.Minute)
+	for time.Now().Before(deadline) {
+		inst, err := p.getInstance(ctx, name)
+		if err == nil && inst != nil && strings.EqualFold(inst.Status, "RUNNING") && externalIP(inst) != "" {
+			return inst, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
+	}
 	return &gcpInstance{
 		Name:   name,
 		Status: "PROVISIONING",
@@ -411,6 +428,58 @@ func (p *gcpProvisioner) createInstance(ctx context.Context, email, orgID, remot
 // Delete — 사용자의 GCP VM 즉시 삭제. owner 가 user 를 제거할 때 호출.
 // instance 이름은 current.InstanceID 또는 email 기반으로 추측.
 // 이미 없으면 nil 반환 (404 = idempotent OK).
+// ListManagedInstances — zone 의 모든 인스턴스 중 boanclaw label 이 붙은 것만 반환.
+// label `boanclaw-user-email` 가 비어 있으면 boanclaw 가 만든 VM 이 아님 → 무시.
+// janitor 가 이 list 를 user store 와 대조해서 고아를 reap.
+func (p *gcpProvisioner) ListManagedInstances(ctx context.Context) ([]ManagedInstance, error) {
+	u := fmt.Sprintf(
+		"https://compute.googleapis.com/compute/v1/projects/%s/zones/%s/instances",
+		url.PathEscape(p.cfg.WorkstationProjectID),
+		url.PathEscape(p.cfg.WorkstationZone),
+	)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("gcp list instances returned status %d", resp.StatusCode)
+	}
+	type fullInstance struct {
+		Name              string            `json:"name"`
+		Labels            map[string]string `json:"labels"`
+		CreationTimestamp string            `json:"creationTimestamp"`
+	}
+	var out struct {
+		Items []fullInstance `json:"items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	managed := make([]ManagedInstance, 0, len(out.Items))
+	for _, inst := range out.Items {
+		emailLabel := inst.Labels["boanclaw-user-email"]
+		if emailLabel == "" {
+			continue
+		}
+		created, _ := time.Parse(time.RFC3339, inst.CreationTimestamp)
+		managed = append(managed, ManagedInstance{
+			Name:         inst.Name,
+			Email:        emailLabel,
+			OrgID:        inst.Labels["boanclaw-org-id"],
+			CreationTime: created,
+		})
+	}
+	return managed, nil
+}
+
 func (p *gcpProvisioner) Delete(ctx context.Context, email, _ string, current *userstore.Workstation) error {
 	name := instanceNameFromCurrent(current)
 	if name == "" {
@@ -807,6 +876,10 @@ func splitCSV(v string) []string {
 	return out
 }
 
+// LabelEmail — janitor 등 외부 패키지에서 email 을 GCP label 형식으로 변환할 때 사용.
+// 내부 labelValue 와 동일 (공개 wrapper).
+func LabelEmail(email string) string { return labelValue(email) }
+
 func labelValue(v string) string {
 	v = strings.ToLower(strings.TrimSpace(v))
 	v = strings.NewReplacer("@", "-", ".", "-", "_", "-", "/", "-", " ", "-").Replace(v)
@@ -972,7 +1045,7 @@ $logPath = "C:\ProgramData\boanclaw-startup.log"
 function LogStep($msg) { "$(Get-Date -Format o) $msg" | Add-Content -Path $logPath }
 LogStep "=== boanclaw startup begin (user=%s) ==="
 
-# ── 계정 생성 / 비밀번호 설정 ─────────────────────────────────────────
+# Account create / password set
 $securePassword = ConvertTo-SecureString "%s" -AsPlainText -Force
 try {
   if (-not (Get-LocalUser -Name "%s" -ErrorAction SilentlyContinue)) {
@@ -987,7 +1060,7 @@ try {
   LogStep "user/pass error: $_"
 }
 
-# ── 그룹 멤버십 — Administrators + Remote Desktop Users 둘 다 확인 ──────
+# Group membership: Administrators + Remote Desktop Users
 foreach ($grp in @("Administrators","Remote Desktop Users")) {
   try {
     Add-LocalGroupMember -Group $grp -Member "%s" -ErrorAction SilentlyContinue
@@ -995,14 +1068,14 @@ foreach ($grp in @("Administrators","Remote Desktop Users")) {
   } catch { LogStep "membership fail ${grp}: $_" }
 }
 
-# ── RDP 활성화 ────────────────────────────────────────────────────────
+# RDP enable
 Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
-# NLA 끄기 (Guacamole 와의 호환성 — RDP 2FA 스타일 검사 disable)
+# Disable NLA for Guacamole compatibility
 Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 0 -ErrorAction SilentlyContinue
 Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 LogStep "RDP enabled + NLA disabled"
 
-# ── 사용자 Desktop\boanclaw 폴더 생성 ─────────────────────────────────
+# Create user Desktop boanclaw folder
 $userProfile = "C:\Users\%s"
 $desktopBoanclaw = Join-Path $userProfile "Desktop\boanclaw"
 if (-not (Test-Path $desktopBoanclaw)) {
@@ -1012,6 +1085,47 @@ if (-not (Test-Path $desktopBoanclaw)) {
 icacls $desktopBoanclaw /grant "%s:(OI)(CI)F" /T 2>&1 | Out-Null
 LogStep "=== boanclaw startup end ==="
 `, username, password, username, username, username, username, username, username, username, username, username)
+}
+
+// wazuhAgentTemplatePS — minimal bootstrap. 큰 install 로직은 GCS 에서 다운로드 받음.
+// metadata 의 PS 5.1 인코딩 이슈 (한국어/em-dash silent fail) 회피 + 사이즈 작아서 안전.
+const wazuhAgentTemplatePS = "\n\n" +
+	"# BoanClaw Wazuh agent bootstrap -- download install ps1 from GCS + run it.\n" +
+	"try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}\n" +
+	"$installer = \"$env:TEMP\\wazuh-agent-install.ps1\"\n" +
+	"try { Invoke-WebRequest -Uri 'https://storage.googleapis.com/boanclaw-vm-scripts-ai-security-test-473701/wazuh-agent-install.ps1' -OutFile $installer -UseBasicParsing } catch { Add-Content -Path C:\\ProgramData\\boanclaw-wazuh-bootstrap.log -Value (\"download failed: \" + $_.Exception.Message) }\n" +
+	"if (Test-Path $installer) { & PowerShell -ExecutionPolicy Bypass -File $installer -ManagerHost '@@MANAGER@@' -AgentGroup '@@GROUP@@' -AgentName '@@AGENT_NAME@@' }\n"
+
+// wazuhAgentSnippet — Wazuh agent + Sysmon 자동 설치 PowerShell 스니펫.
+// startupScript 끝에 append. managerHost 가 비어있으면 빈 문자열 반환 (skip).
+//
+// 기능:
+//   1) Wazuh agent MSI 설치 + manager 등록 (agent_name = email-slug)
+//   2) Sysmon64 + SwiftOnSecurity sysmonconfig 설치
+//   3) ossec.conf 에 Microsoft-Windows-Sysmon/Operational eventchannel 추가
+//   4) Wazuh service 시작 — 부팅 시 manager 로 연결
+//
+// idempotent — 이미 깔린 VM (Golden Image 부터 부팅) 도 다시 실행 시 skip.
+func wazuhAgentSnippet(managerHost, agentGroup, email string) string {
+	managerHost = strings.TrimSpace(managerHost)
+	if managerHost == "" {
+		return ""
+	}
+	if agentGroup == "" {
+		agentGroup = "boanclaw-default"
+	}
+	// agent_name = email 의 local-part slug (boan-proxy 의 active-response 가
+	// agent_name → email 매핑 시 사용). 예: "user@samsung.com" → "user"
+	agentName := strings.ToLower(strings.SplitN(email, "@", 2)[0])
+	if agentName == "" {
+		agentName = "boanclaw-agent"
+	}
+	// non-alphanumeric → underscore (Wazuh agent_name 제약).
+	agentName = slugRe.ReplaceAllString(agentName, "_")
+	tpl := strings.ReplaceAll(wazuhAgentTemplatePS, "@@MANAGER@@", managerHost)
+	tpl = strings.ReplaceAll(tpl, "@@GROUP@@", agentGroup)
+	tpl = strings.ReplaceAll(tpl, "@@AGENT_NAME@@", agentName)
+	return tpl
 }
 
 // ═══════════════════════════════════════════════════════════════════════

@@ -59,14 +59,24 @@ type WikiEdge struct {
 	Weight float32 `json:"weight,omitempty"`
 }
 
-// DecisionLog — approve/deny 라벨.
+// DecisionLog — allow/deny 라벨. 옛 데이터에는 "approve" 가 박혀있을 수 있음 →
+// 읽기 시점에 NormalizeDecision 으로 정규화.
 type DecisionLog struct {
 	ID        string    `json:"id"`
 	Input     string    `json:"input"`
-	Decision  string    `json:"decision"` // "approve" | "deny"
+	Decision  string    `json:"decision"` // "allow" | "deny"  (legacy: "approve" → "allow")
 	Reason    string    `json:"reason,omitempty"`
 	Labeler   string    `json:"labeler,omitempty"`
 	Timestamp time.Time `json:"timestamp"`
+}
+
+// NormalizeDecision — legacy "approve" 를 "allow" 로 통일. 다른 값은 그대로.
+// 새로 쓸 때나 읽을 때나 거쳐서 라벨 단어가 코드베이스 어디서도 "approve" 로 보이지 않게.
+func NormalizeDecision(v string) string {
+	if strings.EqualFold(strings.TrimSpace(v), "approve") {
+		return "allow"
+	}
+	return v
 }
 
 // ClarificationDialog — LLM 이 애매한 부분을 물어본 대화 세션.
@@ -82,6 +92,18 @@ type DialogTurn struct {
 	Role     string   `json:"role"` // "llm" | "human"
 	Content  string   `json:"content"`
 	Examples []string `json:"examples,omitempty"` // LLM 이 든 애매한 예시
+
+	// Action — LLM 턴이 어떤 종류의 응답인지 기록 (UI rehydration 용).
+	// "ASK_FOLLOWUP" | "REQUEST_LABEL_FIX" | "UPDATE_WIKI" | "CLOSE_AND_FIND_NEW"
+	Action string `json:"action,omitempty"`
+
+	// LabelFixTarget — legacy 단일 제안 (한 항목). UI 호환을 위해 유지.
+	LabelFixTarget map[string]any `json:"label_fix_target,omitempty"`
+
+	// LabelFixBatch — REQUEST_LABEL_FIX 턴이 여러 항목을 한꺼번에 제안할 때.
+	// 각 항목: {decision_id, decision_text, current_label, suggested_label, reason}.
+	// UI 는 각 항목마다 토글 (allow/deny) + 일괄 적용 버튼 렌더.
+	LabelFixBatch []map[string]any `json:"label_fix_batch,omitempty"`
 }
 
 // ── 검증 한계 ──────────────────────────────────────────────
@@ -256,6 +278,7 @@ func (s *WikiGraphStore) AppendDecision(orgID string, d *DecisionLog) error {
 	if d.Timestamp.IsZero() {
 		d.Timestamp = time.Now().UTC()
 	}
+	d.Decision = NormalizeDecision(d.Decision)
 	return writeJSON(filepath.Join(s.orgDir(orgID), "decisions", d.ID+".json"), d)
 }
 
@@ -270,7 +293,7 @@ func (s *WikiGraphStore) UpdateDecision(orgID, id string, newDecision, newReason
 		return nil, err
 	}
 	if strings.TrimSpace(newDecision) != "" {
-		d.Decision = newDecision
+		d.Decision = NormalizeDecision(newDecision)
 	}
 	if strings.TrimSpace(newReason) != "" {
 		// reason 은 기존 값에 "[label-fix @ timestamp] ..." prefix 를 덧붙여
@@ -298,6 +321,7 @@ func (s *WikiGraphStore) ListDecisions(orgID string, limit int) ([]DecisionLog, 
 		}
 		var d DecisionLog
 		if err := readJSON(filepath.Join(s.orgDir(orgID), "decisions", e.Name()), &d); err == nil {
+			d.Decision = NormalizeDecision(d.Decision)
 			out = append(out, d)
 		}
 	}
