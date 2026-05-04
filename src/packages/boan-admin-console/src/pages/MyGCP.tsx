@@ -1371,19 +1371,83 @@ export default function MyGCP({ alwaysActive = false }: MyGCPProps = {}) {
         </div>
       ) : loading ? (
         <StateScreen title="작업 컴퓨터를 불러오는 중" subtitle="잠시만 기다리세요." />
-      ) : error || !workstation ? (
-        <StateScreen
-          title="작업 컴퓨터가 준비되지 않았습니다"
-          subtitle={error ?? "소유자 승인 후 개인 작업 컴퓨터가 생성됩니다."}
-        />
-      ) : (
-        <StateScreen
-          title={screenTitle}
-          subtitle={stateSubtitle(workstation)}
-          actionHref={workstation.console_url}
-          actionLabel={workstation.console_url ? "콘솔 열기" : undefined}
-        />
-      )}
+      ) : (() => {
+        // Phase 1 — VM 은 admin 승인 시점에만 만들어진다. user 가 직접 신청 → 관리자 승인.
+        const vs = (workstation?.vm_status ?? "") as string;
+        if (vs === "requested") {
+          return (
+            <StateScreen
+              title="VM 승인 대기 중"
+              subtitle="관리자가 Authorization > Users 에서 VM 을 승인하면 즉시 사용 가능합니다."
+            />
+          );
+        }
+        if (vs === "" || vs === "reclaimed") {
+          return <VMRequestPanel reclaimed={vs === "reclaimed"} onRequested={() => {
+            workstationApi.me().then((d) => setWorkstation(d)).catch(() => undefined);
+          }} />;
+        }
+        if (error || !workstation) {
+          return (
+            <StateScreen
+              title="작업 컴퓨터가 준비되지 않았습니다"
+              subtitle={error ?? "소유자 승인 후 개인 작업 컴퓨터가 생성됩니다."}
+            />
+          );
+        }
+        return (
+          <StateScreen
+            title={screenTitle}
+            subtitle={stateSubtitle(workstation)}
+            actionHref={workstation.console_url}
+            actionLabel={workstation.console_url ? "콘솔 열기" : undefined}
+          />
+        );
+      })()}
+    </div>
+  );
+}
+
+// VMRequestPanel — Phase 1: shown when the user has no VM (vm_status is
+// "" or "reclaimed"). Clicking "VM 신청" calls /api/workstation/request which
+// flips VMStatus to "requested"; the admin then approves in Authorization >
+// Users to actually create the VM via Google OAuth.
+function VMRequestPanel({ reclaimed, onRequested }: { reclaimed: boolean; onRequested: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const handle = async () => {
+    setBusy(true);
+    setMsg(null);
+    try {
+      await workstationApi.request();
+      setMsg("VM 신청 완료 — 관리자 승인 대기 중");
+      onRequested();
+    } catch (e) {
+      setMsg(`신청 실패: ${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="flex h-full items-center justify-center bg-gray-900 text-white">
+      <div className="max-w-md text-center px-8">
+        <h2 className="text-2xl font-semibold mb-2">
+          {reclaimed ? "🔴 VM 이 회수되었습니다" : "🖥️ 작업 컴퓨터가 없습니다"}
+        </h2>
+        <p className="text-sm text-gray-400 mb-6">
+          {reclaimed
+            ? "Kill chain 또는 관리자에 의해 VM 이 삭제되었습니다. 새 VM 을 신청하면 관리자 승인 후 골든 이미지로 다시 생성됩니다."
+            : "VM 을 신청하면 관리자 승인 후 골든 이미지로 작업 컴퓨터가 생성됩니다."}
+        </p>
+        <button
+          onClick={handle}
+          disabled={busy}
+          className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white font-medium px-6 py-3 rounded-full"
+        >
+          {busy ? "신청 중..." : "✦ VM 신청"}
+        </button>
+        {msg && <p className="mt-4 text-xs text-gray-300">{msg}</p>}
+      </div>
     </div>
   );
 }

@@ -93,32 +93,24 @@ func (r *Runner) execute(ctx context.Context, incidentID, targetEmail string, ws
 		return "VM deleted", nil
 	}, &failures)
 
-	// 6) provision replacement VM (golden image). 모든 user 동일 처리 — owner 예외 없음.
-	r.runStep(ctx, incidentID, "provision-replacement", func(ctx context.Context) (string, error) {
+	// 6) mark-reclaimed — Phase 1: 자동 spawn 제거. VM 삭제 후 사용자의
+	//    workstation 을 정리하고 VMStatus=reclaimed 로 표시. 새 VM 은 admin 이
+	//    Authorization > Users 의 "VM 승인" 을 다시 클릭하고 Google OAuth 로
+	//    인증한 시점에만 생성됨 (매번 명시적 승인).
+	r.runStep(ctx, incidentID, "mark-reclaimed", func(ctx context.Context) (string, error) {
 		if r.Users == nil {
 			return "", fmt.Errorf("user store not wired into killchain runner")
 		}
 		if strings.TrimSpace(targetEmail) == "" {
-			return "", fmt.Errorf("incident has no target_email; cannot reprovision")
+			return "", fmt.Errorf("incident has no target_email; cannot reclaim user")
 		}
-		user, err := r.Users.Get(targetEmail)
-		if err != nil || user == nil {
-			return "", fmt.Errorf("user not found: %s", targetEmail)
-		}
-		// 기존 stale workstation 정리 (provisioner 가 같은 이름 instance lookup 안 하도록).
-		_ = r.Users.AssignWorkstation(targetEmail, nil)
-		newWS, err := r.Prov.Ensure(ctx, targetEmail, user.OrgID, nil)
-		if err != nil {
+		if err := r.Users.AssignWorkstation(targetEmail, nil); err != nil {
 			return "", err
 		}
-		if err := r.Users.AssignWorkstation(targetEmail, newWS); err != nil {
+		if err := r.Users.SetVMStatus(targetEmail, userstore.VMStatusReclaimed); err != nil {
 			return "", err
 		}
-		host := ""
-		if newWS != nil {
-			host = newWS.RemoteHost
-		}
-		return fmt.Sprintf("new VM=%s host=%s", instanceName(newWS), host), nil
+		return fmt.Sprintf("user=%s vm_status=reclaimed (admin must re-approve)", targetEmail), nil
 	}, &failures)
 
 	// finalize incident status

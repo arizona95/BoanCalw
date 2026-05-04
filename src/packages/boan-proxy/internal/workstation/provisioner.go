@@ -13,6 +13,12 @@ import (
 
 type Provisioner interface {
 	Ensure(ctx context.Context, email, orgID string, current *userstore.Workstation) (*userstore.Workstation, error)
+	// EnsureWithToken — same as Ensure, but uses the supplied OAuth bearer token
+	// for GCP API calls instead of the proxy's default service account.
+	// Used by the admin VM-approve flow so each VM creation is gated on a fresh
+	// Google Sign-In and attributed to the approving admin.
+	// Empty token falls back to the default service-account-based Ensure.
+	EnsureWithToken(ctx context.Context, email, orgID, accessToken string, current *userstore.Workstation) (*userstore.Workstation, error)
 	RepairCredentials(ctx context.Context, email, orgID string, current *userstore.Workstation) (*userstore.Workstation, error)
 	// Delete — 사용자의 GCP VM 을 즉시 삭제. user 가 owner 에 의해 제거될 때 호출.
 	// noop provider 는 빈 구현. error 는 caller 가 best-effort 로 로그만 찍을 수 있음.
@@ -93,6 +99,10 @@ func (p *noopProvisioner) Ensure(_ context.Context, email, _ string, current *us
 		WebDesktopURL: "",
 		AssignedAt:    time.Now().UTC(),
 	}, nil
+}
+
+func (p *noopProvisioner) EnsureWithToken(ctx context.Context, email, orgID, _ string, current *userstore.Workstation) (*userstore.Workstation, error) {
+	return p.Ensure(ctx, email, orgID, current)
 }
 
 func (p *noopProvisioner) RepairCredentials(_ context.Context, email, _ string, current *userstore.Workstation) (*userstore.Workstation, error) {

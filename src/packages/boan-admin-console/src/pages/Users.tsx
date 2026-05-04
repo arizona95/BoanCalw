@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { orgSettingsApi, workstationApi } from "../api";
 
 // GoldenImagePanel — owner 전용. 현재 등록된 골든 이미지 URI 표시 + "내 VM 을
@@ -187,9 +187,38 @@ interface UserRow {
   role: string;
   org_id: string;
   status: string;
+  vm_status?: string;
+  workstation_status?: string;
+  instance_id?: string;
   access_level: string;
   created_at: string;
   registered_ip?: string;
+}
+
+const VM_STATUS_LABEL: Record<string, string> = {
+  "":          "VM 없음",
+  "requested": "🟡 VM 신청 대기",
+  "active":    "🟢 VM 활성",
+  "reclaimed": "🔴 VM 회수됨 (재승인 필요)",
+};
+
+const VM_STATUS_BADGE: Record<string, string> = {
+  "":          "bg-gray-100 text-gray-500",
+  "requested": "bg-yellow-100 text-yellow-700",
+  "active":    "bg-green-100 text-green-700",
+  "reclaimed": "bg-red-100 text-red-700",
+};
+
+// requestAdminAccessToken — Phase 1: prompt-based fallback. Phase 2 will
+// replace with Google Identity Services popup once OAuth client_id is wired
+// (BOAN_OAUTH_CLIENT_ID is already in compose env). Returns empty string if
+// the admin cancels — backend then falls back to its default service account.
+function requestAdminAccessToken(email: string): string | null {
+  const msg =
+    `${email} 에게 VM 을 승인합니다.\n\n` +
+    `Google OAuth access_token 을 입력하세요 (host 머신에서 'gcloud auth print-access-token' 실행 후 복사).\n` +
+    `비워 두면 백엔드 service account 로 fallback 합니다.`;
+  return window.prompt(msg, "");
 }
 
 const ROLE_BADGE: Record<string, string> = {
@@ -214,6 +243,41 @@ export default function Users() {
   const [users, setUsers] = useState<UserRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [msg, setMsg] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [busyVM, setBusyVM] = useState<Record<string, boolean>>({});
+
+  const approveVM = async (email: string) => {
+    const token = requestAdminAccessToken(email);
+    if (token === null) return; // user cancelled
+    setBusyVM((b) => ({ ...b, [email]: true }));
+    setMsg(null);
+    try {
+      const res = await fetch(`/api/admin/users/${encodeURIComponent(email)}/vm-approve`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ access_token: token }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        setMsg(`VM 승인됨 — ${data.workstation?.instance_id?.split("/").pop?.() ?? "ok"}`);
+      } else {
+        setMsg(`승인 실패: ${data.error ?? res.status}`);
+      }
+    } catch (e) {
+      setMsg(`네트워크 오류: ${(e as Error).message}`);
+    } finally {
+      setBusyVM((b) => ({ ...b, [email]: false }));
+      load();
+    }
+  };
+
+  const denyVM = async (email: string) => {
+    if (!confirm(`${email} 의 VM 신청을 거부하시겠습니까?\n(VMStatus 를 다시 none 으로 되돌립니다.)`)) return;
+    // Phase 1 stub — no dedicated /vm-deny endpoint yet. Reuse PATCH on the
+    // user store to clear vm_status (server-side enforcement deferred).
+    setMsg("거부 endpoint 미구현 — Phase 2 에서 추가 예정");
+  };
 
   const load = () => {
     setLoading(true);
@@ -303,11 +367,21 @@ export default function Users() {
             </thead>
             <tbody className="divide-y divide-gray-100">
               {users.map((u) => (
-                <tr key={u.email} className={
+                <Fragment key={u.email}>
+                <tr className={
                   u.role === "tester" ? "bg-purple-50" :
                   u.status === "pending" ? "bg-yellow-50" : ""
                 }>
-                  <td className="px-4 py-3 font-mono text-xs text-gray-700">{u.email}</td>
+                  <td className="px-4 py-3 font-mono text-xs text-gray-700">
+                    <button
+                      onClick={() => setExpanded((e) => ({ ...e, [u.email]: !e[u.email] }))}
+                      className="mr-1.5 text-gray-400 hover:text-gray-700"
+                      title={expanded[u.email] ? "VM 정보 접기" : "VM 정보 펼치기"}
+                    >
+                      {expanded[u.email] ? "▼" : "▶"}
+                    </button>
+                    {u.email}
+                  </td>
                   <td className="px-4 py-3">
                     <span className={`text-xs font-medium px-2 py-1 rounded-full ${ROLE_BADGE[u.role] ?? "bg-gray-100 text-gray-600"}`}>
                       {ROLE_LABEL[u.role] ?? "사용자"}
@@ -369,6 +443,54 @@ export default function Users() {
                     )}
                   </td>
                 </tr>
+                {expanded[u.email] && (
+                  <tr>
+                    <td colSpan={8} className="bg-gray-50 border-l-4 border-blue-300 px-10 py-4">
+                      <div className="text-xs text-gray-500 mb-2">↳ VM 승인 / 상태</div>
+                      <div className="flex items-center gap-3 flex-wrap">
+                        <span className={`text-xs font-medium px-2 py-1 rounded-full ${VM_STATUS_BADGE[u.vm_status ?? ""] ?? "bg-gray-100 text-gray-500"}`}>
+                          {VM_STATUS_LABEL[u.vm_status ?? ""] ?? "VM 없음"}
+                        </span>
+                        {u.instance_id && (
+                          <span className="text-xs font-mono text-gray-400">
+                            {u.instance_id.split("/").pop()}
+                          </span>
+                        )}
+                        {(u.vm_status === "requested" || u.vm_status === "reclaimed") && (
+                          <>
+                            <button
+                              onClick={() => approveVM(u.email)}
+                              disabled={busyVM[u.email]}
+                              className="text-xs bg-blue-600 text-white px-3 py-1.5 rounded-full hover:bg-blue-700 font-medium disabled:opacity-50"
+                              title="Google OAuth access_token 으로 GCP createInstance"
+                            >
+                              {busyVM[u.email] ? "생성 중..." : "✓ VM 승인 (Google 인증)"}
+                            </button>
+                            {u.vm_status === "requested" && (
+                              <button
+                                onClick={() => denyVM(u.email)}
+                                className="text-xs text-red-500 hover:text-red-700 px-2 py-1.5"
+                              >
+                                미승인
+                              </button>
+                            )}
+                          </>
+                        )}
+                        {u.vm_status === "active" && (
+                          <span className="text-xs text-gray-400">
+                            현재 사용 중 — kill chain 발동 시 자동 회수됨
+                          </span>
+                        )}
+                        {(u.vm_status ?? "") === "" && (
+                          <span className="text-xs text-gray-400">
+                            사용자가 아직 VM 신청을 하지 않았습니다.
+                          </span>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                )}
+                </Fragment>
               ))}
             </tbody>
           </table>

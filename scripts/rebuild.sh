@@ -27,6 +27,23 @@ docker compose -f "$COMPOSE_FILE" build "${TARGETS[@]}"
 echo "▶ restarting: ${TARGETS[*]}"
 docker compose -f "$COMPOSE_FILE" up -d --force-recreate "${TARGETS[@]}"
 
+# Volume bind from host can come up with 1000:1000 ownership which the boan
+# UID inside the proxy/sandbox containers can't read. The image entrypoint
+# tries to chown but on some hosts that silently fails before the proxy
+# binary starts. Reassert from the host as the simplest reliable path.
+if docker ps --format '{{.Names}}' | grep -q '^boanclaw-boan-proxy-1$'; then
+  docker exec -u 0 boanclaw-boan-proxy-1 \
+    sh -c 'chown -R boan:boan /data/users 2>/dev/null; chmod 775 /data/users 2>/dev/null' \
+    >/dev/null 2>&1 || true
+fi
+if docker ps --format '{{.Names}}' | grep -q '^boanclaw-boan-sandbox-1$'; then
+  docker exec -u 0 boanclaw-boan-sandbox-1 \
+    sh -c 'chown -R boan:boan /data/users 2>/dev/null; chmod 775 /data/users 2>/dev/null' \
+    >/dev/null 2>&1 || true
+fi
+# Restart proxy so it loads users.json with the corrected ownership.
+docker restart boanclaw-boan-proxy-1 >/dev/null 2>&1 || true
+
 echo "▶ waiting for services to be healthy..."
 MAX_WAIT=60
 ELAPSED=0

@@ -404,17 +404,16 @@ func (s *Server) StartAdmin() {
 		return ws, nil
 	}
 
-	warmWorkstation := func(email, orgID string) {
-		email = strings.TrimSpace(strings.ToLower(email))
-		if email == "" || orgID == "" {
-			return
-		}
-		go func() {
-			if _, err := ensureWorkstation(context.Background(), email, orgID); err != nil {
-				log.Printf("workstation warmup failed for %s: %v", email, err)
-			}
-		}()
+	// warmWorkstation kept as a no-op closure so any forgotten callsite still
+	// compiles; Phase 1 architecture forbids implicit VM creation.
+	_ = func(email, orgID string) {
+		_ = email
+		_ = orgID
 	}
+	// ensureWorkstation may still be invoked by legacy code paths (RepairCredentials
+	// surrounded flows, etc). Keep the helper available; the auto-trigger callsites
+	// have been individually removed above.
+	_ = ensureWorkstation
 
 	syncLocalUser := func(email, orgID, role string, status userstore.Status) {
 		_, _ = s.users.Upsert(strings.TrimSpace(strings.ToLower(email)), orgID, role, status)
@@ -1124,9 +1123,9 @@ func (s *Server) StartAdmin() {
 			"can_edit":      roles.CanEdit(roles.Normalize(sess.Role)),
 			"org_id":        sess.OrgID,
 		})
-		if u, err := s.users.Get(sess.Email); err == nil && u.Status == userstore.StatusApproved {
-			warmWorkstation(sess.Email, sess.OrgID)
-		}
+		// Auto-provisioning on login removed — VMs are now created only after
+		// admin clicks "VM 승인" in Authorization > Users (Phase 1 architecture).
+		_ = sess
 	})
 
 	mux.HandleFunc("/api/openclaw/dashboard", func(w http.ResponseWriter, r *http.Request) {
@@ -1735,13 +1734,12 @@ func (s *Server) StartAdmin() {
 			json.NewEncoder(w).Encode(map[string]any{"error": "failed to load workstation state"})
 			return
 		}
-		if u, getErr := s.users.Get(sess.Email); getErr == nil && u.Status == userstore.StatusApproved {
-			provisioned, provisionErr := ensureWorkstation(r.Context(), sess.Email, sess.OrgID)
-			if provisionErr != nil {
-				log.Printf("workstation ensure failed for %s: %v", sess.Email, provisionErr)
-			} else {
-				ws = provisioned
-			}
+		// Phase 1: no auto-provisioning. The frontend uses vm_status to decide
+		// whether to render "VM 신청" button (none/reclaimed), "승인 대기" message
+		// (requested), or the RDP iframe (active).
+		var vmStatus userstore.VMStatus
+		if u, getErr := s.users.Get(sess.Email); getErr == nil {
+			vmStatus = u.VMStatus
 		}
 		if ws == nil {
 			json.NewEncoder(w).Encode(map[string]any{
@@ -1750,6 +1748,7 @@ func (s *Server) StartAdmin() {
 				"provider":        "",
 				"platform":        "",
 				"status":          "unprovisioned",
+				"vm_status":       string(vmStatus),
 				"display_name":    "",
 				"instance_id":     "",
 				"region":          "",
@@ -1783,12 +1782,132 @@ func (s *Server) StartAdmin() {
 			"provider":        ws.Provider,
 			"platform":        ws.Platform,
 			"status":          ws.Status,
+			"vm_status":       string(vmStatus),
 			"display_name":    ws.DisplayName,
 			"instance_id":     ws.InstanceID,
 			"region":          ws.Region,
 			"console_url":     ws.ConsoleURL,
 			"web_desktop_url": ws.WebDesktopURL,
 			"assigned_at":     ws.AssignedAt,
+		})
+	})
+
+	// POST /api/admin/users/{email}/vm-approve — owner approves a pending VM
+	// request. Body: {"access_token": "..."} — the admin's Google OAuth bearer
+	// token (obtained from a fresh in-browser Sign-In popup). The proxy uses
+	// that token to call GCP createInstance, so every VM is attributed to the
+	// approving admin and the proxy never holds long-lived elevated creds.
+	mux.HandleFunc("/api/admin/users/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Path: /api/admin/users/{email}/vm-approve  (or /vm-deny in future)
+		rest := strings.TrimPrefix(r.URL.Path, "/api/admin/users/")
+		slash := strings.LastIndex(rest, "/")
+		if slash <= 0 {
+			http.NotFound(w, r)
+			return
+		}
+		email := strings.TrimSpace(rest[:slash])
+		action := rest[slash+1:]
+		if email == "" || action != "vm-approve" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		if !s.requireOwner(w, r) {
+			return
+		}
+		var body struct {
+			AccessToken string `json:"access_token"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		u, err := s.users.Get(email)
+		if err != nil || u == nil {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]any{"error": "user not found"})
+			return
+		}
+		if u.Status != userstore.StatusApproved {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]any{"error": "account not approved"})
+			return
+		}
+		if u.VMStatus != userstore.VMStatusRequested {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]any{
+				"error":     "user has not requested a VM",
+				"vm_status": string(u.VMStatus),
+			})
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+		defer cancel()
+		ws, err := s.workstations.EnsureWithToken(ctx, email, u.OrgID, body.AccessToken, nil)
+		if err != nil {
+			log.Printf("vm-approve: EnsureWithToken failed for %s: %v", email, err)
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+			return
+		}
+		if err := s.users.AssignWorkstation(email, ws); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"status":    "ok",
+			"vm_status": string(userstore.VMStatusActive),
+			"workstation": map[string]any{
+				"instance_id":  ws.InstanceID,
+				"remote_host":  ws.RemoteHost,
+				"display_name": ws.DisplayName,
+			},
+		})
+	})
+
+	// POST /api/workstation/request — user-initiated VM request.
+	// Phase 1: replaces the previous auto-spawn-on-login flow. User can call
+	// this once their account is approved; admin must explicitly approve via
+	// /api/admin/users/{email}/vm-approve before a VM is created.
+	mux.HandleFunc("/api/workstation/request", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		sess, err := auth.SessionFromRequest(r, s.authProv)
+		if err != nil || sess == nil {
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]any{"error": "unauthenticated"})
+			return
+		}
+		u, err := s.users.Get(sess.Email)
+		if err != nil || u == nil {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]any{"error": "user not found"})
+			return
+		}
+		if u.Status != userstore.StatusApproved {
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]any{"error": "account not approved"})
+			return
+		}
+		if err := s.users.RequestVM(sess.Email); err != nil {
+			if err == userstore.ErrVMAlreadyActive {
+				w.WriteHeader(http.StatusConflict)
+				json.NewEncoder(w).Encode(map[string]any{"error": "VM already active"})
+				return
+			}
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"status":    "ok",
+			"vm_status": string(userstore.VMStatusRequested),
+			"hint":      "관리자가 VM 승인 후 사용 가능합니다.",
 		})
 	})
 
@@ -1984,7 +2103,9 @@ func (s *Server) StartAdmin() {
 			"role_label": roles.Labels[roleVal],
 			"org_id":     orgID,
 		})
-		warmWorkstation(body.Email, orgID)
+		// Phase 1: no auto-provisioning on register. User must call POST
+		// /api/workstation/request and admin must approve in Authorization >
+		// Users (Google OAuth) before a VM is created.
 	})
 
 	// GET /api/orgs — public list (login screen dropdown).
@@ -2221,7 +2342,7 @@ func (s *Server) StartAdmin() {
 				json.NewEncoder(w).Encode(map[string]string{"error": "세션 생성 실패"})
 				return
 			}
-			warmWorkstation(body.Email, orgID)
+			// Phase 1: no auto-provisioning on test-mode login.
 			hintMsg := "TEST 모드: OTP 없이 바로 로그인됩니다."
 			if isOwner {
 				hintMsg = "TEST 모드 소유자 계정은 OTP 없이 바로 로그인됩니다."
@@ -2566,6 +2687,7 @@ func (s *Server) StartAdmin() {
 				Role              string `json:"role"`
 				OrgID             string `json:"org_id"`
 				Status            string `json:"status"`
+				VMStatus          string `json:"vm_status,omitempty"`
 				AccessLevel       string `json:"access_level"`
 				CreatedAt         string `json:"created_at"`
 				RegisteredIP      string `json:"registered_ip,omitempty"`
@@ -2589,6 +2711,7 @@ func (s *Server) StartAdmin() {
 					Role:  string(displayRole),
 					OrgID:       u.OrgID,
 					Status:      string(u.Status),
+					VMStatus:    string(u.VMStatus),
 					AccessLevel: accessLevel,
 					CreatedAt:    u.CreatedAt.Format("2006-01-02 15:04"),
 					RegisteredIP: u.RegisteredIP,
@@ -2645,11 +2768,9 @@ func (s *Server) StartAdmin() {
 				if err := s.orgs.ClientFor(defaultOrgID).RegisterUserWithState(defaultOrgID, body.Email, "", string(roles.User), "approved", "", ""); err != nil {
 					log.Printf("[approve] org server sync failed for %s: %v", body.Email, err)
 				}
-				if _, err := ensureWorkstation(r.Context(), body.Email, defaultOrgID); err != nil {
-					w.WriteHeader(http.StatusBadGateway)
-					json.NewEncoder(w).Encode(map[string]string{"error": "개인 작업 컴퓨터 생성 실패: " + err.Error()})
-					return
-				}
+				// Phase 1: account approval no longer creates a VM. The user
+				// must request one via /api/workstation/request and the admin
+				// must approve it in Authorization > Users (Google OAuth).
 			}
 			if body.Role != "" {
 				if err := s.users.SetRole(body.Email, body.Role); err != nil {

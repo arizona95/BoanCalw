@@ -125,6 +125,22 @@ func oauth2HTTPClient(src oauth2.TokenSource, base http.RoundTripper) *http.Clie
 	}
 }
 
+// EnsureWithToken — Ensure but using a caller-supplied OAuth bearer token
+// for GCP API calls. Phase 1 architecture: every VM creation is gated on a
+// fresh Google Sign-In by the approving admin. If accessToken is empty we
+// fall back to the proxy's default service-account credentials.
+func (p *gcpProvisioner) EnsureWithToken(ctx context.Context, email, orgID, accessToken string, current *userstore.Workstation) (*userstore.Workstation, error) {
+	if strings.TrimSpace(accessToken) == "" {
+		return p.Ensure(ctx, email, orgID, current)
+	}
+	src := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: accessToken})
+	tokenClient := oauth2HTTPClient(src, directHTTPClient().Transport)
+	pCopy := *p
+	pCopy.client = tokenClient
+	pCopy.firewallOnce = sync.Once{}
+	return pCopy.Ensure(ctx, email, orgID, current)
+}
+
 func (p *gcpProvisioner) Ensure(ctx context.Context, email, orgID string, current *userstore.Workstation) (*userstore.Workstation, error) {
 	remoteUser := workstationRemoteUser(current)
 	remotePass := workstationRemotePass(current)

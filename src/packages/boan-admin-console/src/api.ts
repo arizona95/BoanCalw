@@ -309,6 +309,7 @@ export interface PersonalWorkstation {
   provider: string;
   platform: string;
   status: string;
+  vm_status?: string; // "" | "requested" | "active" | "reclaimed"
   display_name: string;
   instance_id: string;
   region?: string;
@@ -555,6 +556,19 @@ export const workstationApi = {
     fetch("/api/workstation/me", { credentials: "include" }).then((r) => {
       if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
       return r.json() as Promise<PersonalWorkstation>;
+    }),
+  // user-initiated VM request (Phase 1). Account must already be approved.
+  // Server moves VMStatus none/reclaimed → requested; admin must approve in
+  // Authorization > Users to actually create the VM.
+  request: () =>
+    fetch("/api/workstation/request", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    }).then(async (r) => {
+      if (!r.ok) throw new Error(`${r.status} ${(await r.text()) || r.statusText}`);
+      return r.json() as Promise<{ status: string; vm_status: string; hint: string }>;
     }),
   // owner 의 현재 VM 으로부터 GCP Custom Image 생성. 10-20분 소요. 시작 즉시 ACK 반환.
   captureGoldenImage: (name?: string, description?: string) =>

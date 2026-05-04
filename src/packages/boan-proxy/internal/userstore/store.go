@@ -21,6 +21,24 @@ const (
 	StatusApproved Status = "approved"
 )
 
+// VMStatus — VM provisioning lifecycle, decoupled from account approval.
+// Account approval (Status) controls "can the user log in to BoanClaw at all";
+// VMStatus controls "does this user have a workstation VM right now".
+//
+//   none      : just-approved account, no VM yet — user can request one.
+//   requested : user clicked "VM 신청"; admin must approve to create the VM.
+//   active    : VM created and assigned (Workstation populated).
+//   reclaimed : prior VM was deleted (kill chain or manual) — admin must
+//               re-approve to spawn a replacement; no auto-spawn.
+type VMStatus string
+
+const (
+	VMStatusNone      VMStatus = ""          // empty = legacy/not requested
+	VMStatusRequested VMStatus = "requested"
+	VMStatusActive    VMStatus = "active"
+	VMStatusReclaimed VMStatus = "reclaimed"
+)
+
 // AccessLevel — 사용자 정보 흐름 권한
 // allow: 낮은 흐름 허용 + 모니터링만
 // ask:   낮은 흐름에 가드레일 적용 (사전차단 + 모니터링)
@@ -47,6 +65,7 @@ type User struct {
 	Role          string       `json:"role"`
 	OrgID         string       `json:"org_id"`
 	Status        Status       `json:"status"`
+	VMStatus      VMStatus     `json:"vm_status,omitempty"`
 	AccessLevel   AccessLevel  `json:"access_level"`
 	CreatedAt     time.Time    `json:"created_at"`
 	Workstation   *Workstation `json:"workstation,omitempty"`
@@ -227,7 +246,50 @@ func (s *Store) AssignWorkstation(email string, ws *Workstation) error {
 		return ErrNotFound
 	}
 	u.Workstation = ws
+	// Keep VMStatus in sync with workstation presence:
+	//   ws != nil → active (admin just approved/created the VM)
+	//   ws == nil → reclaimed (kill chain or admin removed it)
+	// Callers wanting different semantics (e.g. "requested") should use SetVMStatus.
+	if ws != nil {
+		u.VMStatus = VMStatusActive
+	} else if u.VMStatus == VMStatusActive {
+		u.VMStatus = VMStatusReclaimed
+	}
 	return s.save()
+}
+
+// SetVMStatus — explicit transition (used by request/approve/reclaim flows).
+func (s *Store) SetVMStatus(email string, vs VMStatus) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.users[email]
+	if !ok {
+		return ErrNotFound
+	}
+	u.VMStatus = vs
+	return s.save()
+}
+
+// RequestVM — user-initiated request. Allowed only from none/reclaimed.
+// Idempotent on requested. Refuses if VM is already active.
+var ErrVMAlreadyActive = errors.New("VM already active")
+
+func (s *Store) RequestVM(email string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.users[email]
+	if !ok {
+		return ErrNotFound
+	}
+	switch u.VMStatus {
+	case VMStatusActive:
+		return ErrVMAlreadyActive
+	case VMStatusRequested:
+		return nil
+	default: // none or reclaimed
+		u.VMStatus = VMStatusRequested
+		return s.save()
+	}
 }
 
 func (s *Store) Workstation(email string) (*Workstation, error) {
