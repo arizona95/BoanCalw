@@ -80,7 +80,7 @@ var (
 )
 
 func sanitizeCredentialReadableText(text string) string {
-	return sanitizeCredentialReadableTextWithKnown(text, nil, nil)
+	return sanitizeCredentialReadableTextWithKnown(text, nil)
 }
 
 // redactValueInKeywordMatch preserves the "keyword:" or "keyword=" part of a
@@ -119,7 +119,7 @@ func redactValueInKeywordMatch(match string) string {
 	return match[:j] + "[REDACTED]"
 }
 
-func sanitizeCredentialReadableTextWithKnown(text string, known map[string]string, passthrough map[string]struct{}) string {
+func sanitizeCredentialReadableTextWithKnown(text string, known map[string]string) string {
 	if strings.TrimSpace(text) == "" {
 		return text
 	}
@@ -143,31 +143,12 @@ func sanitizeCredentialReadableTextWithKnown(text string, known map[string]strin
 			sanitized = strings.ReplaceAll(sanitized, value, known[value])
 		}
 	}
-	if len(passthrough) > 0 {
-		values := make([]string, 0, len(passthrough))
-		for value := range passthrough {
-			if strings.TrimSpace(value) != "" {
-				values = append(values, value)
-			}
-		}
-		sort.Slice(values, func(i, j int) bool {
-			return len(values[i]) > len(values[j])
-		})
-		for _, value := range values {
-			token := fmt.Sprintf("__BOAN_PASS_THRU_%d__", len(protected)+1)
-			protected[token] = value
-			sanitized = strings.ReplaceAll(sanitized, value, token)
-		}
-	}
 	for idx, pattern := range credentialReadablePatterns {
 		// Patterns at index 3 and 4 match "keyword=value" form.
 		// Preserve the keyword portion and only redact the value.
 		valueOnly := idx >= 3
 		sanitized = pattern.ReplaceAllStringFunc(sanitized, func(match string) string {
 			if strings.Contains(match, "__BOAN_CRED_REF_") {
-				return match
-			}
-			if strings.Contains(match, "__BOAN_PASS_THRU_") {
 				return match
 			}
 			if isObviouslyNonSecretCredential(match) {
@@ -307,6 +288,45 @@ func parseCurlTemplate(curlTemplate string) (method, endpoint string, headers ma
 	return method, endpoint, headers, body
 }
 
+// extractAssistantText pulls the first choice's assistant content out of an
+// OpenAI / Anthropic-shaped chat completion response (string or array form).
+// Truncated to 200 chars for trace summary.
+func extractAssistantText(resp map[string]any) string {
+	choices, _ := resp["choices"].([]any)
+	if len(choices) == 0 {
+		return ""
+	}
+	first, _ := choices[0].(map[string]any)
+	if first == nil {
+		return ""
+	}
+	msg, _ := first["message"].(map[string]any)
+	if msg == nil {
+		return ""
+	}
+	var text string
+	switch c := msg["content"].(type) {
+	case string:
+		text = c
+	case []any:
+		var sb strings.Builder
+		for _, part := range c {
+			if pm, ok := part.(map[string]any); ok {
+				if t, ok := pm["text"].(string); ok {
+					sb.WriteString(t)
+				}
+			}
+		}
+		text = sb.String()
+	}
+	text = strings.TrimSpace(text)
+	// 표시는 UI 에서 truncate. 너무 큰 응답으로 메모리 폭증 방지 위해 5000 자만.
+	if len(text) > 5000 {
+		text = text[:5000] + "..."
+	}
+	return text
+}
+
 func extractPromptFromMessages(rawMessages any) string {
 	list, ok := rawMessages.([]any)
 	if !ok {
@@ -421,7 +441,12 @@ func (s *Server) testRegistryLLMCurl(ctx context.Context, orgID, curlTemplate st
 		return fmt.Errorf("curl에서 -d 본문 추출 불가")
 	}
 
-	// {{CREDENTIAL:name}} → 실제 키 치환 (헤더 + 본문 모두)
+	// {{CREDENTIAL:name}} 치환은 dispatchLLMRequest 경유 시 cloud 의
+	// boan-org-credential-gate 가 처리한다. 로컬에서는 placeholder 그대로 두고
+	// resolveTemplateCredentials 가 cloud-mode 일 때 통과시키도록 설계되어 있음.
+	// 핵심: register-test 도 dispatchLLMRequest 를 써야 — 옛 코드는
+	// noProxyHTTPClient 로 ollama.com 에 직접 호출해서 placeholder 가 그대로
+	// 전송되어 401 unauthorized 가 났음.
 	for k, v := range headers {
 		resolved, err := s.resolveTemplateCredentials(ctx, v)
 		if err != nil {
@@ -433,34 +458,28 @@ func (s *Server) testRegistryLLMCurl(ctx context.Context, orgID, curlTemplate st
 	if err != nil {
 		return fmt.Errorf("credential 치환 실패 (body): %w", err)
 	}
+	if _, hasCT := headers["Content-Type"]; !hasCT {
+		headers["Content-Type"] = "application/json"
+	}
 
-	log.Printf("[register-test] endpoint=%s body_len=%d", endpoint, len(resolvedBody))
-	// 디버그: 실제 전송 body 일부 (이미지 데이터는 잘림)
+	log.Printf("[register-test] endpoint=%s body_len=%d (via dispatchLLMRequest)", endpoint, len(resolvedBody))
 	preview := resolvedBody
 	if len(preview) > 500 {
 		preview = preview[:500] + "..."
 	}
-	log.Printf("[register-test] body_preview=%s", preview)
+	log.Printf("[register-test] body_preview=%s", strings.ReplaceAll(preview, "\n", " "))
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(resolvedBody))
-	if err != nil {
-		return err
+	respBody, status, dErr := s.dispatchLLMRequest(ctx, endpoint, headers, []byte(resolvedBody), 60*time.Second)
+	if dErr != nil {
+		return fmt.Errorf("HTTP 호출 실패: %w", dErr)
 	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
+	bodyStr := string(respBody)
+	if len(bodyStr) > 200 {
+		bodyStr = bodyStr[:200]
 	}
-	if req.Header.Get("Content-Type") == "" {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	resp, err := noProxyHTTPClient(60 * time.Second).Do(req)
-	if err != nil {
-		return fmt.Errorf("HTTP 호출 실패: %w", err)
-	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-	log.Printf("[register-test] status=%d body=%.200s", resp.StatusCode, string(respBody))
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	log.Printf("[register-test] status=%d body=%s", status, bodyStr)
+	if status >= 400 {
+		return fmt.Errorf("HTTP %d: %s", status, strings.TrimSpace(bodyStr))
 	}
 	return nil
 }
@@ -767,6 +786,13 @@ func noProxyHTTPClient(timeout time.Duration) *http.Client {
 // hosts listed in OrgLLMProxyBypassHosts (e.g. boan-grounding) bypass the
 // proxy and are called directly on the docker network.
 //
+// All egress — including the leg to boan-org-llm-proxy on Cloud Run — is
+// gated by the local network.Gate allowlist (Gateway Policies UI). Admin
+// must explicitly allow the cloud-proxy host (`*.run.app`) along with any
+// direct LLM hosts they want bypassed. Bypass-list hosts on the docker
+// network (e.g. `boan-org-llm-proxy` service name when called from a peer
+// container) are skipped because the gate only sees external traffic.
+//
 // Returns (body, status, error). status is the upstream status code.
 func (s *Server) dispatchLLMRequest(ctx context.Context, endpoint string, headers map[string]string, body []byte, timeout time.Duration) ([]byte, int, error) {
 	proxyURL := strings.TrimRight(s.cfg.OrgLLMProxyURL, "/")
@@ -778,9 +804,29 @@ func (s *Server) dispatchLLMRequest(ctx context.Context, endpoint string, header
 	}
 	host := strings.ToLower(parsed.Hostname())
 
-	bypass := proxyURL == "" || proxyToken == "" || hostInBypassList(host, s.cfg.OrgLLMProxyBypassHosts)
+	bypassToProxy := proxyURL == "" || proxyToken == "" || hostInBypassList(host, s.cfg.OrgLLMProxyBypassHosts)
 
-	if bypass {
+	// Decide which host the actual TCP connection will hit, then ask the
+	// local network gate. For Cloud Run forwarding the connection goes to
+	// the proxy URL, not the user-facing endpoint, so we check that host
+	// instead. This is the only way to enforce "all traffic, including LLM
+	// calls, passes through the Gateway Policies allowlist" — previously
+	// this leg silently bypassed the gate.
+	gateHost := host
+	gatePort := portFromURL(parsed)
+	if !bypassToProxy {
+		if pu, perr := neturl.Parse(proxyURL); perr == nil {
+			gateHost = strings.ToLower(pu.Hostname())
+			gatePort = portFromURL(pu)
+		}
+	}
+	if s.gate != nil && gateHost != "" && !isDockerInternalHost(gateHost) {
+		if err := s.gate.AllowWithPort(gateHost, http.MethodPost, gatePort); err != nil {
+			return nil, http.StatusForbidden, fmt.Errorf("network gate blocked LLM egress to %s:%d (%w) — add the host to Gateway Policies allowlist with methods POST", gateHost, gatePort, err)
+		}
+	}
+
+	if bypassToProxy {
 		return directHTTPCall(ctx, endpoint, headers, body, timeout)
 	}
 
@@ -798,6 +844,41 @@ func (s *Server) dispatchLLMRequest(ctx context.Context, endpoint string, header
 		}
 	}
 	return forwardViaOrgProxy(ctx, proxyURL, proxyToken, s.cfg.OrgID, deviceJWT, endpoint, headers, body, timeout)
+}
+
+// portFromURL extracts the destination port from a parsed URL, defaulting
+// to 443/80 by scheme when the URL omits an explicit port.
+func portFromURL(u *neturl.URL) int {
+	if u == nil {
+		return 0
+	}
+	if p := u.Port(); p != "" {
+		var n int
+		fmt.Sscanf(p, "%d", &n)
+		return n
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		return 443
+	case "http":
+		return 80
+	}
+	return 0
+}
+
+// isDockerInternalHost returns true for hostnames that resolve only on the
+// docker compose internal network (peer service names without dots or
+// localhost variants). The gate is for *external* egress; container-to-
+// container traffic is already constrained by docker networking.
+func isDockerInternalHost(host string) bool {
+	if host == "" || host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		return true
+	}
+	if !strings.Contains(host, ".") {
+		// docker service names like "boan-policy-server", "boan-credential-filter"
+		return true
+	}
+	return false
 }
 
 func hostInBypassList(host, csv string) bool {
@@ -1181,7 +1262,6 @@ func translateUpstreamToOpenAI(model string, raw []byte) (map[string]any, error)
 
 func (s *Server) sanitizeOpenAIResponseForOrg(ctx context.Context, orgID string, resp map[string]any) map[string]any {
 	known := s.credentialPlaceholderMap(ctx, orgID)
-	passthrough := s.credentialPassthroughValues(orgID)
 	choicesRaw, ok := resp["choices"].([]any)
 	if ok {
 		for _, choiceRaw := range choicesRaw {
@@ -1194,7 +1274,7 @@ func (s *Server) sanitizeOpenAIResponseForOrg(ctx context.Context, orgID string,
 				continue
 			}
 			if content, ok := message["content"].(string); ok {
-				message["content"] = sanitizeCredentialReadableTextWithKnown(content, known, passthrough)
+				message["content"] = sanitizeCredentialReadableTextWithKnown(content, known)
 			}
 		}
 		return resp
@@ -1207,7 +1287,7 @@ func (s *Server) sanitizeOpenAIResponseForOrg(ctx context.Context, orgID string,
 				continue
 			}
 			if content, ok := message["content"].(string); ok {
-				message["content"] = sanitizeCredentialReadableTextWithKnown(content, known, passthrough)
+				message["content"] = sanitizeCredentialReadableTextWithKnown(content, known)
 			}
 		}
 	}

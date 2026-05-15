@@ -32,13 +32,16 @@ docker compose -f "$COMPOSE_FILE" up -d --force-recreate "${TARGETS[@]}"
 # tries to chown but on some hosts that silently fails before the proxy
 # binary starts. Reassert from the host as the simplest reliable path.
 if docker ps --format '{{.Names}}' | grep -q '^boanclaw-boan-proxy-1$'; then
+  # standalone proxy UID 100 vs sandbox-embedded proxy UID 1000 both share
+  # /data/users; loosen mode so either process can write. (host-only file in
+  # docker volume, not exposed to other systems.)
   docker exec -u 0 boanclaw-boan-proxy-1 \
-    sh -c 'chown -R boan:boan /data/users 2>/dev/null; chmod 775 /data/users 2>/dev/null' \
+    sh -c 'chmod 777 /data/users 2>/dev/null; chmod 666 /data/users/*.json 2>/dev/null' \
     >/dev/null 2>&1 || true
 fi
 if docker ps --format '{{.Names}}' | grep -q '^boanclaw-boan-sandbox-1$'; then
   docker exec -u 0 boanclaw-boan-sandbox-1 \
-    sh -c 'chown -R boan:boan /data/users 2>/dev/null; chmod 775 /data/users 2>/dev/null' \
+    sh -c 'chmod 777 /data/users 2>/dev/null; chmod 666 /data/users/*.json 2>/dev/null' \
     >/dev/null 2>&1 || true
 fi
 # Restart proxy so it loads users.json with the corrected ownership.

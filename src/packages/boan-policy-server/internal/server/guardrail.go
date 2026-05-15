@@ -128,7 +128,7 @@ func (e *GuardrailEvaluator) evaluateWithLLM(ctx context.Context, cfg policy.Gua
 		"You are an S4 guardrail server. Evaluate the user's request against the constitution and provide both a safety decision and an appropriate response.\n"+
 			"Constitution:\n%s\n\n"+
 			"Return strict JSON only: {\"decision\":\"allow|ask|block\",\"reason\":\"short reason\",\"confidence\":0.0,\"response\":\"your answer to the user's question if allowed, or empty if blocked\"}",
-		strings.TrimSpace(cfg.Constitution),
+		strings.TrimSpace(cfg.GT2Constitution),
 	)
 	payload := map[string]any{
 		"model": e.llmModel,
@@ -208,7 +208,7 @@ func (e *GuardrailEvaluator) evaluateWithLLM(ctx context.Context, cfg policy.Gua
 
 func evaluateGuardrailHeuristic(cfg policy.GuardrailConfig, req GuardrailEvaluateRequest) GuardrailEvaluateResponse {
 	text := strings.ToLower(strings.TrimSpace(req.Text))
-	constitution := strings.ToLower(strings.TrimSpace(cfg.Constitution))
+	constitution := strings.ToLower(strings.TrimSpace(cfg.GT2Constitution))
 
 	for _, pattern := range guardrailBlockPatterns {
 		if pattern.MatchString(text) {
@@ -393,7 +393,7 @@ func (e *GuardrailEvaluator) AutoJudge(ctx context.Context, cfg policy.Guardrail
 func (e *GuardrailEvaluator) autoJudgeWithLLM(ctx context.Context, cfg policy.GuardrailConfig, wiki string, req AutoJudgeRequest) (AutoJudgeResponse, error) {
 	systemPrompt := fmt.Sprintf(
 		"You are a BoanClaw HITL auto-judge agent. Your job is to approve or reject flagged inputs.\n\nConstitution:\n%s\n\n%sReturn strict JSON only: {\"decision\":\"approve|reject\",\"reasoning\":\"short reason\",\"confidence\":0.0}.",
-		strings.TrimSpace(cfg.Constitution),
+		strings.TrimSpace(cfg.GT2Constitution),
 		wiki,
 	)
 	payload := map[string]any{
@@ -552,7 +552,7 @@ func (e *GuardrailEvaluator) wikiEvaluateWithLLM(ctx context.Context, cfg policy
 			"Constitution:\n%s\n\n"+
 			"%s\n"+
 			"Evaluate the user's request. Return strict JSON only: {\"decision\":\"allow|ask|block\",\"reason\":\"short reason\",\"confidence\":0.0,\"response\":\"answer if allowed\"}",
-		strings.TrimSpace(cfg.Constitution), wikiContext,
+		strings.TrimSpace(cfg.GT2Constitution), wikiContext,
 	)
 	payload := map[string]any{
 		"model": e.llmModel,
@@ -708,7 +708,7 @@ func (e *GuardrailEvaluator) ProposeAmendment(ctx context.Context, cfg policy.Gu
 			"%s\n"+
 			"Based on the pattern of recent decisions, propose amendments to the constitution.\n"+
 			"Return strict JSON: {\"diff\":\"unified diff of the constitution (lines starting with + for additions, - for removals)\",\"reasoning\":\"why this amendment is needed\"}",
-		strings.TrimSpace(cfg.Constitution), wikiContext,
+		strings.TrimSpace(cfg.GT2Constitution), wikiContext,
 	)
 	payload := map[string]any{
 		"model": e.llmModel,
@@ -797,10 +797,10 @@ func (e *GuardrailEvaluator) ProposeG1Amendment(ctx context.Context, cfg policy.
 
 	// Current G1 patterns
 	g1Patterns := ""
-	if len(cfg.G1CustomPatterns) > 0 {
+	if len(cfg.GT1Patterns) > 0 {
 		var sb strings.Builder
 		sb.WriteString("Current G1 patterns:\n")
-		for _, p := range cfg.G1CustomPatterns {
+		for _, p := range cfg.GT1Patterns {
 			sb.WriteString(fmt.Sprintf("- pattern=%q desc=%q mode=%s\n", p.Pattern, p.Description, p.Mode))
 		}
 		g1Patterns = sb.String()
@@ -1130,7 +1130,7 @@ func (ws *WikiStore) Compile(ctx context.Context, llmURL, llmModel, llmKey strin
 	overviewContent, err := callLLM(
 		"You are a security analyst for BoanClaw guardrail system. Analyze the HITL decision log and produce a concise security posture overview in markdown. "+
 			"Include: overall threat profile, key trends, areas of concern, and recommendations. Keep it under 500 words. Output raw markdown only, no code fences.",
-		fmt.Sprintf("Constitution:\n%s\n\nTraining log data:\n%s", strings.TrimSpace(cfg.Constitution), logData),
+		fmt.Sprintf("Constitution:\n%s\n\nTraining log data:\n%s", strings.TrimSpace(cfg.GT2Constitution), logData),
 	)
 	if err != nil {
 		overviewContent = fmt.Sprintf("# Security Overview\n\nCompilation failed: %v\n\nStats: %d total, %d human, %d auto, %d approve, %d reject",
@@ -1190,7 +1190,7 @@ func (ws *WikiStore) Compile(ctx context.Context, llmURL, llmModel, llmKey strin
 		fmt.Sprintf("Current G1 patterns:\n%s\n\nTraining log data:\n%s",
 			func() string {
 				var sb strings.Builder
-				for _, p := range cfg.G1CustomPatterns {
+				for _, p := range cfg.GT1Patterns {
 					sb.WriteString(fmt.Sprintf("- pattern=%q desc=%q mode=%s\n", p.Pattern, p.Description, p.Mode))
 				}
 				return sb.String()
@@ -1205,7 +1205,7 @@ func (ws *WikiStore) Compile(ctx context.Context, llmURL, llmModel, llmKey strin
 		"You are a constitution advisor for BoanClaw guardrail. Analyze the HITL decision log and current constitution. "+
 			"Suggest specific amendments to the constitution to better handle observed patterns. "+
 			"Output markdown with clear before/after suggestions. No code fences.",
-		fmt.Sprintf("Current constitution:\n%s\n\nTraining log data:\n%s", strings.TrimSpace(cfg.Constitution), logData),
+		fmt.Sprintf("Current constitution:\n%s\n\nTraining log data:\n%s", strings.TrimSpace(cfg.GT2Constitution), logData),
 	)
 	if err == nil && g2Content != "" {
 		os.WriteFile(ws.baseDir+"/proposals/g2-changes.md", []byte(g2Content), 0644)

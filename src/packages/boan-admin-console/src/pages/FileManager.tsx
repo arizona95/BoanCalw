@@ -26,7 +26,7 @@ async function listFiles(side: Side, path: string): Promise<{ files: FileEntry[]
   return res.json();
 }
 
-async function transferFile(fileName: string, srcSide: Side, srcPath: string, dstPath: string): Promise<{ ok: boolean; error?: string; reason?: string }> {
+async function transferFile(fileName: string, srcSide: Side, srcPath: string, dstPath: string): Promise<{ ok: boolean; error?: string; reason?: string; action?: string; tier?: string; approval_id?: string }> {
   const res = await fetch("/api/files/transfer", {
     method: "POST", credentials: "include",
     headers: { "Content-Type": "application/json" },
@@ -151,8 +151,13 @@ export default function FileManager() {
       const result = await transferFile(fileName, srcSide, srcPath, "");
       if (result.ok) {
         setMsg({ type: "ok", text: `${fileName} 전송 완료 (${direction})` });
+      } else if (result.action === "ask" || result.approval_id) {
+        setMsg({
+          type: "warn",
+          text: `${fileName} HITL 승인 필요 (${result.tier ?? "G2"}) — Approvals 페이지에서 처리하세요. 사유: ${result.reason || result.error || ""}`,
+        });
       } else {
-        setMsg({ type: "err", text: `${fileName} 전송 차단: ${result.reason || result.error}` });
+        setMsg({ type: "err", text: `${fileName} 전송 차단 (${result.tier ?? "guardrail"}): ${result.reason || result.error}` });
       }
       setRefreshKey((k) => k + 1);
     } catch (err) {
@@ -184,6 +189,23 @@ export default function FileManager() {
           <p className="text-xs text-gray-500">
             S2→S1 : 가드레일 검사 &nbsp;|&nbsp; S1→S2 : 통과 &nbsp;|&nbsp; 폴더 전송 불가, 파일만
           </p>
+          <button
+            onClick={async () => {
+              try {
+                const res = await fetch("/api/files/host-path?path=", { credentials: "include" });
+                const data = await res.json();
+                const path = data.host_path as string;
+                await navigator.clipboard.writeText(path);
+                setMsg({ type: "ok", text: `호스트 경로 복사됨: ${path}  →  Files (Ctrl+L) 에 붙여넣기` });
+              } catch (e) {
+                setMsg({ type: "err", text: `경로 가져오기 실패: ${e instanceof Error ? e.message : String(e)}` });
+              }
+            }}
+            className="text-xs bg-gray-800 hover:bg-gray-700 text-white px-3 py-1.5 rounded"
+            title="S2 마운트의 호스트 경로를 클립보드에 복사. 파일 관리자에 붙여넣어 사용."
+          >
+            📂 호스트에서 열기
+          </button>
         </div>
       </div>
 

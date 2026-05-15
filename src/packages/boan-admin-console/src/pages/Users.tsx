@@ -196,30 +196,21 @@ interface UserRow {
 }
 
 const VM_STATUS_LABEL: Record<string, string> = {
-  "":          "VM 없음",
-  "requested": "🟡 VM 신청 대기",
-  "active":    "🟢 VM 활성",
-  "reclaimed": "🔴 VM 회수됨 (재승인 필요)",
+  "":             "없음",
+  "requested":    "🟡 신청 대기",
+  "provisioning": "🔄 생성 중",
+  "active":       "🟢 활성",
+  "reclaimed":    "🔴 회수됨",
 };
 
 const VM_STATUS_BADGE: Record<string, string> = {
-  "":          "bg-gray-100 text-gray-500",
-  "requested": "bg-yellow-100 text-yellow-700",
-  "active":    "bg-green-100 text-green-700",
-  "reclaimed": "bg-red-100 text-red-700",
+  "":             "bg-gray-100 text-gray-500",
+  "requested":    "bg-yellow-100 text-yellow-700",
+  "provisioning": "bg-blue-100 text-blue-700",
+  "active":       "bg-green-100 text-green-700",
+  "reclaimed":    "bg-red-100 text-red-700",
 };
 
-// requestAdminAccessToken — Phase 1: prompt-based fallback. Phase 2 will
-// replace with Google Identity Services popup once OAuth client_id is wired
-// (BOAN_OAUTH_CLIENT_ID is already in compose env). Returns empty string if
-// the admin cancels — backend then falls back to its default service account.
-function requestAdminAccessToken(email: string): string | null {
-  const msg =
-    `${email} 에게 VM 을 승인합니다.\n\n` +
-    `Google OAuth access_token 을 입력하세요 (host 머신에서 'gcloud auth print-access-token' 실행 후 복사).\n` +
-    `비워 두면 백엔드 service account 로 fallback 합니다.`;
-  return window.prompt(msg, "");
-}
 
 const ROLE_BADGE: Record<string, string> = {
   owner:  "bg-blue-100 text-blue-700",
@@ -247,25 +238,28 @@ export default function Users() {
   const [busyVM, setBusyVM] = useState<Record<string, boolean>>({});
 
   const approveVM = async (email: string) => {
-    const token = requestAdminAccessToken(email);
-    if (token === null) return; // user cancelled
+    if (busyVM[email]) return;
     setBusyVM((b) => ({ ...b, [email]: true }));
-    setMsg(null);
+    setMsg(`${email} VM 생성 시작 — GCP createInstance (1~3분)...`);
     try {
       const res = await fetch(`/api/admin/users/${encodeURIComponent(email)}/vm-approve`, {
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ access_token: token }),
+        body: JSON.stringify({ access_token: "" }),
       });
       const data = await res.json().catch(() => ({}));
-      if (res.ok) {
-        setMsg(`VM 승인됨 — ${data.workstation?.instance_id?.split("/").pop?.() ?? "ok"}`);
+      if (res.status === 202) {
+        setMsg(`🔄 VM 생성 진행 중 (1~3분) — 새로고침으로 진행 확인 가능`);
+      } else if (res.status === 409) {
+        setMsg(`⚠ 이미 생성 진행 중 — 중복 클릭 무시됨`);
+      } else if (res.ok) {
+        setMsg(`✅ VM 승인됨 — ${data.workstation?.instance_id?.split("/").pop?.() ?? "ok"}`);
       } else {
-        setMsg(`승인 실패: ${data.error ?? res.status}`);
+        setMsg(`❌ 승인 실패 (HTTP ${res.status}): ${data.error ?? "unknown"}`);
       }
     } catch (e) {
-      setMsg(`네트워크 오류: ${(e as Error).message}`);
+      setMsg(`❌ 네트워크 오류: ${(e as Error).message}`);
     } finally {
       setBusyVM((b) => ({ ...b, [email]: false }));
       load();
@@ -355,14 +349,15 @@ export default function Users() {
           <table className="w-full text-sm">
             <thead className="bg-gray-50 border-b border-gray-200">
               <tr>
-                <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500">이메일</th>
-                <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500">역할</th>
-                <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500">권한</th>
-                <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500">조직</th>
-                <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500">상태</th>
-                <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500">바인딩 PC</th>
-                <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500">가입일</th>
-                <th className="text-right px-4 py-3 text-xs font-semibold text-gray-500">관리</th>
+                <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 whitespace-nowrap">이메일</th>
+                <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 whitespace-nowrap">역할</th>
+                <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 whitespace-nowrap">권한</th>
+                <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 whitespace-nowrap">조직</th>
+                <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 whitespace-nowrap">상태</th>
+                <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 whitespace-nowrap">VM</th>
+                <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 whitespace-nowrap">단말</th>
+                <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 whitespace-nowrap">가입일</th>
+                <th className="text-right px-4 py-3 text-xs font-semibold text-gray-500 whitespace-nowrap">관리</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-100">
@@ -414,10 +409,18 @@ export default function Users() {
                       </span>
                     )}
                   </td>
+                  <td className="px-4 py-3">
+                    <span
+                      className={`text-xs font-medium px-2 py-1 rounded-full ${VM_STATUS_BADGE[u.vm_status ?? ""] ?? "bg-gray-100 text-gray-500"}`}
+                      title={u.workstation_status ? `instance status: ${u.workstation_status}` : ""}
+                    >
+                      {VM_STATUS_LABEL[u.vm_status ?? ""] ?? "VM 없음"}
+                    </span>
+                  </td>
                   <td className="px-4 py-3 text-xs font-mono text-gray-500" title={u.registered_ip ?? ""}>
                     {u.registered_ip
-                      ? u.registered_ip.length > 16
-                        ? `${u.registered_ip.slice(0, 8)}…${u.registered_ip.slice(-4)}`
+                      ? u.registered_ip.length > 6
+                        ? `${u.registered_ip.slice(0, 6)}…`
                         : u.registered_ip
                       : <span className="text-gray-300">-</span>}
                   </td>
@@ -445,7 +448,7 @@ export default function Users() {
                 </tr>
                 {expanded[u.email] && (
                   <tr>
-                    <td colSpan={8} className="bg-gray-50 border-l-4 border-blue-300 px-10 py-4">
+                    <td colSpan={9} className="bg-gray-50 border-l-4 border-blue-300 px-10 py-4">
                       <div className="text-xs text-gray-500 mb-2">↳ VM 승인 / 상태</div>
                       <div className="flex items-center gap-3 flex-wrap">
                         <span className={`text-xs font-medium px-2 py-1 rounded-full ${VM_STATUS_BADGE[u.vm_status ?? ""] ?? "bg-gray-100 text-gray-500"}`}>
@@ -464,7 +467,7 @@ export default function Users() {
                               className="text-xs bg-blue-600 text-white px-3 py-1.5 rounded-full hover:bg-blue-700 font-medium disabled:opacity-50"
                               title="Google OAuth access_token 으로 GCP createInstance"
                             >
-                              {busyVM[u.email] ? "생성 중..." : "✓ VM 승인 (Google 인증)"}
+                              {busyVM[u.email] ? "생성 중..." : "✓ VM 승인 → 즉시 생성"}
                             </button>
                             {u.vm_status === "requested" && (
                               <button
@@ -475,6 +478,11 @@ export default function Users() {
                               </button>
                             )}
                           </>
+                        )}
+                        {u.vm_status === "provisioning" && (
+                          <span className="text-xs text-blue-600">
+                            🔄 GCP createInstance 진행 중 (1~3분) — 완료 시 자동으로 활성 전환
+                          </span>
                         )}
                         {u.vm_status === "active" && (
                           <span className="text-xs text-gray-400">

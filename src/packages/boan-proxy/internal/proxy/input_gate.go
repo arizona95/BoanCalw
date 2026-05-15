@@ -162,6 +162,17 @@ type InputGateResponse struct {
 	NormalizedText string `json:"normalized_text,omitempty"`
 	Key            string `json:"key,omitempty"`
 	ApprovalID     string `json:"approval_id,omitempty"`
+	// Evaluations — text 모드에서 G1/G2/G3/DLP 각 tier 가 평가한 결과를
+	// 순서대로 누적. caller 가 관찰성 trace 에 한 줄씩 풀어 적기 위해 사용.
+	// 비-text 모드(key/chord/clipboard)는 단일 tier 라 이 슬라이스는 비어있음.
+	Evaluations []TierEval `json:"evaluations,omitempty"`
+}
+
+// TierEval — input gate 각 tier 의 평가 결과 한 줄.
+type TierEval struct {
+	Tier     string `json:"tier"`     // G1 / G2 / G3 / DLP / access / credential-gate
+	Decision string `json:"decision"` // allow / block / ask / credential_required / hitl_required
+	Reason   string `json:"reason,omitempty"`
 }
 
 type GuardrailEvaluator interface {
@@ -284,7 +295,28 @@ func evaluateInputGateWithLocal(
 	case "text", "paste", "":
 		text := req.Text
 		if strings.TrimSpace(text) == "" {
-			return InputGateResponse{Allowed: false, Action: "block", Tier: "G1", Reason: "empty input"}
+			return InputGateResponse{Allowed: false, Action: "block", Tier: "G1_txt", Reason: "empty input"}
+		}
+
+		// evals — 각 tier 결정을 누적. 마지막 return 시 응답에 첨부해서 caller
+		// (observability trace) 가 한 줄씩 풀어 기록한다.
+		var evals []TierEval
+		// G1 mask/fake 치환 결과를 chat handler 가 받아서 LLM 호출에 쓰도록
+		// NormalizedText 에 항상 현재 text 를 채운다. 이전엔 DLP path 만
+		// NormalizedText 를 박아서 mask 치환이 LLM 까지 전달되지 않는 버그가 있었음.
+		withEvals := func(r InputGateResponse) InputGateResponse {
+			r.Evaluations = evals
+			if r.NormalizedText == "" && r.Allowed {
+				r.NormalizedText = text
+			}
+			return r
+		}
+		withEvalsAppend := func(prior []TierEval, ev TierEval, r InputGateResponse) InputGateResponse {
+			r.Evaluations = append(append([]TierEval{}, prior...), ev)
+			if r.NormalizedText == "" && r.Allowed {
+				r.NormalizedText = text
+			}
+			return r
 		}
 
 		// ══════════════════════════════════════════════════════════
@@ -303,42 +335,65 @@ func evaluateInputGateWithLocal(
 				g1Rules = append(g1Rules, compiledG1Rule{re: re, mode: "credential"})
 			}
 		}
-		// 먼저 redact 규칙을 모두 적용 (매칭된 부분을 replacement 로 치환 후 계속 흐름 진행).
-		// 나머지 block/credential 규칙은 이후에 평가.
+		// G1 평가 — 4 모드:
+		//   block      : 매칭되면 즉시 차단 (downstream 안 감, replacement 무시)
+		//   mask       : 매칭 부분을 replacement 로 치환 후 downstream 통과 (의미 가림)
+		//   fake       : mask 와 동일 동작이지만 의도는 "형식 보존 가짜값" (예: 000-0000-0000)
+		//   credential : 별도 credential gate 흐름 (등록 키 swap or HITL)
+		// 레거시 호환: 옛 "redact" 는 "mask" 와 동일 처리.
+		var maskedHits []string // mask/fake 로 치환된 패턴 모음 — G1 통과 trace reason 에 사용.
 		for _, rule := range g1Rules {
-			if rule.mode == "redact" && rule.replacement != "" {
-				if rule.re.MatchString(text) {
-					text = rule.re.ReplaceAllString(text, rule.replacement)
-				}
-			}
-		}
-		for _, rule := range g1Rules {
-			if rule.mode == "redact" {
-				continue
-			}
-			// PostCredentialSubstitute=true 이면 credential mode 패턴은 건너뛴다.
-			// 이미 credential gate 에서 치환 완료 상태. 다시 감지해봤자 placeholder
-			// 를 또 치환하려고 해서 무의미. block 패턴은 계속 적용 (substituted text
-			// 가 "github pat key" 같은 context 금지 문구를 포함하는지 검사).
 			if rule.mode == "credential" && req.PostCredentialSubstitute {
 				continue
 			}
-			if rule.re.MatchString(text) {
-				// mode=credential → credential substitution flow
-				// mode=block       → 즉시 block
-				action := "credential_required"
-				reason := "[G1] credential-like pattern matched: " + rule.re.String()
-				if rule.mode == "block" {
-					action = "block"
-					reason = "[G1] blocked by pattern: " + rule.re.String()
-				}
-				return InputGateResponse{
-					Allowed: false,
-					Action:  action,
-					Tier:    "G1",
-					Reason:  reason,
-				}
+			if !rule.re.MatchString(text) {
+				continue
 			}
+			switch rule.mode {
+			case "block":
+				// 즉시 차단 — replacement 의미 없음. 사용자 메시지가 downstream
+				// 으로 가지 않음. caller 가 formatGuardrailBlockMessage 로 응답.
+				return withEvalsAppend(evals, TierEval{
+					Tier:     "G1_txt",
+					Decision: "block",
+					Reason:   "[G1_txt] blocked by regex: " + rule.re.String(),
+				}, InputGateResponse{
+					Allowed: false,
+					Action:  "block",
+					Tier:    "G1_txt",
+					Reason:  "[G1_txt] blocked by regex: " + rule.re.String(),
+				})
+			case "mask", "fake", "redact":
+				// mask / fake: 매칭 부분 치환 후 통과. redact 는 레거시 → mask 동일.
+				replacement := strings.TrimSpace(rule.replacement)
+				if replacement == "" {
+					replacement = fmt.Sprintf("[guardrail::G1::%s]", rule.mode)
+				}
+				text = rule.re.ReplaceAllString(text, replacement)
+				maskedHits = append(maskedHits, fmt.Sprintf("%s:%s→%s", rule.mode, rule.re.String(), replacement))
+			case "credential":
+				// credential 모드는 별도 substitution flow — input gate 에서
+				// 즉시 멈춰 caller 가 credential-filter 로 진행하게 한다.
+				reason := "[G1_txt] credential-like pattern matched: " + rule.re.String()
+				evals = append(evals, TierEval{Tier: "G1_txt", Decision: "credential_required", Reason: reason})
+				return withEvals(InputGateResponse{
+					Allowed: false,
+					Action:  "credential_required",
+					Tier:    "G1_txt",
+					Reason:  reason,
+				})
+			}
+		}
+		// G1 통과 trace — 매칭된 게 있으면 어떤 패턴이 어떤 모드로 치환됐는지 보고,
+		// 없으면 "no regex match". 매칭됐는데도 "no regex match" 보이던 버그 fix.
+		if len(maskedHits) > 0 {
+			evals = append(evals, TierEval{
+				Tier:     "G1_txt",
+				Decision: "allow",
+				Reason:   "[G1_txt] matched and replaced: " + strings.Join(maskedHits, ", "),
+			})
+		} else {
+			evals = append(evals, TierEval{Tier: "G1_txt", Decision: "allow", Reason: "[G1_txt] no regex match"})
 		}
 
 		// 하향 흐름(S레벨 낮아짐) 체크
@@ -349,12 +404,14 @@ func evaluateInputGateWithLocal(
 		// G2/G3 가 "allow" 를 리턴해도 무시하고 무조건 block.
 		// ══════════════════════════════════════════════════════════
 		if isDownwardFlow && strings.ToLower(req.AccessLevel) == "deny" {
-			return InputGateResponse{
+			reason := "[access_level=deny] 사용자는 하향 데이터 전송이 금지됩니다"
+			evals = append(evals, TierEval{Tier: "access", Decision: "block", Reason: reason})
+			return withEvals(InputGateResponse{
 				Allowed: false,
 				Action:  "block",
 				Tier:    "access",
-				Reason:  "[access_level=deny] 사용자는 하향 데이터 전송이 금지됩니다",
-			}
+				Reason:  reason,
+			})
 		}
 
 		// G2/G3는 하향 흐름이고 guardrail client가 있을 때만
@@ -376,40 +433,43 @@ func evaluateInputGateWithLocal(
 				if localEval != nil {
 					d, r, _, e := localEval(ctx, orgID, text, mode)
 					if e != nil {
-						return InputGateResponse{Allowed: false, Action: "block", Tier: "G2", Reason: "[G2] " + r}
+						evals = append(evals, TierEval{Tier: "G2_txt", Decision: "block", Reason: "[G2_txt] " + r})
+						return withEvals(InputGateResponse{Allowed: false, Action: "block", Tier: "G2_txt", Reason: "[G2_txt] " + r})
 					}
 					g2Decision, g2Reason = d, r
 				} else {
 					g2, err := guardrailClient.Evaluate(ctx, orgID, grReq)
 					if err != nil {
-						return InputGateResponse{Allowed: false, Action: "block", Tier: "G2", Reason: "[G2] guardrail LLM failed — fail-closed: " + err.Error()}
+						reason := "[G2_txt] guardrail LLM failed — fail-closed: " + err.Error()
+						evals = append(evals, TierEval{Tier: "G2_txt", Decision: "block", Reason: reason})
+						return withEvals(InputGateResponse{Allowed: false, Action: "block", Tier: "G2_txt", Reason: reason})
 					}
 					g2Decision, g2Reason = g2.Decision, g2.Reason
 				}
 				switch strings.ToLower(strings.TrimSpace(g2Decision)) {
 				case "allow":
-					// G2 통과 → DLP 검사로 (Tier 는 아래 DLP 결과로 갱신)
+					evals = append(evals, TierEval{Tier: "G2_txt", Decision: "allow", Reason: "[G2_txt] " + firstNonEmptyString(g2Reason, "constitution passed")})
 				case "block":
-					return InputGateResponse{Allowed: false, Action: "block", Tier: "G2",
-						Reason: "[G2] " + firstNonEmptyString(g2Reason, "constitution blocked")}
+					reason := "[G2_txt] " + firstNonEmptyString(g2Reason, "constitution blocked")
+					evals = append(evals, TierEval{Tier: "G2_txt", Decision: "block", Reason: reason})
+					return withEvals(InputGateResponse{Allowed: false, Action: "block", Tier: "G2_txt", Reason: reason})
 				case "ask":
-					// ══════════════════════════════════════════════
-					// G3: Wiki 적응형 가드레일 — ask 사용자만
-					// 과거 결정을 학습한 자기진화 LLM
-					// G3이 주기적으로 G1/G2를 자동 개정 제안
-					// ══════════════════════════════════════════════
+					evals = append(evals, TierEval{Tier: "G2_txt", Decision: "ask", Reason: "[G2_txt] " + firstNonEmptyString(g2Reason, "ambiguous, escalating to G3")})
+					// G3 호출
 					g3, err := guardrailClient.WikiEvaluate(ctx, orgID, grReq)
 					if err != nil {
-						return InputGateResponse{Allowed: false, Action: "block", Tier: "G3", Reason: "[G3] wiki guardrail failed — fail-closed: " + err.Error()}
+						reason := "[G3_txt] wiki guardrail failed — fail-closed: " + err.Error()
+						evals = append(evals, TierEval{Tier: "G3_txt", Decision: "block", Reason: reason})
+						return withEvals(InputGateResponse{Allowed: false, Action: "block", Tier: "G3_txt", Reason: reason})
 					}
 					switch strings.ToLower(strings.TrimSpace(g3.Decision)) {
 					case "allow":
-						// G3 통과 → DLP 검사로
+						evals = append(evals, TierEval{Tier: "G3_txt", Decision: "allow", Reason: "[G3_txt] " + firstNonEmptyString(g3.Reason, "wiki passed")})
 					case "block":
-						return InputGateResponse{Allowed: false, Action: "block", Tier: "G3",
-							Reason: "[G3] " + firstNonEmptyString(g3.Reason, "wiki guardrail blocked")}
+						reason := "[G3_txt] " + firstNonEmptyString(g3.Reason, "wiki guardrail blocked")
+						evals = append(evals, TierEval{Tier: "G3_txt", Decision: "block", Reason: reason})
+						return withEvals(InputGateResponse{Allowed: false, Action: "block", Tier: "G3_txt", Reason: reason})
 					case "ask":
-						// G3도 애매 → 인간(소유자) 승인 큐
 						approvalID := ""
 						if createApproval != nil {
 							approvalID = createApproval(
@@ -417,54 +477,29 @@ func evaluateInputGateWithLocal(
 								req,
 							)
 						}
-						return InputGateResponse{
+						reason := "[G3_txt] " + firstNonEmptyString(g3.Reason, "human review required")
+						evals = append(evals, TierEval{Tier: "G3_txt", Decision: "ask", Reason: reason})
+						return withEvals(InputGateResponse{
 							Allowed:    false,
 							Action:     "hitl_required",
-							Tier:       "G3",
-							Reason:     "[G3] " + firstNonEmptyString(g3.Reason, "human review required"),
+							Tier:       "G3_txt",
+							Reason:     reason,
 							ApprovalID: approvalID,
-						}
+						})
 					}
 				}
 			}
 		}
 
-		if eng == nil {
-			return InputGateResponse{Allowed: true, Action: "allow", Tier: "DLP", NormalizedText: text, Reason: "no DLP engine; allowed by default"}
-		}
-
-		decision, err := eng.Inspect(ctx, strings.NewReader(text))
-		if err != nil {
-			return InputGateResponse{Allowed: false, Action: "block", Tier: "DLP", Reason: "guardrail inspection failed"}
-		}
-		if decision == nil {
-			return InputGateResponse{Allowed: false, Action: "block", Tier: "DLP", Reason: "guardrail returned no decision"}
-		}
-
-		switch decision.Action {
-		case dlp.ActionAllow:
-			return InputGateResponse{
-				Allowed:        true,
-				Action:         "allow",
-				Tier:           "DLP",
-				Reason:         firstNonEmptyString(decision.Reason, "[DLP] passed all tiers"),
-				NormalizedText: decision.Body,
-			}
-		case dlp.ActionRedact:
-			return InputGateResponse{
-				Allowed: false,
-				Action:  "redact_required",
-				Tier:    "DLP",
-				Reason:  "[DLP] sensitive input detected; use credential inject lane or rewrite",
-			}
-		default:
-			return InputGateResponse{
-				Allowed: false,
-				Action:  "block",
-				Tier:    "DLP",
-				Reason:  "[DLP] critical input blocked by guardrail",
-			}
-		}
+		// G1/G2/G3 모두 통과 — 가드레일 끝. (예전 DLP layer 는 G1/G2/G3 와 중복
+		// 검사라 제거됨 — 사용자 정책상 가드레일은 G1/G2/G3 셋만.)
+		return withEvals(InputGateResponse{
+			Allowed:        true,
+			Action:         "allow",
+			Tier:           "G3_txt",
+			Reason:         "[guardrail] G1/G2/G3 모두 통과",
+			NormalizedText: text,
+		})
 	default:
 		return InputGateResponse{Allowed: false, Action: "block", Tier: "mode", Reason: fmt.Sprintf("unsupported input mode %q", req.Mode)}
 	}

@@ -43,16 +43,6 @@ func isObviouslyNonSecretCredential(value string) bool {
 	return false
 }
 
-func isCredentialPassthrough(value string, passthrough map[string]struct{}) bool {
-	if isObviouslyNonSecretCredential(value) {
-		return true
-	}
-	if len(passthrough) == 0 {
-		return false
-	}
-	_, ok := passthrough[strings.TrimSpace(value)]
-	return ok
-}
 
 // credentialFingerprint returns a SHA-256 hex fingerprint of a credential value.
 func credentialFingerprint(value string) string {
@@ -173,7 +163,6 @@ func (s *Server) applyCredentialGate(
 
 	// Step 1: fetch all registered credential names for this org.
 	names := s.fetchCredentialNames(ctx, orgID)
-	passthrough := s.credentialPassthroughValues(orgID)
 
 	replaced := prompt
 
@@ -208,7 +197,7 @@ func (s *Server) applyCredentialGate(
 	// Step 4: separate declined vs new unknown keys; redact all of them.
 	var newKeys, newPreviews, newFPs []string
 	for _, key := range remaining {
-		if isCredentialPassthrough(key, passthrough) {
+		if isObviouslyNonSecretCredential(key) {
 			continue
 		}
 		replaced = strings.ReplaceAll(replaced, key, "[REDACTED]")

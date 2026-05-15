@@ -33,10 +33,11 @@ const (
 type VMStatus string
 
 const (
-	VMStatusNone      VMStatus = ""          // empty = legacy/not requested
-	VMStatusRequested VMStatus = "requested"
-	VMStatusActive    VMStatus = "active"
-	VMStatusReclaimed VMStatus = "reclaimed"
+	VMStatusNone         VMStatus = ""             // empty = legacy/not requested
+	VMStatusRequested    VMStatus = "requested"
+	VMStatusProvisioning VMStatus = "provisioning" // admin approved, GCP createInstance 진행 중
+	VMStatusActive       VMStatus = "active"
+	VMStatusReclaimed    VMStatus = "reclaimed"
 )
 
 // AccessLevel — 사용자 정보 흐름 권한

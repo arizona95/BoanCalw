@@ -157,7 +157,7 @@ function Shell() {
       >
         <div className={`flex items-center gap-2 border-b border-white/10 flex-shrink-0 ${isUsage ? "px-4 py-3" : "px-4 py-5"}`}>
           <span className={isUsage ? "text-sm font-bold tracking-tight" : "text-xl font-bold tracking-tight"}>
-            {isUsage ? "BoanClaw" : "BoanClaw v0.4"}
+            BoanClaw
           </span>
           {version?.current && (
             <span className="text-[10px] text-white/30 font-mono">{version.current}</span>

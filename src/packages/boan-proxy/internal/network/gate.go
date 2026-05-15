@@ -6,19 +6,24 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
-	"log"
 	"net"
 	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/samsung-sds/boanclaw/boan-proxy/internal/policysync"
 )
 
 type Endpoint struct {
 	Host    string   `json:"host"`
 	Ports   []int    `json:"ports"`
 	Methods []string `json:"methods"`
+	// System — set by policy-server for entries the admin cannot remove
+	// (e.g. cloud LLM proxy host, prevents bricking the chat path). The
+	// gate treats System entries identically to user entries; the flag
+	// only carries through to the UI for display.
+	System bool `json:"system,omitempty"`
 }
 
 type Policy struct {
@@ -81,20 +86,30 @@ func NewGateWithClient(policyURL, orgID string, client *http.Client) *Gate {
 	}
 }
 
+// StartRefresh wires the gate to a shared policysync.Client. The client
+// runs one SSE stream + one polling loop and dispatches decoded snapshots
+// to every subscriber (this gate, future guardrail caches, …). Replaces
+// the inline runStream/streamOnce/refresh trio so there is exactly one
+// place that talks to /network-policy.{stream,json}.
 func (g *Gate) StartRefresh(ctx context.Context, interval time.Duration) {
-	go func() {
-		g.refresh()
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				g.refresh()
-			}
-		}
-	}()
+	if g.policyURL == "" {
+		return
+	}
+	client := policysync.New(policysync.Config[*Policy]{
+		PolicyURL:    g.policyURL,
+		OrgID:        g.orgID,
+		OrgToken:     g.orgToken,
+		PollInterval: interval,
+		HTTPClient:   g.client,
+		Decode:       g.decodePolicy,
+	})
+	client.Subscribe(func(p *Policy) {
+		g.mu.Lock()
+		g.policy = p
+		g.lastFetch = time.Now()
+		g.mu.Unlock()
+	})
+	client.Start(ctx)
 }
 
 func (g *Gate) Allow(host, method string) error {
@@ -152,48 +167,6 @@ func (g *Gate) LastFetch() time.Time {
 
 func (g *Gate) StatsAllowed() uint64 { return g.stats.allowed.Load() }
 func (g *Gate) StatsBlocked() uint64 { return g.stats.blocked.Load() }
-
-func (g *Gate) refresh() {
-	if g.policyURL == "" {
-		return
-	}
-	url := fmt.Sprintf("%s/org/%s/network-policy.json", g.policyURL, g.orgID)
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		log.Printf("network gate: request build failed: %v", err)
-		return
-	}
-	if g.orgToken != "" {
-		req.Header.Set("Authorization", "Bearer "+g.orgToken)
-	}
-	resp, err := g.client.Do(req)
-	if err != nil {
-		log.Printf("network gate: refresh failed: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("network gate: refresh returned status %d", resp.StatusCode)
-		return
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return
-	}
-
-	policy, err := g.decodePolicy(body)
-	if err != nil {
-		log.Printf("network gate: decode failed: %v", err)
-		return
-	}
-
-	g.mu.Lock()
-	g.policy = policy
-	g.lastFetch = time.Now()
-	g.mu.Unlock()
-}
 
 func (g *Gate) decodePolicy(body []byte) (*Policy, error) {
 	var signed SignedPayload

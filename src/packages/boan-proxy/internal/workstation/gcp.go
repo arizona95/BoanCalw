@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -172,6 +174,25 @@ func (p *gcpProvisioner) Ensure(ctx context.Context, email, orgID string, curren
 			return nil, err
 		}
 		instance.Status = "PROVISIONING"
+	}
+	// Wait until the instance is RUNNING with an external IP. Without this,
+	// the auto-start-on-login path (sandbox proxy calls Ensure right after
+	// startInstance) saves RemoteHost="" — Guacamole then refuses to render
+	// the RDP iframe. Bound at 2 minutes so login response isn't held forever.
+	if !strings.EqualFold(instance.Status, "RUNNING") || externalIP(instance) == "" {
+		deadline := time.Now().Add(2 * time.Minute)
+		for time.Now().Before(deadline) {
+			fresh, ferr := p.getInstance(ctx, instance.Name)
+			if ferr == nil && fresh != nil && strings.EqualFold(fresh.Status, "RUNNING") && externalIP(fresh) != "" {
+				instance = fresh
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(5 * time.Second):
+			}
+		}
 	}
 	return p.toWorkstation(email, instance, remoteUser, remotePass), nil
 }
@@ -968,6 +989,25 @@ func randomPassword() string {
 	return string(buf)
 }
 
+// DerivePassword — deterministic password from the user's device-binding fingerprint
+// (registered_ip) + email. Same inputs always produce the same password, so the
+// three sources of truth (Windows SAM via startup-script, users.json, Guacamole
+// connection record) cannot drift. If the bound IP rotates, the password also
+// rotates — which is the desired security behavior.
+//
+// Format: "Boan!" + 24 hex chars of sha256(fp + ":" + email). 29 chars total.
+// Satisfies Windows complexity: uppercase ('B'), lowercase (hex a-f), digit, symbol ('!').
+//
+// Returns "" if fp is empty — caller must fall back to randomPassword.
+func DerivePassword(fingerprint, email string) string {
+	fp := strings.TrimSpace(fingerprint)
+	if fp == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(fp + ":" + strings.ToLower(strings.TrimSpace(email))))
+	return "Boan!" + hex.EncodeToString(sum[:])[:24]
+}
+
 // ensureFirewallRules — boan-workstation 태그 인스턴스에 RDP(3389) ingress 허용.
 // 파일 전송도 RDP virtual channel(drive redirection)을 통해 같은 포트로 흐른다.
 // 이미 존재하면 무시.
@@ -1054,22 +1094,39 @@ func startupScript(username, password string) string {
 	//   2) Administrators **AND** Remote Desktop Users 그룹 모두 멤버십 확인
 	//      (image 에서 복원된 user 는 group membership 이 깨져있을 수 있음)
 	//   3) Password policy complexity 일시 해제 (랜덤 비번이 거부되는 엣지 케이스)
-	//   4) 모든 단계 결과를 C:\ProgramData\boanclaw-startup.log 에 기록 → 디버깅 가능
-	return fmt.Sprintf(`
+	//   4) 모든 단계 결과를 C:\ProgramData\boanclaw-startup.log 에 기록 -> 디버깅 가능
+	//
+	// **NEVER use non-ASCII (em-dash, Korean, smart quotes) inside the template
+	// below.** GCE delivers metadata to Windows; PowerShell 5.1 silently chokes
+	// on UTF-8 multibyte sequences inside quoted strings, breaking parsing and
+	// leaving the boanclaw account never-created -> RDP login fails.
+	// assertASCII() below enforces this invariant.
+	body := fmt.Sprintf(`
 $ErrorActionPreference = "Continue"
 $logPath = "C:\ProgramData\boanclaw-startup.log"
+$passSentinel = "C:\ProgramData\boanclaw-pass-initialized.flag"
 function LogStep($msg) { "$(Get-Date -Format o) $msg" | Add-Content -Path $logPath }
 LogStep "=== boanclaw startup begin (user=%s) ==="
 
-# Account create / password set
+# Account create / password set.
+# Important: only set the password on *first* boot of a freshly-created VM.
+# On subsequent reboots (e.g. cost-saving stop/start cycle), the running
+# password may have been rotated by gcloud reset-windows-password and is the
+# source of truth in users.json - overwriting it here would re-introduce the
+# stale baked-in random and break RDP. The sentinel file ensures one-time
+# initialization.
 $securePassword = ConvertTo-SecureString "%s" -AsPlainText -Force
 try {
   if (-not (Get-LocalUser -Name "%s" -ErrorAction SilentlyContinue)) {
     New-LocalUser -Name "%s" -Password $securePassword -PasswordNeverExpires -AccountNeverExpires
     LogStep "created user %s"
-  } else {
+    Set-Content -Path $passSentinel -Value (Get-Date -Format o)
+  } elseif (-not (Test-Path $passSentinel)) {
     Set-LocalUser -Name "%s" -Password $securePassword -PasswordNeverExpires $true
-    LogStep "reset password for existing user %s"
+    LogStep "first-boot password set for existing user %s"
+    Set-Content -Path $passSentinel -Value (Get-Date -Format o)
+  } else {
+    LogStep "skipping password reset - sentinel present (%s)"
   }
   Enable-LocalUser -Name "%s" -ErrorAction SilentlyContinue
 } catch {
@@ -1100,7 +1157,22 @@ if (-not (Test-Path $desktopBoanclaw)) {
 }
 icacls $desktopBoanclaw /grant "%s:(OI)(CI)F" /T 2>&1 | Out-Null
 LogStep "=== boanclaw startup end ==="
-`, username, password, username, username, username, username, username, username, username, username, username)
+`, username, password, username, username, username, username, username, username, username, username, username, username)
+	return assertASCII(body, "startupScript")
+}
+
+// assertASCII panics if s contains any non-ASCII rune. We use this on the
+// Windows startup-script body to guarantee PS 5.1 can parse it reliably.
+// Korean/em-dash sneaking into the template has broken VM provisioning before
+// (see comment in startupScript). A panic at provision time is loud and
+// immediate; the alternative is a silent VM with no boanclaw account.
+func assertASCII(s, label string) string {
+	for i, r := range s {
+		if r > 127 {
+			panic(fmt.Sprintf("%s contains non-ASCII rune %q (U+%04X) at byte %d - PowerShell 5.1 will silently fail to parse", label, r, r, i))
+		}
+	}
+	return s
 }
 
 // wazuhAgentTemplatePS — minimal bootstrap. 큰 install 로직은 GCS 에서 다운로드 받음.
@@ -1304,4 +1376,48 @@ func (p *gcpProvisioner) StopInstance(ctx context.Context, current *userstore.Wo
 		return fmt.Errorf("current workstation has no instance")
 	}
 	return p.stopInstance(ctx, name)
+}
+
+// StartInstance — gcpProvisioner 의 내부 startInstance 래퍼. 이미 RUNNING
+// 이면 GCP 가 idempotent error (or 409) 를 내지만 startInstance 가 그걸 grace
+// 하게 처리한다. logout/login 비용 절약 사이클에서 사용.
+func (p *gcpProvisioner) StartInstance(ctx context.Context, current *userstore.Workstation) error {
+	name := instanceNameFromCurrent(current)
+	if name == "" {
+		return fmt.Errorf("current workstation has no instance")
+	}
+	return p.startInstance(ctx, name)
+}
+
+// InstanceStatus — GCP instance 의 현재 status 를 boanclaw 내부 어휘로 매핑해
+// 반환. /api/workstation/me 가 store 와 비교해 drift 보정에 사용.
+func (p *gcpProvisioner) InstanceStatus(ctx context.Context, current *userstore.Workstation) (string, error) {
+	name := instanceNameFromCurrent(current)
+	if name == "" {
+		return "unprovisioned", nil
+	}
+	inst, err := p.getInstance(ctx, name)
+	if err != nil {
+		return "", err
+	}
+	if inst == nil {
+		return "unprovisioned", nil
+	}
+	return mapGCPStatus(inst.Status), nil
+}
+
+// mapGCPStatus — GCP compute instance status → boanclaw status 어휘.
+func mapGCPStatus(gcpStatus string) string {
+	switch strings.ToUpper(strings.TrimSpace(gcpStatus)) {
+	case "RUNNING":
+		return "running"
+	case "TERMINATED", "SUSPENDED":
+		return "stopped"
+	case "PROVISIONING", "STAGING", "REPAIRING":
+		return "starting"
+	case "STOPPING", "SUSPENDING":
+		return "stopping"
+	default:
+		return "unprovisioned"
+	}
 }

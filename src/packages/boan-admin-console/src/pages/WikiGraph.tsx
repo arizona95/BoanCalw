@@ -10,7 +10,7 @@ import {
   type DialogTurn,
 } from "../api";
 
-type Tab = "folders" | "raw" | "dialog";
+type Tab = "folders" | "raw" | "dialog" | "skills";
 
 // ── 폴더 트리 빌더 ────────────────────────────────────────
 type TreeNode = {
@@ -279,6 +279,33 @@ export default function WikiGraph() {
   // agentic_iterate
   const [iterating, setIterating] = useState(false);
 
+  // 🔬 Skill 테스트 탭 — 4개 endpoint 개별 호출 + raw 응답 표시.
+  type SkillName = "agentic_iterate" | "find_ambiguous" | "chat_continue" | "wiki_edit";
+  const [skillBusy, setSkillBusy] = useState<SkillName | null>(null);
+  const [skillResult, setSkillResult] = useState<{ name: SkillName; ms: number; status: "ok" | "error"; body: unknown } | null>(null);
+  const [skillAiDialogID, setSkillAiDialogID] = useState("");
+  const [skillCcDialogID, setSkillCcDialogID] = useState("");
+  const [skillWeJSON, setSkillWeJSON] = useState(
+    `{\n  "id": "test-${Date.now().toString(36)}",\n  "input": "test sample input — replace with real text",\n  "decision": "allow",\n  "reason": "manual skill test"\n}`,
+  );
+  const runSkill = async (name: SkillName, fn: () => Promise<unknown>) => {
+    setSkillBusy(name);
+    setSkillResult(null);
+    const start = performance.now();
+    try {
+      const body = await fn();
+      setSkillResult({ name, ms: performance.now() - start, status: "ok", body });
+    } catch (e) {
+      setSkillResult({ name, ms: performance.now() - start, status: "error", body: { error: e instanceof Error ? e.message : String(e) } });
+    } finally {
+      setSkillBusy(null);
+      // 결과로 인해 store 가 바뀌었을 수 있으니 새로고침.
+      void loadNodes();
+      if (name === "find_ambiguous" || name === "chat_continue") void loadDialogsOnly();
+      if (name === "wiki_edit") void loadDecisions();
+    }
+  };
+
   const loadNodes = useCallback(async () => {
     setLoading(true);
     setErr(null);
@@ -483,6 +510,7 @@ export default function WikiGraph() {
             { id: "folders", label: `📂 Skills (${nodes.length})` },
             { id: "raw",     label: `📋 Raw 결정 (${decisions.length})` },
             { id: "dialog",  label: `💬 LLM 대화 (${dialogs.length})` },
+            { id: "skills",  label: `🔬 Skill 테스트` },
           ] as const).map((t) => (
             <button
               key={t.id}
@@ -830,6 +858,148 @@ export default function WikiGraph() {
             </div>
           );
         })()}
+
+        {/* ── 🔬 Skill 테스트 탭 ── */}
+        {tab === "skills" && (
+          <div className="flex-1 min-h-0 flex gap-3 overflow-hidden">
+            {/* 좌: skill 4개 별 카드 */}
+            <div className="w-[420px] flex flex-col gap-3 overflow-y-auto">
+              {/* 1. agentic_iterate */}
+              <div className="bg-white border border-gray-200 rounded-xl p-3 flex flex-col gap-2">
+                <div className="text-sm font-semibold text-gray-800">🤖 agentic_iterate</div>
+                <div className="text-xs text-gray-500 leading-relaxed">
+                  Wiki 전체 (+옵션 dialog) 를 LLM 에게 주고 한 턴 동안 create/update/delete/move 액션 plan + 실행.
+                  최대 5개 노드 변경.
+                </div>
+                <label className="text-[11px] text-gray-500">dialog_id (옵션 — 비우면 wiki 만 보고 정리)</label>
+                <input
+                  className="text-xs px-2 py-1 border border-gray-300 rounded font-mono"
+                  placeholder="dlg-..."
+                  value={skillAiDialogID}
+                  onChange={(e) => setSkillAiDialogID(e.target.value)}
+                />
+                <button
+                  onClick={() => runSkill("agentic_iterate", () => wikiGraphApi.runAgenticIterate(skillAiDialogID.trim() || undefined))}
+                  disabled={skillBusy === "agentic_iterate"}
+                  className="text-xs px-3 py-1.5 bg-purple-600 text-white rounded hover:bg-purple-700 disabled:opacity-50 self-start"
+                >
+                  {skillBusy === "agentic_iterate" ? "실행 중..." : "▶ 실행"}
+                </button>
+              </div>
+
+              {/* 2. find_ambiguous */}
+              <div className="bg-white border border-gray-200 rounded-xl p-3 flex flex-col gap-2">
+                <div className="text-sm font-semibold text-gray-800">🔍 find_ambiguous</div>
+                <div className="text-xs text-gray-500 leading-relaxed">
+                  최근 decision 20개 보고 LLM 이 애매한 경계 패턴 식별 → 질문 1~3개 생성하여 새 ClarificationDialog 로 저장.
+                  최소 3개 decision 필요.
+                </div>
+                <button
+                  onClick={() => runSkill("find_ambiguous", () => wikiGraphApi.runFindAmbiguous())}
+                  disabled={skillBusy === "find_ambiguous"}
+                  className="text-xs px-3 py-1.5 bg-amber-600 text-white rounded hover:bg-amber-700 disabled:opacity-50 self-start"
+                >
+                  {skillBusy === "find_ambiguous" ? "실행 중..." : "▶ 실행"}
+                </button>
+              </div>
+
+              {/* 3. chat_continue */}
+              <div className="bg-white border border-gray-200 rounded-xl p-3 flex flex-col gap-2">
+                <div className="text-sm font-semibold text-gray-800">💬 chat_continue</div>
+                <div className="text-xs text-gray-500 leading-relaxed">
+                  특정 dialog 의 마지막 turn (사용자 답변) 을 보고 LLM 이 다음 action 선택:
+                  ASK_FOLLOWUP / REQUEST_LABEL_FIX / UPDATE_WIKI / CLOSE_AND_FIND_NEW.
+                  UPDATE_WIKI 면 agentic_iterate 도 같이 실행됨.
+                </div>
+                <label className="text-[11px] text-gray-500">dialog_id (필수)</label>
+                <div className="flex gap-1">
+                  <input
+                    className="flex-1 text-xs px-2 py-1 border border-gray-300 rounded font-mono"
+                    placeholder="dlg-..."
+                    value={skillCcDialogID}
+                    onChange={(e) => setSkillCcDialogID(e.target.value)}
+                  />
+                  <button
+                    onClick={() => {
+                      if (dialogs.length > 0) setSkillCcDialogID(dialogs[0].id || "");
+                    }}
+                    disabled={dialogs.length === 0}
+                    className="text-[11px] px-2 py-1 border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-50"
+                    title="가장 최신 dialog id 자동 채우기"
+                  >
+                    최신
+                  </button>
+                </div>
+                <button
+                  onClick={() => runSkill("chat_continue", () => wikiGraphApi.chatContinue(skillCcDialogID.trim()))}
+                  disabled={skillBusy === "chat_continue" || !skillCcDialogID.trim()}
+                  className="text-xs px-3 py-1.5 bg-sky-600 text-white rounded hover:bg-sky-700 disabled:opacity-50 self-start"
+                >
+                  {skillBusy === "chat_continue" ? "실행 중..." : "▶ 실행"}
+                </button>
+              </div>
+
+              {/* 4. wiki_edit */}
+              <div className="bg-white border border-gray-200 rounded-xl p-3 flex flex-col gap-2">
+                <div className="text-sm font-semibold text-gray-800">✏️ wiki_edit</div>
+                <div className="text-xs text-gray-500 leading-relaxed">
+                  단일 decision (allow/deny + 입력 텍스트) 을 LLM 에게 주고 그 결정을 wiki 에 어떻게 반영할지 (관련 skill 만들기/수정) 1회 plan + 실행.
+                </div>
+                <label className="text-[11px] text-gray-500">decision JSON</label>
+                <textarea
+                  className="text-[11px] px-2 py-1.5 border border-gray-300 rounded font-mono resize-none"
+                  rows={8}
+                  value={skillWeJSON}
+                  onChange={(e) => setSkillWeJSON(e.target.value)}
+                />
+                <button
+                  onClick={() => {
+                    let parsed: unknown;
+                    try {
+                      parsed = JSON.parse(skillWeJSON);
+                    } catch (e) {
+                      setSkillResult({ name: "wiki_edit", ms: 0, status: "error", body: { error: "JSON parse 실패: " + (e instanceof Error ? e.message : String(e)) } });
+                      return;
+                    }
+                    void runSkill("wiki_edit", () => wikiGraphApi.runWikiEdit(parsed as Parameters<typeof wikiGraphApi.runWikiEdit>[0]));
+                  }}
+                  disabled={skillBusy === "wiki_edit"}
+                  className="text-xs px-3 py-1.5 bg-emerald-600 text-white rounded hover:bg-emerald-700 disabled:opacity-50 self-start"
+                >
+                  {skillBusy === "wiki_edit" ? "실행 중..." : "▶ 실행"}
+                </button>
+              </div>
+            </div>
+
+            {/* 우: 결과 패널 */}
+            <div className="flex-1 min-w-0 bg-white border border-gray-200 rounded-xl flex flex-col overflow-hidden">
+              <div className="px-3 py-2 border-b border-gray-100 flex items-center gap-3">
+                <div className="text-xs text-gray-500">📊 결과</div>
+                {skillResult && (
+                  <>
+                    <span className="text-xs font-mono text-gray-700">{skillResult.name}</span>
+                    <span className={`text-[11px] px-2 py-0.5 rounded-full ${skillResult.status === "ok" ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"}`}>
+                      {skillResult.status}
+                    </span>
+                    <span className="text-[11px] text-gray-400">{skillResult.ms.toFixed(0)}ms</span>
+                  </>
+                )}
+                {skillBusy && (
+                  <span className="text-[11px] text-gray-500 animate-pulse">⏳ {skillBusy} 실행 중…</span>
+                )}
+              </div>
+              <div className="flex-1 min-h-0 overflow-auto p-3">
+                {skillResult ? (
+                  <pre className="text-[11px] font-mono text-gray-800 whitespace-pre-wrap break-all leading-relaxed">
+                    {JSON.stringify(skillResult.body, null, 2)}
+                  </pre>
+                ) : (
+                  <div className="text-xs text-gray-400">좌측에서 skill 을 ▶ 실행 하세요.</div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

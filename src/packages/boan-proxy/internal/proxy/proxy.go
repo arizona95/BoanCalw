@@ -14,6 +14,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/audit"
@@ -65,6 +66,222 @@ type Server struct {
 	killchainRun  *killchain.Runner
 	threatLeader  *threatleader.Store
 	threatRefresh *threatleader.Refresher
+
+	// lastActivity — per-user "last authenticated request seen" timestamp.
+	// Authoritative signal for "is the user still using their VM?" The sweeper
+	// stops VMs whose owner has been inactive longer than LogoutGracePeriod.
+	// Replaces the previous logout-event-driven pendingStops design, which was
+	// fragile: it required (a) user clicking logout, (b) cookie still valid,
+	// (c) proxy not restarted between logout and stop — losing any of those
+	// left the VM running forever, billing the org for an unused instance.
+	lastActivityMu sync.Mutex
+	lastActivity   map[string]time.Time
+
+	// vmStatusCacheMu — short-TTL cache for cloud-side VM status. The frontend
+	// polls /api/workstation/me every 5s; without a cache that would hammer GCP
+	// at the same rate. Each entry refreshes lazily on first miss > vmStatusTTL
+	// old. Used only to reconcile drift between store ws.Status and actual GCP
+	// state (e.g. instance auto-terminated outside boanclaw's control).
+	vmStatusCacheMu sync.Mutex
+	vmStatusCache   map[string]vmStatusEntry
+}
+
+type vmStatusEntry struct {
+	status   string
+	fetchedAt time.Time
+}
+
+const vmStatusTTL = 8 * time.Second
+
+// LogoutGracePeriod — VM stops after this much continuous inactivity. Tunable
+// later via config; 10 minutes per the cost-saving spec.
+const LogoutGracePeriod = 10 * time.Minute
+
+// resolveVMStatus — return the most up-to-date VM status, reconciling store
+// state against the cloud-side truth. Returns the resolved status plus a flag
+// indicating whether the store should be updated. Caller must persist the
+// update if changed (we cannot reach into userstore from here without a
+// pointer to the workstation).
+//
+// TTL cache (vmStatusTTL) keeps GCP API calls bounded under the frontend's 5s
+// poll cadence. A cache miss makes one getInstance call; cache hits return
+// instantly.
+func (s *Server) resolveVMStatus(ctx context.Context, email string, ws *userstore.Workstation) (string, bool) {
+	if ws == nil || s.workstations == nil {
+		return "", false
+	}
+	cacheKey := strings.TrimSpace(email)
+	if cacheKey == "" {
+		cacheKey = strings.TrimSpace(ws.InstanceID)
+	}
+	if cacheKey == "" {
+		return ws.Status, false
+	}
+	s.vmStatusCacheMu.Lock()
+	if entry, ok := s.vmStatusCache[cacheKey]; ok && time.Since(entry.fetchedAt) < vmStatusTTL {
+		s.vmStatusCacheMu.Unlock()
+		if entry.status != "" && entry.status != ws.Status {
+			return entry.status, true
+		}
+		return ws.Status, false
+	}
+	s.vmStatusCacheMu.Unlock()
+
+	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cloudStatus, err := s.workstations.InstanceStatus(queryCtx, ws)
+	if err != nil {
+		// Treat transient lookup failures as "trust the store" — don't flip
+		// status to unknown on network blips. Log for diagnosis.
+		log.Printf("[vm-status] InstanceStatus(%s) failed: %v (keeping store status=%s)", email, err, ws.Status)
+		return ws.Status, false
+	}
+
+	s.vmStatusCacheMu.Lock()
+	if s.vmStatusCache == nil {
+		s.vmStatusCache = make(map[string]vmStatusEntry)
+	}
+	s.vmStatusCache[cacheKey] = vmStatusEntry{status: cloudStatus, fetchedAt: time.Now()}
+	s.vmStatusCacheMu.Unlock()
+
+	if cloudStatus != "" && cloudStatus != ws.Status {
+		return cloudStatus, true
+	}
+	return ws.Status, false
+}
+
+// RecordActivity — refresh the user's idle timer. Should be called for every
+// authenticated request that implies the user is actively using the system.
+// Cheap: O(1) map write under a short lock.
+func (s *Server) RecordActivity(email string) {
+	if strings.TrimSpace(email) == "" {
+		return
+	}
+	s.lastActivityMu.Lock()
+	defer s.lastActivityMu.Unlock()
+	if s.lastActivity == nil {
+		s.lastActivity = make(map[string]time.Time)
+	}
+	s.lastActivity[email] = time.Now()
+}
+
+// markLogoutAsActivityCheckpoint — sets lastActivity to NOW on logout so the
+// idle timer starts counting from the moment the user signed out. Sweeper
+// will stop the VM at (logout time + LogoutGracePeriod). If the user logs
+// back in within the grace window, RecordActivity refreshes the checkpoint
+// and the stop is naturally cancelled.
+//
+// Earlier this function set lastActivity to (now - grace) to force immediate
+// stop, but that contradicted the "10 minute grace after logout" spec — the
+// VM died on the next sweep tick (~30s later) instead of 10 minutes later.
+func (s *Server) markLogoutAsActivityCheckpoint(email string) {
+	if strings.TrimSpace(email) == "" {
+		return
+	}
+	s.lastActivityMu.Lock()
+	defer s.lastActivityMu.Unlock()
+	if s.lastActivity == nil {
+		s.lastActivity = make(map[string]time.Time)
+	}
+	s.lastActivity[email] = time.Now()
+	log.Printf("[grace-stop] %s logout - grace period (%s) starts now", email, LogoutGracePeriod)
+}
+
+// runStopSweeper — background loop that stops VMs whose owner has been idle
+// for >= LogoutGracePeriod. Source of truth: lastActivity map (in-memory).
+// On startup we seed lastActivity[email] = now for every user with an active
+// VM, giving them one full grace period to make a request before we stop them
+// (covers proxy restart without instantly killing live sessions).
+func (s *Server) runStopSweeper(ctx context.Context) {
+	// Seed on first tick: any user with vm_status=active gets activity=now.
+	s.seedActivityFromActiveVMs()
+
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		now := time.Now()
+		idleCutoff := now.Add(-LogoutGracePeriod)
+
+		users := s.users.List()
+		for _, u := range users {
+			if u.Workstation == nil || strings.TrimSpace(u.Workstation.InstanceID) == "" {
+				continue
+			}
+			if u.VMStatus != userstore.VMStatusActive {
+				continue
+			}
+			// Already stopped — sweeper has no work. Don't re-fire StopInstance
+			// every tick (the old design did, flooding logs and GCP API).
+			if u.Workstation.Status == "stopped" {
+				continue
+			}
+			s.lastActivityMu.Lock()
+			last, ok := s.lastActivity[u.Email]
+			if !ok {
+				// User logged in via an old cookie before we observed any
+				// activity; treat now as their first checkpoint and give a
+				// full grace period before considering them idle.
+				if s.lastActivity == nil {
+					s.lastActivity = make(map[string]time.Time)
+				}
+				s.lastActivity[u.Email] = now
+				s.lastActivityMu.Unlock()
+				continue
+			}
+			s.lastActivityMu.Unlock()
+			if last.After(idleCutoff) {
+				continue
+			}
+			ws := *u.Workstation
+			email := u.Email
+			go func(ws userstore.Workstation, email string) {
+				stopCtx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+				defer cancel()
+				if err := s.workstations.StopInstance(stopCtx, &ws); err != nil {
+					log.Printf("[grace-stop] %s StopInstance failed: %v", email, err)
+					return
+				}
+				// Mark workstation.status=stopped so the frontend can show a
+				// "VM 중지됨 + 시작" UI and the sweeper stops re-firing.
+				ws.Status = "stopped"
+				if err := s.users.AssignWorkstation(email, &ws); err != nil {
+					log.Printf("[grace-stop] %s AssignWorkstation(stopped) failed: %v", email, err)
+				}
+				// Clear lastActivity — when the user next clicks Start the
+				// activity record is re-seeded by /api/workstation/start.
+				s.lastActivityMu.Lock()
+				delete(s.lastActivity, email)
+				s.lastActivityMu.Unlock()
+				log.Printf("[grace-stop] %s VM stopped after %s of inactivity", email, LogoutGracePeriod)
+			}(ws, email)
+		}
+	}
+}
+
+// seedActivityFromActiveVMs — on proxy startup, give every user with a running
+// VM one full grace period of "credit" before we consider them idle. Without
+// this, a proxy restart would instantly stop every VM whose owner happened to
+// be between requests at that moment.
+func (s *Server) seedActivityFromActiveVMs() {
+	users := s.users.List()
+	now := time.Now()
+	s.lastActivityMu.Lock()
+	defer s.lastActivityMu.Unlock()
+	if s.lastActivity == nil {
+		s.lastActivity = make(map[string]time.Time)
+	}
+	for _, u := range users {
+		if u.VMStatus == userstore.VMStatusActive && u.Workstation != nil && strings.TrimSpace(u.Workstation.InstanceID) != "" {
+			if _, exists := s.lastActivity[u.Email]; !exists {
+				s.lastActivity[u.Email] = now
+			}
+		}
+	}
 }
 
 func New(cfg *config.Config) (*Server, error) {
@@ -211,6 +428,9 @@ func New(cfg *config.Config) (*Server, error) {
 	} else {
 		log.Printf("[threat-leader] init failed: %v (feature disabled)", err)
 	}
+	// Grace-period stop sweeper: 30s tick, calls StopInstance on users whose
+	// LogoutGracePeriod elapsed without a re-login.
+	go s.runStopSweeper(context.Background())
 	// 고아 GCP VM reaper — cleanup-user 가 한 번 더 빠뜨려도 비용이 영원히 누적되지
 	// 않도록 하는 안전망. context.Background 사용 — 프로세스 lifetime 내내 동작.
 	// BOAN_DISABLE_VM_JANITOR=1 로 끌 수 있다 — 같은 /data/users 를 공유하는

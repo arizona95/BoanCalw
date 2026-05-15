@@ -45,6 +45,16 @@ type Provisioner interface {
 	// StopInstance — VM 전원 끔. RAM 증발. disk 는 유지.
 	StopInstance(ctx context.Context, current *userstore.Workstation) error
 
+	// StartInstance — TERMINATED VM 을 다시 켠다. 비용 절약을 위해 logout 시
+	// StopInstance, login 시 StartInstance 호출. noop provisioner 는 빈 구현.
+	StartInstance(ctx context.Context, current *userstore.Workstation) error
+
+	// InstanceStatus — VM 의 실제 cloud-side 상태를 반환. 호출자가 store 와 비교해
+	// drift 를 보정하는 데 사용. 반환 string 은 boanclaw 내부 status 어휘 ("running",
+	// "stopped", "starting", "stopping", "unprovisioned") — 매핑은 provider 내부.
+	// 인스턴스가 GCP 에 없으면 "unprovisioned", noop provisioner 는 ws.Status 그대로 반환.
+	InstanceStatus(ctx context.Context, current *userstore.Workstation) (string, error)
+
 	// ListManagedInstances — janitor 가 사용. boanclaw 가 만든 VM 만 (label `boanclaw-user-email`)
 	// 모두 반환. 각 entry 는 (instance name, label email, creation time). VM 의 사용자가 더 이상
 	// 존재하지 않으면 reaper 가 Delete 호출. noop provisioner 는 빈 list.
@@ -132,6 +142,17 @@ func (p *noopProvisioner) ForensicDiskSnapshot(_ context.Context, _ *userstore.W
 
 func (p *noopProvisioner) StopInstance(_ context.Context, _ *userstore.Workstation) error {
 	return ErrKillChainUnsupported
+}
+
+func (p *noopProvisioner) StartInstance(_ context.Context, _ *userstore.Workstation) error {
+	return nil
+}
+
+func (p *noopProvisioner) InstanceStatus(_ context.Context, current *userstore.Workstation) (string, error) {
+	if current == nil {
+		return "unprovisioned", nil
+	}
+	return current.Status, nil
 }
 
 func (p *noopProvisioner) ListManagedInstances(_ context.Context) ([]ManagedInstance, error) {

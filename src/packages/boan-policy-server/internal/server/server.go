@@ -34,6 +34,15 @@ type Config struct {
 	// in X-Boan-Device-JWT header. Absent/invalid → 401. fail-closed.
 	DevicePubKeys  string
 	RevokedDevices string
+	// SystemNetworkEndpoints — CSV of mandatory egress entries that admins
+	// cannot delete. Each item: "host[:port[/methods]]". Default port 443,
+	// default method POST. Defended via prepend on every read + strip on
+	// every write so that they survive `updatePolicy` round-trips.
+	//
+	// Without this the cloud LLM proxy host could be deleted by an admin
+	// and the device would lose chat capability with no way to restore it
+	// (the UI itself talks through the same proxy).
+	SystemNetworkEndpoints string
 }
 
 func LoadConfig() Config {
@@ -54,7 +63,57 @@ func LoadConfig() Config {
 		WikiLLMKey:        env("BOAN_WIKI_LLM_KEY", ""),
 		DevicePubKeys:     env("BOAN_DEVICE_PUBKEYS", ""),
 		RevokedDevices:    env("BOAN_REVOKED_DEVICES", ""),
+		SystemNetworkEndpoints: env("BOAN_SYSTEM_NETWORK_ENDPOINTS", ""),
 	}
+}
+
+// parseSystemEndpoints decodes the CSV form of BOAN_SYSTEM_NETWORK_ENDPOINTS
+// into a slice of NetworkEndpoint with System=true. Each item supports:
+//
+//	host
+//	host:port
+//	host:port/METHOD,METHOD
+//
+// Empty input → empty slice (system list is optional). Invalid items are
+// logged and skipped — boot proceeds so the rest of the policy stays usable.
+func parseSystemEndpoints(csv string) []policy.NetworkEndpoint {
+	out := []policy.NetworkEndpoint{}
+	for _, raw := range strings.Split(csv, ",") {
+		item := strings.TrimSpace(raw)
+		if item == "" {
+			continue
+		}
+		host := item
+		port := 443
+		methods := []string{"POST"}
+		if i := strings.Index(item, "/"); i >= 0 {
+			host = item[:i]
+			ms := strings.Split(item[i+1:], "|")
+			methods = methods[:0]
+			for _, m := range ms {
+				m = strings.ToUpper(strings.TrimSpace(m))
+				if m != "" {
+					methods = append(methods, m)
+				}
+			}
+			if len(methods) == 0 {
+				methods = []string{"POST"}
+			}
+		}
+		if i := strings.LastIndex(host, ":"); i > 0 {
+			var p int
+			if _, err := fmt.Sscanf(host[i+1:], "%d", &p); err == nil && p > 0 && p <= 65535 {
+				port = p
+				host = host[:i]
+			}
+		}
+		host = strings.ToLower(strings.TrimSpace(host))
+		if host == "" {
+			continue
+		}
+		out = append(out, policy.NetworkEndpoint{Host: host, Ports: []int{port}, Methods: methods, System: true})
+	}
+	return out
 }
 
 type Server struct {
@@ -69,6 +128,18 @@ type Server struct {
 	// devicePubs — parsed Ed25519 pubkeys. Empty → device JWT not required (dev only).
 	devicePubs     []ed25519.PublicKey
 	revokedDevices map[string]struct{}
+	// broker — fans policy updates out to SSE subscribers (devices + admin UI).
+	// Replaces / supplements the 60s polling on boan-proxy network.Gate so that
+	// admin "−" / "+" / edit actions propagate to every device in <100 ms.
+	broker *Broker
+	// systemEndpoints — parsed from BOAN_SYSTEM_NETWORK_ENDPOINTS. Always
+	// prepended on read and stripped on write so admins can't delete them.
+	systemEndpoints []policy.NetworkEndpoint
+	// orgPolicy — single API for all org-policy mutations. Routes every
+	// patch (network whitelist, guardrail patterns, constitution, org
+	// settings…) through one save+publish path. New mutation handlers
+	// should call orgPolicy.Update instead of touching store directly.
+	orgPolicy *OrgPolicy
 }
 
 type checkinRequest struct {
@@ -112,18 +183,67 @@ func New(cfg Config) *Server {
 			revoked[d] = struct{}{}
 		}
 	}
-	return &Server{
-		cfg:            cfg,
-		store:          store,
-		signer:         signer,
-		guardrail:      NewGuardrailEvaluator(cfg.GuardrailLLMURL, cfg.GuardrailLLMModel, cfg.GuardrailLLMKey),
-		wikiGuardrail:  NewGuardrailEvaluator(cfg.WikiLLMURL, cfg.WikiLLMModel, cfg.WikiLLMKey),
-		trainingLog:    NewHITLTrainingLog(trainingLogPath),
-		wikiStore:      NewWikiStore(cfg.DataDir),
-		wikiGraph:      policy.NewWikiGraphStore(cfg.DataDir),
-		devicePubs:     pubs,
-		revokedDevices: revoked,
+	s := &Server{
+		cfg:             cfg,
+		store:           store,
+		signer:          signer,
+		guardrail:       NewGuardrailEvaluator(cfg.GuardrailLLMURL, cfg.GuardrailLLMModel, cfg.GuardrailLLMKey),
+		wikiGuardrail:   NewGuardrailEvaluator(cfg.WikiLLMURL, cfg.WikiLLMModel, cfg.WikiLLMKey),
+		trainingLog:     NewHITLTrainingLog(trainingLogPath),
+		wikiStore:       NewWikiStore(cfg.DataDir),
+		wikiGraph:       policy.NewWikiGraphStore(cfg.DataDir),
+		devicePubs:      pubs,
+		revokedDevices:  revoked,
+		broker:          NewBroker(),
+		systemEndpoints: parseSystemEndpoints(cfg.SystemNetworkEndpoints),
 	}
+	s.orgPolicy = newOrgPolicy(s)
+	return s
+}
+
+// withSystemEndpoints prepends the mandatory system endpoints to `user` and
+// dedupes by host (system wins). Caller is the policy reader — DB always
+// stores only user-managed entries.
+func (s *Server) withSystemEndpoints(user []policy.NetworkEndpoint) []policy.NetworkEndpoint {
+	if len(s.systemEndpoints) == 0 {
+		return user
+	}
+	seen := map[string]struct{}{}
+	out := make([]policy.NetworkEndpoint, 0, len(s.systemEndpoints)+len(user))
+	for _, e := range s.systemEndpoints {
+		key := strings.ToLower(e.Host)
+		out = append(out, e)
+		seen[key] = struct{}{}
+	}
+	for _, e := range user {
+		if _, dup := seen[strings.ToLower(e.Host)]; dup {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// stripSystemEndpoints removes any host that matches a system entry from the
+// incoming update so the DB never persists them. Defends against an admin
+// manually reposting a system row (UI 가 lock 해도 API 직접 호출 시).
+func (s *Server) stripSystemEndpoints(incoming []policy.NetworkEndpoint) []policy.NetworkEndpoint {
+	if len(s.systemEndpoints) == 0 {
+		return incoming
+	}
+	sys := map[string]struct{}{}
+	for _, e := range s.systemEndpoints {
+		sys[strings.ToLower(e.Host)] = struct{}{}
+	}
+	out := make([]policy.NetworkEndpoint, 0, len(incoming))
+	for _, e := range incoming {
+		if _, isSys := sys[strings.ToLower(e.Host)]; isSys {
+			continue
+		}
+		e.System = false // user-managed entries always have System=false
+		out = append(out, e)
+	}
+	return out
 }
 
 func (s *Server) Start(ctx context.Context) error {
@@ -307,6 +427,10 @@ func (s *Server) handleOrg(w http.ResponseWriter, r *http.Request) {
 		s.getPolicy(w, orgID)
 	case rest == "v1/policy" && (r.Method == http.MethodPut || r.Method == http.MethodPost):
 		s.updatePolicy(w, r, orgID)
+	case rest == "v1/org-policy" && r.Method == http.MethodPatch:
+		// PolicyPatch JSON 직접. 새 클라이언트 (frontend / agent) 가 이 endpoint
+		// 만 쓰면 산발적인 wire format 없이 일관된 부분 업데이트 가능.
+		s.patchOrgPolicy(w, r, orgID)
 	case rest == "v1/org-settings" && r.Method == http.MethodGet:
 		s.getOrgSettings(w, orgID)
 	case rest == "v1/org-settings" && (r.Method == http.MethodPut || r.Method == http.MethodPatch):
@@ -321,6 +445,14 @@ func (s *Server) handleOrg(w http.ResponseWriter, r *http.Request) {
 		s.proposeAmendment(w, r, orgID)
 	case rest == "v1/guardrail/propose-g1-amendment" && r.Method == http.MethodPost:
 		s.proposeG1Amendment(w, r, orgID)
+	case rest == "v1/guardrail/gi1/forbidden" && r.Method == http.MethodPost:
+		s.gi1Upload(w, r, orgID)
+	case strings.HasPrefix(rest, "v1/guardrail/gi1/forbidden/") && r.Method == http.MethodDelete:
+		s.gi1Delete(w, r, orgID, strings.TrimPrefix(rest, "v1/guardrail/gi1/forbidden/"))
+	case rest == "v1/guardrail/gi1/threshold" && r.Method == http.MethodPut:
+		s.gi1Threshold(w, r, orgID)
+	case rest == "v1/guardrail/gi2/descriptions" && r.Method == http.MethodPut:
+		s.gi2SetDescriptions(w, r, orgID)
 	case rest == "v1/guardrail/auto-judge" && r.Method == http.MethodPost:
 		s.autoJudge(w, r, orgID)
 	case rest == "v1/guardrail/training-log" && r.Method == http.MethodGet:
@@ -342,130 +474,121 @@ func (s *Server) handleOrg(w http.ResponseWriter, r *http.Request) {
 		s.listVersions(w, orgID)
 	case strings.HasPrefix(rest, "policy/rollback/") && r.Method == http.MethodPost:
 		verStr := strings.TrimPrefix(rest, "policy/rollback/")
-		s.rollbackPolicy(w, orgID, verStr)
+		s.rollbackPolicy(w, r, orgID, verStr)
 	case rest == "network-policy.json" && r.Method == http.MethodGet:
 		s.getSignedNetworkPolicy(w, orgID)
+	case rest == "network-policy.stream" && r.Method == http.MethodGet:
+		s.streamNetworkPolicy(w, r, orgID)
 	default:
 		http.NotFound(w, r)
 	}
 }
 
 func (s *Server) getPolicy(w http.ResponseWriter, orgID string) {
-	p, err := s.store.EnsureDefault(orgID)
+	// OrgPolicy.Get 가 시스템 endpoint 주입 + 서명까지 처리. 핸들러는 직렬화만.
+	p, err := s.orgPolicy.Get(context.Background(), orgID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	p.Signature = ""
-	sig, _ := s.signer.Sign(p)
-	p.Signature = sig
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(p)
 }
 
-func (s *Server) updatePolicy(w http.ResponseWriter, r *http.Request, orgID string) {
-	existing, err := s.store.EnsureDefault(orgID)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+// patchOrgPolicy — clean PolicyPatch JSON endpoint. 새 클라이언트가 빈 슬라이스 vs
+// "필드 보내지 않음" 명확히 구분할 수 있도록 pointer-based 페이로드 직접 수용.
+// 기존 PUT /policy 핸들러는 backward compat 위해 유지하지만 내부적으로 동일
+// orgPolicy.Update 호출 → 모든 mutation 이 한 path.
+func (s *Server) patchOrgPolicy(w http.ResponseWriter, r *http.Request, orgID string) {
+	var patch PolicyPatch
+	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if patch.IsEmpty() {
+		http.Error(w, ErrPatchEmpty.Error(), http.StatusBadRequest)
+		return
+	}
+	updated, err := s.orgPolicy.Update(r.Context(), orgID, patch)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(updated)
+}
 
+// updatePolicy 는 admin UI 의 PUT /policy 요청을 받아 PolicyPatch 로 변환한 뒤
+// OrgPolicy.Update 단일 진입점에 위임한다. 기존엔 여기서 직접 store.Save +
+// publish 했는데, 같은 흐름이 다른 곳에도 산재해서 한 군데로 모음. 새 mutation
+// 핸들러 (org-settings/dlp/rbac 등) 도 PolicyPatch 만 만들어서 같은 메서드 호출.
+func (s *Server) updatePolicy(w http.ResponseWriter, r *http.Request, orgID string) {
 	var incoming policy.Policy
 	if err := json.NewDecoder(r.Body).Decode(&incoming); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	p := *existing
+	patch := PolicyPatch{}
+	// 빈 슬라이스 vs 보내지 않음 구분이 어렵기 때문에 legacy wire format 은
+	// "비어있지 않으면 의도된 변경"으로 해석. 새 클라이언트는 명시적으로
+	// /v1/org-policy 같은 patch endpoint 를 쓰면 됨 (PolicyPatch 직접 JSON).
 	if len(incoming.Network) > 0 {
-		p.Network = incoming.Network
+		net := incoming.Network
+		patch.NetworkWhitelist = &net
 	}
 	if len(incoming.DLPRules) > 0 {
-		p.DLPRules = incoming.DLPRules
+		dlp := incoming.DLPRules
+		patch.DLPRules = &dlp
 	}
 	if len(incoming.RBAC.Roles) > 0 || incoming.RBAC.DefaultRole != "" || incoming.RBAC.EnforceStrict {
-		p.RBAC = incoming.RBAC
+		rbac := incoming.RBAC
+		patch.RBAC = &rbac
 	}
 	if incoming.VersionPolicy.MinVersion != "" || len(incoming.VersionPolicy.BlockedVersions) > 0 || incoming.VersionPolicy.UpdateChannel != "" {
-		p.VersionPolicy = incoming.VersionPolicy
+		vp := incoming.VersionPolicy
+		patch.VersionPolicy = &vp
 	}
 	if incoming.OrgSettings.OrgName != "" || len(incoming.OrgSettings.AllowedSSO) > 0 || len(incoming.OrgSettings.AdminEmails) > 0 || incoming.OrgSettings.SeatLimit != 0 || incoming.OrgSettings.GCPOrgID != "" || incoming.OrgSettings.WorkspaceURL != "" || incoming.OrgSettings.MountRules != nil {
-		// Preserve fields that the caller did not provide.
-		merged := p.OrgSettings
-		if incoming.OrgSettings.OrgName != "" {
-			merged.OrgName = incoming.OrgSettings.OrgName
-		}
-		if len(incoming.OrgSettings.AllowedSSO) > 0 {
-			merged.AllowedSSO = incoming.OrgSettings.AllowedSSO
-		}
-		if len(incoming.OrgSettings.AdminEmails) > 0 {
-			merged.AdminEmails = incoming.OrgSettings.AdminEmails
-		}
-		if incoming.OrgSettings.SeatLimit != 0 {
-			merged.SeatLimit = incoming.OrgSettings.SeatLimit
-		}
-		if incoming.OrgSettings.GCPOrgID != "" {
-			merged.GCPOrgID = incoming.OrgSettings.GCPOrgID
-		}
-		if incoming.OrgSettings.WorkspaceURL != "" {
-			merged.WorkspaceURL = incoming.OrgSettings.WorkspaceURL
-		}
-		if incoming.OrgSettings.MountRules != nil {
-			// Normalize each rule's Mode field.
-			rules := make([]policy.MountRule, 0, len(incoming.OrgSettings.MountRules))
-			for _, mr := range incoming.OrgSettings.MountRules {
-				if strings.TrimSpace(mr.Pattern) == "" {
-					continue
-				}
-				rules = append(rules, policy.MountRule{
-					Pattern: strings.TrimSpace(mr.Pattern),
-					Mode:    policy.NormalizeMountMode(mr.Mode),
-				})
-			}
-			merged.MountRules = rules
-		}
-		// MountRoot is not user-writable; always pull from env var.
-		merged.MountRoot = policy.MountRootFromEnv()
-		p.OrgSettings = merged
+		os := incoming.OrgSettings
+		patch.OrgSettings = &os
 	}
-	// Guardrail: 부분 업데이트 (필드별로 merge). 클라이언트가 보낸 필드만 덮어씀.
-	if strings.TrimSpace(incoming.Guardrail.Constitution) != "" {
-		p.Guardrail.Constitution = incoming.Guardrail.Constitution
+	if strings.TrimSpace(incoming.Guardrail.GT2Constitution) != "" {
+		c := incoming.Guardrail.GT2Constitution
+		patch.GT2Constitution = &c
 	}
-	if incoming.Guardrail.G1CustomPatterns != nil {
-		// 빈 패턴 제거 및 trim, mode normalize
-		cleaned := make([]policy.G1CustomPattern, 0, len(incoming.Guardrail.G1CustomPatterns))
-		for _, pat := range incoming.Guardrail.G1CustomPatterns {
-			pattern := strings.TrimSpace(pat.Pattern)
-			if pattern == "" {
-				continue
-			}
-			mode := strings.ToLower(strings.TrimSpace(pat.Mode))
-			if mode != "credential" && mode != "block" {
-				mode = "block" // default to safer block mode
-			}
-			cleaned = append(cleaned, policy.G1CustomPattern{
-				Pattern:     pattern,
-				Description: strings.TrimSpace(pat.Description),
-				Mode:        mode,
-			})
-		}
-		p.Guardrail.G1CustomPatterns = cleaned
+	if incoming.Guardrail.GT1Patterns != nil {
+		g1 := incoming.Guardrail.GT1Patterns
+		patch.GT1Patterns = &g1
 	}
-	if incoming.Guardrail.G3WikiHint != "" {
-		p.Guardrail.G3WikiHint = incoming.Guardrail.G3WikiHint
+	if incoming.Guardrail.GT3WikiHint != "" {
+		hint := incoming.Guardrail.GT3WikiHint
+		patch.GT3WikiHint = &hint
 	}
 
-	p.OrgID = orgID
-	p.Version = s.store.NextVersion(orgID)
-	p.Signature = ""
-	if err := s.store.Save(&p); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	updated, err := s.orgPolicy.Update(r.Context(), orgID, patch)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]any{"version": p.Version})
+	json.NewEncoder(w).Encode(map[string]any{"version": updated.Version})
+}
+
+// publishPolicyUpdate fans the latest signed network policy out to every SSE
+// subscriber for orgID. Failures are swallowed — a polling client will pick
+// up the update on its next 60s tick.
+func (s *Server) publishPolicyUpdate(orgID string) {
+	if s.broker == nil {
+		return
+	}
+	payload, err := s.signedNetworkPolicyJSON(orgID)
+	if err != nil {
+		return
+	}
+	s.broker.Publish(orgID, payload)
 }
 
 func (s *Server) listVersions(w http.ResponseWriter, orgID string) {
@@ -474,52 +597,105 @@ func (s *Server) listVersions(w http.ResponseWriter, orgID string) {
 	json.NewEncoder(w).Encode(versions)
 }
 
-func (s *Server) rollbackPolicy(w http.ResponseWriter, orgID string, verStr string) {
+func (s *Server) rollbackPolicy(w http.ResponseWriter, r *http.Request, orgID string, verStr string) {
 	ver, err := strconv.Atoi(verStr)
 	if err != nil {
 		http.Error(w, "invalid version", http.StatusBadRequest)
 		return
 	}
-	old, err := s.store.LoadVersion(orgID, ver)
+	updated, err := s.orgPolicy.Rollback(r.Context(), orgID, ver)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	old.Version = s.store.NextVersion(orgID)
-	old.Signature = ""
-	if err := s.store.Save(old); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"rolled_back_to": ver, "new_version": old.Version})
+	json.NewEncoder(w).Encode(map[string]any{"rolled_back_to": ver, "new_version": updated.Version})
 }
 
 func (s *Server) getSignedNetworkPolicy(w http.ResponseWriter, orgID string) {
-	p, err := s.store.EnsureDefault(orgID)
+	payload, err := s.signedNetworkPolicyJSON(orgID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(payload)
+}
+
+// signedNetworkPolicyJSON builds the exact wire format that getSignedNetworkPolicy
+// returns (`{"policy": {...}, "signature": "..."}`) so the SSE stream can push
+// the same bytes that a polling client would have fetched. Keeps subscribers
+// signature-verified end-to-end. System endpoints are prepended here so
+// every consumer (admin UI + device gates) sees the full effective list.
+func (s *Server) signedNetworkPolicyJSON(orgID string) ([]byte, error) {
+	p, err := s.store.EnsureDefault(orgID)
+	if err != nil {
+		return nil, err
+	}
 	policyDoc := map[string]any{
-		"endpoints":  p.Network,
+		"endpoints":  s.withSystemEndpoints(p.Network),
 		"updated_at": p.UpdatedAt,
 	}
 	policyJSON, err := json.Marshal(policyDoc)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return nil, err
 	}
 	sig, err := s.signer.SignBytes(policyJSON)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return nil, err
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	return json.Marshal(map[string]any{
 		"policy":    json.RawMessage(policyJSON),
 		"signature": sig,
 	})
+}
+
+// streamNetworkPolicy is the SSE endpoint that pushes signed network-policy
+// updates the moment they are saved. Clients (boan-proxy network.Gate and
+// admin UI) subscribe here and receive the same JSON shape that
+// `network-policy.json` returns — initial snapshot first, then one event per
+// update. A 25s heartbeat keeps the connection through Cloud Run's idle
+// trimming. The 60s polling cycle stays in place as a fallback for clients
+// that drop the stream.
+func (s *Server) streamNetworkPolicy(w http.ResponseWriter, r *http.Request, orgID string) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+
+	initial, err := s.signedNetworkPolicyJSON(orgID)
+	if err == nil {
+		fmt.Fprintf(w, "event: policy\ndata: %s\n\n", initial)
+		flusher.Flush()
+	}
+
+	ch, cancel := s.broker.Subscribe(orgID)
+	defer cancel()
+
+	heartbeat := time.NewTicker(25 * time.Second)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case payload, alive := <-ch:
+			if !alive {
+				return
+			}
+			fmt.Fprintf(w, "event: policy\ndata: %s\n\n", payload)
+			flusher.Flush()
+		case <-heartbeat.C:
+			fmt.Fprintf(w, ": keepalive\n\n")
+			flusher.Flush()
+		}
+	}
 }
 
 func (s *Server) getOrgSettings(w http.ResponseWriter, orgID string) {
@@ -547,12 +723,13 @@ func (s *Server) getOrgSettings(w http.ResponseWriter, orgID string) {
 }
 
 func (s *Server) updateOrgSettings(w http.ResponseWriter, r *http.Request, orgID string) {
-	p, err := s.store.EnsureDefault(orgID)
+	// 옛 코드는 store.Save 만 하고 broker.Publish 누락 — SSE 구독자가 변경
+	// 못 받음. OrgPolicy.Update 로 위임해서 모든 mutation 이 같은 path 거치게.
+	existing, err := s.store.EnsureDefault(orgID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-
 	var body struct {
 		DisplayName *string                `json:"display_name"`
 		Settings    map[string]interface{} `json:"settings"`
@@ -561,22 +738,24 @@ func (s *Server) updateOrgSettings(w http.ResponseWriter, r *http.Request, orgID
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-
-	next := *p
+	// patch.OrgSettings 만 만들고 OrgPolicy.Update 로 위임. remarshal 헬퍼는
+	// org-settings 키들을 policy.OrgSettings 필드로 매핑해주는 기존 로직.
+	scratch := *existing
 	if body.DisplayName != nil {
-		next.OrgSettings.OrgName = strings.TrimSpace(*body.DisplayName)
+		scratch.OrgSettings.OrgName = strings.TrimSpace(*body.DisplayName)
 	}
 	if body.Settings != nil {
-		if err := applyOrgSettingsPatch(&next, body.Settings); err != nil {
+		if err := applyOrgSettingsPatch(&scratch, body.Settings); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 	}
-
-	next.Version = s.store.NextVersion(orgID)
-	next.Signature = ""
-	if err := s.store.Save(&next); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	patch := PolicyPatch{
+		OrgSettings:   &scratch.OrgSettings,
+		VersionPolicy: &scratch.VersionPolicy, // org-settings 가 version_policy 도 같이 받을 수 있음
+	}
+	if _, err := s.orgPolicy.Update(r.Context(), orgID, patch); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	s.getOrgSettings(w, orgID)

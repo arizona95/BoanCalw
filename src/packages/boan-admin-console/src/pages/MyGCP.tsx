@@ -1255,7 +1255,7 @@ export default function MyGCP({ alwaysActive = false }: MyGCPProps = {}) {
           tabIndex={-1}
         />
       )}
-      {workstation?.web_desktop_url ? (
+      {workstation?.web_desktop_url && workstation.status === "running" ? (
         <div className="relative h-full bg-black">
             <iframe
               ref={iframeRef}
@@ -1387,6 +1387,19 @@ export default function MyGCP({ alwaysActive = false }: MyGCPProps = {}) {
             workstationApi.me().then((d) => setWorkstation(d)).catch(() => undefined);
           }} />;
         }
+        if (workstation && workstation.status === "stopped") {
+          return <VMStartPanel onStarted={() => {
+            workstationApi.me().then((d) => setWorkstation(d)).catch(() => undefined);
+          }} />;
+        }
+        if (workstation && workstation.status === "starting") {
+          return (
+            <StateScreen
+              title="VM 시작 중"
+              subtitle="GCP 가 Windows 를 부팅 중입니다 (보통 1~3분 소요)."
+            />
+          );
+        }
         if (error || !workstation) {
           return (
             <StateScreen
@@ -1445,6 +1458,64 @@ function VMRequestPanel({ reclaimed, onRequested }: { reclaimed: boolean; onRequ
           className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white font-medium px-6 py-3 rounded-full"
         >
           {busy ? "신청 중..." : "✦ VM 신청"}
+        </button>
+        {msg && <p className="mt-4 text-xs text-gray-300">{msg}</p>}
+      </div>
+    </div>
+  );
+}
+
+// VMStartPanel — shown when the user's VM exists but was stopped by the idle
+// sweeper. Clicking "▶ 시작" calls /api/workstation/start which kicks off
+// StartInstance + Ensure (new NAT IP) + Guacamole sync; the page polls
+// /api/workstation/me until status flips to "running" and the RDP iframe
+// appears.
+function VMStartPanel({ onStarted }: { onStarted: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const handle = async () => {
+    setBusy(true);
+    setMsg("VM 시작 요청 — Windows 부팅 대기 중 (1~3분)...");
+    try {
+      await workstationApi.start();
+      // Poll every 5s for up to 4 min until workstation.status flips to
+      // "running"; refresh parent state each tick so the UI transitions
+      // through 시작 중 → running smoothly.
+      const deadline = Date.now() + 4 * 60 * 1000;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 5000));
+        try {
+          const ws = await workstationApi.me();
+          onStarted();
+          if (ws?.status === "running") {
+            setMsg("✅ 시작 완료");
+            return;
+          }
+        } catch {
+          // keep polling
+        }
+      }
+      setMsg("⚠️ 시작이 예상보다 오래 걸립니다. 새로고침 후 다시 확인하세요.");
+    } catch (e) {
+      setMsg(`❌ 시작 실패: ${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="flex h-full items-center justify-center bg-gray-900 text-white">
+      <div className="max-w-md text-center px-8">
+        <h2 className="text-2xl font-semibold mb-2">⏸ VM 중지됨</h2>
+        <p className="text-sm text-gray-400 mb-6">
+          비용 절감을 위해 10분 이상 사용하지 않은 VM 은 자동으로 중지됩니다.
+          시작 버튼을 누르면 약 1~3분 후 다시 사용할 수 있습니다.
+        </p>
+        <button
+          onClick={handle}
+          disabled={busy}
+          className="bg-green-600 hover:bg-green-700 disabled:opacity-50 text-white font-medium px-6 py-3 rounded-full"
+        >
+          {busy ? "시작 중..." : "▶ 시작"}
         </button>
         {msg && <p className="mt-4 text-xs text-gray-300">{msg}</p>}
       </div>

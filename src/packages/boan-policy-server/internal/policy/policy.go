@@ -15,6 +15,11 @@ type NetworkEndpoint struct {
 	Host    string   `json:"host"`
 	Ports   []int    `json:"ports,omitempty"`
 	Methods []string `json:"methods,omitempty"`
+	// System — true 이면 deploy 시 주입된 필수 endpoint (정책서버/LLM proxy
+	// 등). 관리자도 UI 에서 지울 수 없고 updatePolicy 는 incoming 에서 자동
+	// 제거. 매 read 마다 다시 prepend 되어 사라지지 않는다. 이게 없으면
+	// 정책 변경 후 자기 자신이 정책을 못 가져오는 recursive deadlock 발생.
+	System bool `json:"system,omitempty"`
 }
 
 type DLPRule struct {
@@ -90,16 +95,25 @@ func NormalizeMountMode(v string) string {
 }
 
 type GuardrailConfig struct {
-	// G1 — 정규식 가드레일 (기본 패턴은 input_gate.go 에 하드코딩되어 있으며,
-	// 여기 G1CustomPatterns 는 조직별로 추가되는 사용자 정의 패턴 + 설명)
-	G1CustomPatterns []G1CustomPattern `json:"g1_custom_patterns,omitempty"`
+	// GT1 — 텍스트 정규식 가드레일 (기본 패턴은 input_gate.go 에 하드코딩되어 있으며,
+	// 여기 GT1Patterns 는 조직별로 추가되는 사용자 정의 패턴 + 설명)
+	// JSON 태그는 레거시 호환을 위해 g1_custom_patterns 유지.
+	GT1Patterns []GT1Pattern `json:"g1_custom_patterns,omitempty"`
 
-	// G2 — 헌법 + LLM 가드레일. 이 텍스트가 G2 LLM 시스템 프롬프트로 사용됨.
-	Constitution string `json:"constitution,omitempty"`
+	// GT2 — 헌법 + LLM 텍스트 가드레일. 이 텍스트가 GT2 LLM 시스템 프롬프트로 사용됨.
+	GT2Constitution string `json:"constitution,omitempty"`
 
-	// G3 — Wiki 적응형 LLM 가드레일. 운영자가 제공하는 추가 힌트/맥락
+	// GT3 — Wiki 적응형 텍스트 가드레일. 운영자가 제공하는 추가 힌트/맥락
 	// (예: "사내 code review 텍스트는 외부 전송 금지" 등의 자연어 메모)
-	G3WikiHint string `json:"g3_wiki_hint,omitempty"`
+	GT3WikiHint string `json:"g3_wiki_hint,omitempty"`
+
+	// GI1 — 이미지 perceptual-hash 차단 리스트. 들어오는 이미지 pHash 와
+	// Hamming distance < GI1HammingThreshold 이면 차단/치환.
+	GI1Forbidden        []GI1ForbiddenImage `json:"gi1_forbidden,omitempty"`
+	GI1HammingThreshold int                 `json:"gi1_hamming_threshold,omitempty"` // 기본 10
+
+	// GI2 — Vision-LLM 이미지 설명 매칭. description 에 매칭되면 ask → HITL.
+	GI2Descriptions []GI2Description `json:"gi2_descriptions,omitempty"`
 
 	// (레거시 — 현재 사용 안 함) 가드레일 LLM endpoint/model 커스터마이즈.
 	// LLM Registry 역할 바인딩으로 대체됨.
@@ -109,18 +123,34 @@ type GuardrailConfig struct {
 	WikiLLMModel string `json:"wiki_llm_model,omitempty"`
 }
 
-// G1CustomPattern — 조직 G1 정규식 + 설명 + 매칭 시 동작
+// GT1Pattern — 조직 텍스트 정규식 + 설명 + 매칭 시 동작
 // Mode:
 //   "credential" — 매칭된 값이 credential 이라 간주. credential 치환 로직 경유 (기본 5 패턴 mode)
-//   "block"      — 그냥 차단 (프로젝트명, 사내 도메인 등 단순 금지어 mode)
-type G1CustomPattern struct {
+//   "redact"     — 캡쳐된 부분을 Replacement 로 치환해서 통과
+//   "block"      — 캡쳐된 부분을 sentinel 로 치환 (Replacement 비어있으면 [guardrail::GT1::block])
+type GT1Pattern struct {
 	Pattern     string `json:"pattern"`
 	Description string `json:"description,omitempty"`
 	// Replacement: 매칭된 텍스트를 이 값으로 치환해서 downstream 에 전달.
-	// 예: "{{G1::phone_number}}" → 원문의 폰번호 자리에 플레이스홀더가 들어가고 가드레일은 통과.
-	// 비어있고 Mode="block" 이면 차단. 비어있고 Mode="credential" 이면 기존 credential swap 로직.
+	// 예: "{{GT1::phone_number}}" → 원문의 폰번호 자리에 플레이스홀더가 들어가고 가드레일은 통과.
 	Replacement string `json:"replacement,omitempty"`
-	Mode        string `json:"mode,omitempty"` // "redact" | "block" | "credential" (legacy)
+	Mode        string `json:"mode,omitempty"` // "redact" | "block" | "credential"
+}
+
+// GI1ForbiddenImage — 차단할 이미지의 perceptual hash + 설명
+// Hash 는 64-bit pHash (16자리 hex). Hamming distance 기준 비교.
+type GI1ForbiddenImage struct {
+	Hash        string `json:"hash"`                  // 16-hex pHash
+	Description string `json:"description,omitempty"` // 운영자가 보는 라벨 (예: "내부 회로도")
+	UploadedAt  string `json:"uploaded_at,omitempty"`
+	Replacement string `json:"replacement,omitempty"` // 차단 시 downstream 에 보낼 placeholder 텍스트
+}
+
+// GI2Description — 차단되어야 할 이미지의 자연어 설명. Vision-LLM 이 이걸 보고
+// 들어온 이미지가 이 설명에 부합하면 ask → HITL.
+type GI2Description struct {
+	Description string `json:"description"`     // 예: "회로도, 도면, 스키매틱"
+	Action      string `json:"action,omitempty"` // "ask" | "block" (기본: ask)
 }
 
 type Policy struct {
@@ -196,7 +226,7 @@ func DefaultPolicy(orgID string) *Policy {
 			MountRoot: MountRootFromEnv(),
 		},
 		Guardrail: GuardrailConfig{
-			Constitution: "가드레일 헌법: 자격증명, 비밀번호, 토큰, 개인정보, 사내 비밀, 고객 데이터, 민감한 운영 명령은 외부로 그대로 내보내지 않는다. 완전 무해한 일반 텍스트만 허용한다. 애매하면 ask 로 분류하고 사람 확인을 거친다.",
+			GT2Constitution: "가드레일 헌법: 자격증명, 비밀번호, 토큰, 개인정보, 사내 비밀, 고객 데이터, 민감한 운영 명령은 외부로 그대로 내보내지 않는다. 완전 무해한 일반 텍스트만 허용한다. 애매하면 ask 로 분류하고 사람 확인을 거친다.",
 		},
 	}
 }
@@ -314,8 +344,8 @@ func (s *Store) loadFile(dir string, version int) (*Policy, error) {
 	// MountRoot is sourced from env var (BOAN_MOUNT_ROOT) — always override
 	// the persisted value so changes to the env var take effect immediately.
 	p.OrgSettings.MountRoot = MountRootFromEnv()
-	if p.Guardrail.Constitution == "" {
-		p.Guardrail.Constitution = DefaultPolicy(p.OrgID).Guardrail.Constitution
+	if p.Guardrail.GT2Constitution == "" {
+		p.Guardrail.GT2Constitution = DefaultPolicy(p.OrgID).Guardrail.GT2Constitution
 	}
 	return &p, nil
 }

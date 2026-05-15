@@ -42,6 +42,8 @@ export interface NetworkEndpoint {
   host: string;
   ports?: number[];
   methods?: string[];
+  /** policy-server 가 deploy 시 주입하는 필수 endpoint. 관리자도 못 지움. */
+  system?: boolean;
 }
 
 export interface VersionPolicy {
@@ -70,13 +72,28 @@ export interface G1CustomPattern {
   pattern: string;
   description?: string;
   replacement?: string;                          // 예: "{{G1::phone_number}}"
-  mode?: "redact" | "credential" | "block";      // default "redact" if replacement set, else "block"
+  mode?: "block" | "mask" | "fake" | "credential" | "redact"; // redact 는 레거시 (mask 와 동일)
+}
+
+export interface GI1ForbiddenImage {
+  hash: string;                // 16-hex pHash
+  description?: string;
+  uploaded_at?: string;
+  replacement?: string;        // 차단 시 downstream 에 보낼 placeholder
+}
+
+export interface GI2Description {
+  description: string;
+  action?: "ask" | "block";
 }
 
 export interface GuardrailConfig {
   g1_custom_patterns?: G1CustomPattern[];
   constitution?: string;
   g3_wiki_hint?: string;
+  gi1_forbidden?: GI1ForbiddenImage[];
+  gi1_hamming_threshold?: number;
+  gi2_descriptions?: GI2Description[];
   llm_url?: string;
   llm_model?: string;
   wiki_llm_url?: string;
@@ -122,11 +139,6 @@ export interface Credential {
   org_id: string;
   status: "ok" | "expired" | "missing";
   expires_at: string;
-}
-
-export interface CredentialPassthrough {
-  name: string;
-  value: string;
 }
 
 export interface DashboardStats {
@@ -225,16 +237,6 @@ export const credentialApi = {
     request<{ status: string; role: string }>(`${CREDENTIAL_BASE}/v1/store`, {
       method: "POST",
       body: JSON.stringify({ role, key, ttl_hours: 8760 }),
-    }),
-  listPassthrough: () => request<CredentialPassthrough[]>(`${CREDENTIAL_BASE}/v1/passthrough`),
-  addPassthrough: (name: string, value: string) =>
-    request<{ status: string; name: string }>(`${CREDENTIAL_BASE}/v1/passthrough`, {
-      method: "POST",
-      body: JSON.stringify({ name, value }),
-    }),
-  removePassthrough: (name: string) =>
-    request<void>(`${CREDENTIAL_BASE}/v1/passthrough/${encodeURIComponent(name)}`, {
-      method: "DELETE",
     }),
 };
 
@@ -415,6 +417,34 @@ export interface G1DefaultsResponse {
 
 export const guardrailApi = {
   g1Defaults: () => request<G1DefaultsResponse>("/api/guardrail/g1-defaults"),
+
+  // GI1 — 이미지 perceptual-hash 차단 리스트.
+  // 이미지 바이트는 boan-proxy 에서 pHash 로 변환된 뒤 cloud 로 전송됨.
+  gi1Upload: async (file: File, description: string, replacement: string) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    if (description) fd.append("description", description);
+    if (replacement) fd.append("replacement", replacement);
+    const res = await fetch("/api/admin/gi1/forbidden", { method: "POST", body: fd, credentials: "include" });
+    if (!res.ok) throw new Error(await res.text() || `${res.status} ${res.statusText}`);
+    return (await res.json()) as { hash: string; description?: string; duplicate?: boolean };
+  },
+  gi1Delete: (hash: string) =>
+    request<void>(`/api/admin/gi1/forbidden/${encodeURIComponent(hash)}`, { method: "DELETE", credentials: "include" }),
+  gi1SetThreshold: (threshold: number) =>
+    request<void>("/api/admin/gi1/threshold", {
+      method: "PUT",
+      credentials: "include",
+      body: JSON.stringify({ threshold }),
+    }),
+
+  // GI2 — Vision-LLM 설명 매칭. 전체 리스트를 한 번에 저장 (canonical set).
+  gi2SetDescriptions: (descriptions: GI2Description[]) =>
+    request<void>("/api/admin/gi2/descriptions", {
+      method: "PUT",
+      credentials: "include",
+      body: JSON.stringify({ descriptions }),
+    }),
 };
 
 // ── Wiki Graph (LLM 이 편집하는 지식 그래프) ─────────────────
@@ -569,6 +599,16 @@ export const workstationApi = {
     }).then(async (r) => {
       if (!r.ok) throw new Error(`${r.status} ${(await r.text()) || r.statusText}`);
       return r.json() as Promise<{ status: string; vm_status: string; hint: string }>;
+    }),
+  start: () =>
+    fetch("/api/workstation/start", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    }).then(async (r) => {
+      if (!r.ok) throw new Error(`${r.status} ${(await r.text()) || r.statusText}`);
+      return r.json() as Promise<{ status: string; hint: string }>;
     }),
   // owner 의 현재 VM 으로부터 GCP Custom Image 생성. 10-20분 소요. 시작 즉시 ACK 반환.
   captureGoldenImage: (name?: string, description?: string) =>

@@ -3,7 +3,6 @@ import {
   credentialApi,
   credentialRequestApi,
   type Credential,
-  type CredentialPassthrough,
   type CredentialRequestItem,
 } from "../api";
 import { useAuth } from "../auth";
@@ -14,7 +13,7 @@ const STATUS_STYLE: Record<string, string> = {
   missing: "bg-yellow-50 text-yellow-700",
 };
 
-type TabKey = "org" | "personal" | "requests" | "passthrough";
+type TabKey = "org" | "personal" | "requests";
 
 function maskKey(k: string) {
   if (!k) return "";
@@ -26,7 +25,6 @@ export default function Credentials() {
   const { user } = useAuth();
   const [tab, setTab] = useState<TabKey>("org");
   const [creds, setCreds] = useState<Credential[]>([]);
-  const [passthrough, setPassthrough] = useState<CredentialPassthrough[]>([]);
   const [credRequests, setCredRequests] = useState<CredentialRequestItem[]>([]);
   const [reqRoleName, setReqRoleName] = useState("");
   const [reqDescription, setReqDescription] = useState("");
@@ -54,10 +52,7 @@ export default function Credentials() {
   const [name, setName] = useState("");
   const [key, setKey] = useState("");
   const [showKey, setShowKey] = useState(false);
-  const [passthroughName, setPassthroughName] = useState("");
-  const [passthroughValue, setPassthroughValue] = useState("");
   const [adding, setAdding] = useState(false);
-  const [addingPassthrough, setAddingPassthrough] = useState(false);
   // 개인용 credential 직접 등록 폼 (추천 외).
   const [personalName, setPersonalName] = useState("");
   const [personalKey, setPersonalKey] = useState("");
@@ -67,10 +62,9 @@ export default function Credentials() {
 
   const load = () => {
     setLoading(true);
-    Promise.all([credentialApi.list(), credentialApi.listPassthrough(), credentialRequestApi.list()])
-      .then(([credentialItems, passthroughItems, requestItems]) => {
+    Promise.all([credentialApi.list(), credentialRequestApi.list()])
+      .then(([credentialItems, requestItems]) => {
         setCreds(credentialItems);
-        setPassthrough(passthroughItems);
         setCredRequests(requestItems);
       })
       .catch((e: Error) => setError(e.message))
@@ -129,36 +123,6 @@ export default function Credentials() {
     }
   };
 
-  const handleAddPassthrough = async () => {
-    if (!passthroughName.trim()) {
-      setError("예외 키 이름을 입력하세요.");
-      return;
-    }
-    if (!passthroughValue.trim()) {
-      setError("안 바꾸는 값을 입력하세요.");
-      return;
-    }
-    setError(null);
-    setSuccess(null);
-    setAddingPassthrough(true);
-    try {
-      await credentialApi.addPassthrough(
-        passthroughName.trim(),
-        passthroughValue.trim()
-      );
-      setPassthroughName("");
-      setPassthroughValue("");
-      setSuccess(
-        `"${passthroughName}" 이(가) HITL/마스킹 예외 값으로 등록되었습니다.`
-      );
-      load();
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : "예외 키 추가 실패");
-    } finally {
-      setAddingPassthrough(false);
-    }
-  };
-
   const handleRevoke = async (role: string) => {
     setError(null);
     try {
@@ -166,16 +130,6 @@ export default function Credentials() {
       load();
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "삭제 실패");
-    }
-  };
-
-  const handleRemovePassthrough = async (nameToRemove: string) => {
-    setError(null);
-    try {
-      await credentialApi.removePassthrough(nameToRemove);
-      load();
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : "예외 키 삭제 실패");
     }
   };
 
@@ -203,7 +157,7 @@ export default function Credentials() {
       )}
 
       <div className="flex border-b border-gray-200 mb-4">
-        {([["org", "Organization"], ["personal", "Personal"], ["requests", "Recommendations"], ["passthrough", "Passthrough"]] as const)
+        {([["org", "Organization"], ["personal", "Personal"], ["requests", "Recommendations"]] as const)
           .filter(([k]) => k !== "requests" || user?.can_edit)
           .map(([k, label]) => (
             <button key={k} onClick={() => setTab(k)} className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${tab === k ? "border-boan-600 text-boan-700" : "border-transparent text-gray-500 hover:text-gray-700"}`}>{label}</button>
@@ -473,7 +427,7 @@ export default function Credentials() {
             )}
           </div>
         </div>
-      ) : tab === "requests" ? (
+      ) : (
         <div className="space-y-4">
           {/* 소유자: 추천 credential 등록 (org-wide) */}
           <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-5">
@@ -530,96 +484,6 @@ export default function Credentials() {
             )}
           </div>
         </div>
-      ) : (
-        <>
-          <div className="mb-6 rounded-xl border border-amber-200 bg-white p-6 shadow-sm">
-            <h2 className="mb-1 text-lg font-semibold">안 바꾸는 키 등록</h2>
-            <p className="mb-4 text-xs text-gray-500">
-              여기 등록한 값은 Credential HITL이나 `[REDACTED]`로 바꾸지 않습니다.
-              테스트 키, 가짜 키, 샘플 키 같은 값만 넣는 용도입니다.
-            </p>
-            <div className="flex flex-col gap-3">
-              <input
-                type="text"
-                placeholder="이름 (예: anthropic-fake-key)"
-                value={passthroughName}
-                onChange={(e) => setPassthroughName(e.target.value)}
-                className="rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-400"
-              />
-              <div className="flex gap-3">
-                <input
-                  type="text"
-                  placeholder="안 바꾸는 값 (예: sk-ant-api03-fakekey...)"
-                  value={passthroughValue}
-                  onChange={(e) => setPassthroughValue(e.target.value)}
-                  className="flex-1 rounded-lg border border-gray-300 px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-amber-400"
-                />
-                <button
-                  onClick={handleAddPassthrough}
-                  disabled={addingPassthrough}
-                  className="rounded-lg bg-amber-500 px-4 py-2 text-sm text-white hover:bg-amber-600 disabled:opacity-50"
-                >
-                  {addingPassthrough ? "저장 중..." : "등록"}
-                </button>
-              </div>
-            </div>
-          </div>
-
-          <div className="overflow-hidden rounded-xl border border-gray-200 bg-white shadow-sm">
-            <div className="flex items-center justify-between border-b border-gray-200 bg-gray-50 px-6 py-3">
-              <h3 className="text-sm font-semibold text-gray-700">안 바꾸는 키 목록</h3>
-              <button
-                onClick={load}
-                className="text-xs text-boan-600 hover:underline"
-              >
-                새로고침
-              </button>
-            </div>
-            {loading ? (
-              <p className="p-6 text-sm text-gray-500">로딩 중...</p>
-            ) : passthrough.length === 0 ? (
-              <p className="p-6 text-sm text-gray-400">
-                등록된 예외 키가 없습니다.
-              </p>
-            ) : (
-              <table className="w-full text-sm">
-                <thead className="border-b border-gray-200 bg-gray-50">
-                  <tr>
-                    <th className="px-6 py-3 text-left font-medium text-gray-500">
-                      이름
-                    </th>
-                    <th className="px-6 py-3 text-left font-medium text-gray-500">
-                      값
-                    </th>
-                    <th className="px-6 py-3 text-right font-medium text-gray-500">
-                      액션
-                    </th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-100">
-                  {passthrough.map((item) => (
-                    <tr key={item.name} className="hover:bg-gray-50">
-                      <td className="px-6 py-3 font-mono font-medium">
-                        {item.name}
-                      </td>
-                      <td className="px-6 py-3 font-mono text-xs text-gray-500">
-                        {item.value}
-                      </td>
-                      <td className="px-6 py-3 text-right">
-                        <button
-                          onClick={() => handleRemovePassthrough(item.name)}
-                          className="text-xs text-red-600 hover:underline"
-                        >
-                          revoke
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
-          </div>
-        </>
       )}
     </div>
   );

@@ -39,7 +39,10 @@ func NewGraphClient(baseURL, orgID, orgToken string) *GraphClient {
 		OrgID:    orgID,
 		OrgToken: orgToken,
 		HTTP: &http.Client{
-			Timeout:   30 * time.Second,
+			// 90s — Cloud Run policy-server 의 cold-start (~10-15s) + large list 응답
+			// (e.g. decisions limit=30) 까지 견딜 만한 여유. 이전엔 30s 였는데
+			// find_ambiguous 가 cold-start 만나면 자주 timeout 됐음.
+			Timeout:   90 * time.Second,
 			Transport: &http.Transport{Proxy: nil}, // NO proxy — 내부 호출
 		},
 	}

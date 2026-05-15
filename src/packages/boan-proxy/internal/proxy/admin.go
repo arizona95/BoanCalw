@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -22,11 +23,13 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/audit"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/auth"
+	"github.com/samsung-sds/boanclaw/boan-proxy/internal/imagehash"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/orgserver"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/orgstore"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/wikiskills"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/roles"
 	"github.com/samsung-sds/boanclaw/boan-proxy/internal/userstore"
+	"github.com/samsung-sds/boanclaw/boan-proxy/internal/workstation"
 )
 
 // userRDPTransferDir — RDP virtual drive 가 마운트되는 사용자별 staging 디렉토리.
@@ -1112,6 +1115,11 @@ func (s *Server) StartAdmin() {
 			})
 			return
 		}
+		// Refresh the user's idle timer. Frontend polls /api/auth/me on every
+		// page mount and periodically while the app is open, so this is the
+		// canonical "user is still using the system" heartbeat. The sweeper
+		// stops VMs whose owner has been idle for LogoutGracePeriod.
+		s.RecordActivity(sess.Email)
 		json.NewEncoder(w).Encode(map[string]any{
 			"enabled":       s.authProv.Enabled(),
 			"authenticated": true,
@@ -1123,9 +1131,6 @@ func (s *Server) StartAdmin() {
 			"can_edit":      roles.CanEdit(roles.Normalize(sess.Role)),
 			"org_id":        sess.OrgID,
 		})
-		// Auto-provisioning on login removed — VMs are now created only after
-		// admin clicks "VM 승인" in Authorization > Users (Phase 1 architecture).
-		_ = sess
 	})
 
 	mux.HandleFunc("/api/openclaw/dashboard", func(w http.ResponseWriter, r *http.Request) {
@@ -1274,7 +1279,7 @@ func (s *Server) StartAdmin() {
 		// Fetch G1 patterns from policy
 		var g1Patterns []G1PatternRule
 		if rules, _ := s.guardrail.GetGuardrailRules(ctx, orgID); rules != nil {
-			for _, r := range rules.G1Patterns {
+			for _, r := range rules.GT1Patterns {
 				g1Patterns = append(g1Patterns, G1PatternRule{Pattern: r.Pattern, Replacement: r.Replacement, Mode: r.Mode})
 			}
 		}
@@ -1380,6 +1385,28 @@ func (s *Server) StartAdmin() {
 		mode, payload := parseOperatorMode(prompt, "chat")
 		log.Printf("[openclaw/v1] mode=%s payload=%.80q org=%s user=%s", mode, payload, orgID, sender)
 
+		// 사용자 access_level 조회 — image gate access-level 분기에 필요.
+		userAccessLevel := "ask"
+		if sess != nil {
+			if u, err := s.users.Get(sess.Email); err == nil && u != nil {
+				if u.AccessLevel != "" { userAccessLevel = string(u.AccessLevel) }
+			}
+		}
+
+		// GI1 (+ GI2 if ask) — 이미지 perceptual-hash + vision-LLM 가드레일.
+		// messages 배열의 모든 image_url / image source 를 추출해서 평가 →
+		// 매칭되면 해당 image part 를 sentinel text 로 치환. LLM 호출 전 수행 →
+		// 차단된 이미지는 절대 모델 API 로 전송되지 않는다.
+		if results := s.EvaluateImageContent(r.Context(), orgID, userAccessLevel, body["messages"]); len(results) > 0 {
+			subs := ApplyImageReplacements(body["messages"], results)
+			log.Printf("[openclaw/v1] G1_img blocked %d image(s) (results=%d) org=%s user=%s", subs, len(results), orgID, sender)
+			summary := fmt.Sprintf("G1_img blocked %d image(s): %s d=%d", subs, results[0].MatchedHash, results[0].Distance)
+			addTrace(traceEntry{
+				Type: "guardrail", Direction: "inbound", Source: sender, Target: "llm",
+				Summary: summary, Decision: "block", Gate: "G1_img",
+			})
+		}
+
 		// G1/G2/G3 가드레일: OpenClaw 채팅도 가드레일 적용
 		// registry에서 security LLM 정보 가져오기
 		var secLLMURL, secLLMModel string
@@ -1392,39 +1419,69 @@ func (s *Server) StartAdmin() {
 			}
 			if secLLMURL == "" { secLLMURL = entry.Endpoint }
 		}
-		// 사용자 access_level 조회
-		userAccessLevel := "ask"
-		if sess != nil {
-			if u, err := s.users.Get(sess.Email); err == nil && u != nil {
-				if u.AccessLevel != "" { userAccessLevel = string(u.AccessLevel) }
-			}
-		}
 
 		if mode == "chat" && payload != "" {
+			// Fetch G1 custom patterns from policy-server so that admin-edited
+			// rules (Guardrail UI → G1 tab) actually run against OpenClaw chat
+			// input. Previously this list was empty here and only the hardcoded
+			// credential-like patterns ran — admin-added patterns like
+			// `BLOCKME_AUDIT_…` silently passed through.
+			var g1Patterns []G1PatternRule
+			if rules, _ := s.guardrail.GetGuardrailRules(r.Context(), orgID); rules != nil {
+				for _, rr := range rules.GT1Patterns {
+					g1Patterns = append(g1Patterns, G1PatternRule{Pattern: rr.Pattern, Replacement: rr.Replacement, Mode: rr.Mode})
+				}
+			}
 			gateResp := evaluateInputGateWithLocal(r.Context(), s.dlpEng, s.guardrail, s.evaluateGuardrailLocal, orgID, InputGateRequest{
 				Mode: "text", Text: payload, SrcLevel: 3, DestLevel: 1,
 				Flow: "openclaw-chat-direct",
 				UserEmail: sender, AccessLevel: userAccessLevel,
 				LLMURL: secLLMURL, LLMModel: secLLMModel,
+				G1Patterns: g1Patterns,
 			}, func(reason string, req InputGateRequest) string {
 				return createInputGateApproval(sender, orgID, reason, req)
 			})
-			if !gateResp.Allowed {
-				log.Printf("[openclaw/v1] guardrail blocked tier=%s action=%s reason=%q", gateResp.Tier, gateResp.Action, gateResp.Reason)
+			// 각 tier 의 평가 결과를 한 줄씩 trace 로 풀어 기록. G3 까지 갔으면
+			// G1/G2/G3 세 줄이 생성됨. ask 통과 흐름도 모든 tier 가 보임.
+			// DLP / access / key / chord / clipboard 같은 내부 layer 는 가드레일
+			// 탭에서 노이즈라 G1/G2/G3 만 노출.
+			for _, ev := range gateResp.Evaluations {
+				if ev.Tier != "G1_txt" && ev.Tier != "G2_txt" && ev.Tier != "G3_txt" {
+					continue
+				}
 				addTrace(traceEntry{
 					Type: "guardrail", Direction: "inbound", Source: sender, Target: "llm",
-					Summary: payload, Decision: gateResp.Action, Gate: gateResp.Tier,
+					Summary: payload, Decision: ev.Decision, Gate: ev.Tier,
+					Meta: map[string]any{"reason": ev.Reason, "access_level": userAccessLevel},
 				})
+			}
+			if !gateResp.Allowed {
+				log.Printf("[openclaw/v1] guardrail blocked tier=%s action=%s reason=%q", gateResp.Tier, gateResp.Action, gateResp.Reason)
 				writeOpenAITextResponse(w, formatGuardrailBlockMessage(gateResp, payload))
 				return
+			}
+			// G1 mask/fake 가 치환한 text 를 downstream credential gate + LLM 까지 전달.
+			// 이전엔 원본 payload 가 그대로 LLM 호출에 쓰여서 mask/fake 치환이
+			// LLM 응답에 반영 안 됐음 (사용자가 010-1234-5678 등록 후 LLM 이 010
+			// 번호로 답변하는 버그).
+			if gateResp.NormalizedText != "" && gateResp.NormalizedText != payload {
+				log.Printf("[openclaw/v1] G1 normalized text: %.80q → %.80q", payload, gateResp.NormalizedText)
+				payload = gateResp.NormalizedText
+				prompt = gateResp.NormalizedText // forwardSelectedLLM 까지 전달되는 변수
+				if msgs, ok := body["messages"].([]any); ok && len(msgs) > 0 {
+					if last, ok := msgs[len(msgs)-1].(map[string]any); ok {
+						last["content"] = payload
+					}
+				}
 			}
 		}
 
 		summary := payload
-		if len(summary) > 200 { summary = summary[:200] + "..." }
+		// chat trace 의 Gate 필드는 가드레일 tier 가 아니라 request/response/vm-input
+		// 중 하나로만 사용. 가드레일 결과는 별도 guardrail type trace 에 기록됨.
 		addTrace(traceEntry{
 			Type: "chat", Direction: "inbound", Source: sender, Target: "llm",
-			Summary: summary, Decision: "allow", Gate: "G1",
+			Summary: summary, Decision: "allow", Gate: "request",
 		})
 
 		if mode != "chat" {
@@ -1508,6 +1565,31 @@ func (s *Server) StartAdmin() {
 		}
 		if gateResult.HITLRequired && gateResult.ApprovalID != "" {
 			w.Header().Set("X-Boan-Credential-HITL", gateResult.ApprovalID)
+		}
+		// LLM 응답 trace — request 만 남기던 이전엔 어떤 답이 왔는지 안 보였음.
+		// resp 구조 (OpenAI 호환): choices[0].message.content. 200 자 preview 만.
+		respSummary := extractAssistantText(resp)
+		respKeys := make([]string, 0, len(resp))
+		for k := range resp {
+			respKeys = append(respKeys, k)
+		}
+		log.Printf("[openclaw/v1] response trace: summary_len=%d resp_keys=%v sender=%s", len(respSummary), respKeys, sender)
+		if respSummary != "" {
+			addTrace(traceEntry{
+				Type: "chat", Direction: "outbound", Source: "llm", Target: sender,
+				Summary: respSummary, Decision: "allow", Gate: "response",
+			})
+		} else {
+			// Fallback: summary empty 면 raw resp 의 첫 200 자라도 남겨서 어디서 막혔는지 추적.
+			raw, _ := json.Marshal(resp)
+			preview := string(raw)
+			if len(preview) > 200 {
+				preview = preview[:200] + "..."
+			}
+			addTrace(traceEntry{
+				Type: "chat", Direction: "outbound", Source: "llm", Target: sender,
+				Summary: "[raw] " + preview, Decision: "allow", Gate: "response",
+			})
 		}
 		if stream, _ := body["stream"].(bool); stream {
 			writeOpenAIStream(w, resp)
@@ -1728,6 +1810,7 @@ func (s *Server) StartAdmin() {
 			json.NewEncoder(w).Encode(map[string]any{"authenticated": false})
 			return
 		}
+		s.RecordActivity(sess.Email)
 		ws, err := s.users.Workstation(sess.Email)
 		if err != nil && err != userstore.ErrNotFound {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -1758,7 +1841,47 @@ func (s *Server) StartAdmin() {
 			})
 			return
 		}
-		if s.guac != nil {
+		// Reconcile store status against actual GCP state — fixes the bug where
+		// store says "running" but the instance has been TERMINATED (auto-stop,
+		// out-of-band stop, killchain). Without this, the frontend tries to load
+		// Guacamole on a dead VM instead of showing the start panel.
+		//
+		// If GCP returns "unprovisioned" (instance not found / 404), it means the
+		// VM was deleted out-of-band — most often by the kill chain. Clear the
+		// workstation entirely instead of writing back a stale ws with
+		// status="unprovisioned"; otherwise a race against killchain's
+		// AssignWorkstation(nil) resurrects the dead workstation record.
+		if resolved, changed := s.resolveVMStatus(r.Context(), sess.Email, ws); changed {
+			if resolved == "unprovisioned" {
+				// Re-read current store state under lock; if killchain already
+				// cleared it, do nothing. If it's still set, clear it.
+				if cur, _ := s.users.Workstation(sess.Email); cur != nil {
+					_ = s.users.AssignWorkstation(sess.Email, nil)
+				}
+				ws = nil
+				json.NewEncoder(w).Encode(map[string]any{
+					"email":           sess.Email,
+					"org_id":          sess.OrgID,
+					"provider":        "",
+					"platform":        "",
+					"status":          "unprovisioned",
+					"vm_status":       string(vmStatus),
+					"display_name":    "",
+					"instance_id":     "",
+					"region":          "",
+					"console_url":     "",
+					"web_desktop_url": "",
+					"assigned_at":     "",
+				})
+				return
+			}
+			ws.Status = resolved
+			_ = s.users.AssignWorkstation(sess.Email, ws)
+		}
+		// If cloud status now says VM is not running, skip the Guacamole session
+		// URL refresh — there's no live session to bind. Frontend will render
+		// the start panel based on status=stopped/starting/etc.
+		if ws.Status == "running" && s.guac != nil {
 			drivePath := userRDPTransferDir(s.cfg.RDPTransferRoot, sess.Email)
 			_ = ensureRDPTransferDir(drivePath)
 			if remoteURL, remoteErr := s.guac.EnsureSessionURL(r.Context(), ws, drivePath); remoteErr == nil && remoteURL != "" {
@@ -1834,6 +1957,16 @@ func (s *Server) StartAdmin() {
 			json.NewEncoder(w).Encode(map[string]any{"error": "account not approved"})
 			return
 		}
+		// Idempotency: 동일 user 에 대한 vm-approve 가 이미 in-flight 면 (provisioning)
+		// 두 번째 클릭을 거부. requested 만 새로 시작 가능. active/reclaimed 도 reject.
+		if u.VMStatus == userstore.VMStatusProvisioning {
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(map[string]any{
+				"error":     "VM provisioning already in progress",
+				"vm_status": string(u.VMStatus),
+			})
+			return
+		}
 		if u.VMStatus != userstore.VMStatusRequested {
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(map[string]any{
@@ -1842,28 +1975,46 @@ func (s *Server) StartAdmin() {
 			})
 			return
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
-		defer cancel()
-		ws, err := s.workstations.EnsureWithToken(ctx, email, u.OrgID, body.AccessToken, nil)
-		if err != nil {
-			log.Printf("vm-approve: EnsureWithToken failed for %s: %v", email, err)
-			w.WriteHeader(http.StatusBadGateway)
-			json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
-			return
-		}
-		if err := s.users.AssignWorkstation(email, ws); err != nil {
+		// Mark as provisioning BEFORE returning so concurrent / refresh-triggered
+		// re-approvals get 409. Cleared on success (AssignWorkstation → active)
+		// or failure (rollback to requested in the goroutine).
+		if err := s.users.SetVMStatus(email, userstore.VMStatusProvisioning); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
 			return
 		}
+		// Deterministic password from device-binding fingerprint so Windows SAM /
+		// users.json / Guacamole all share the same value with no drift. Falls back
+		// to random inside Ensure if fingerprint is empty (user never logged in yet).
+		var seed *userstore.Workstation
+		if pass := workstation.DerivePassword(u.RegisteredIP, email); pass != "" {
+			seed = &userstore.Workstation{RemoteUser: "boanclaw", RemotePass: pass}
+		}
+		orgID := u.OrgID
+		accessToken := body.AccessToken
+		// Return 202 immediately — UI polls /api/admin/users to observe
+		// vm_status: provisioning → active.
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			ws, err := s.workstations.EnsureWithToken(ctx, email, orgID, accessToken, seed)
+			if err != nil {
+				log.Printf("vm-approve: EnsureWithToken failed for %s: %v — rolling back to requested", email, err)
+				_ = s.users.SetVMStatus(email, userstore.VMStatusRequested)
+				return
+			}
+			if err := s.users.AssignWorkstation(email, ws); err != nil {
+				log.Printf("vm-approve: AssignWorkstation failed for %s: %v", email, err)
+				_ = s.users.SetVMStatus(email, userstore.VMStatusRequested)
+				return
+			}
+			log.Printf("vm-approve: %s → vm_status=active (instance=%s)", email, ws.InstanceID)
+		}()
+		w.WriteHeader(http.StatusAccepted)
 		json.NewEncoder(w).Encode(map[string]any{
-			"status":    "ok",
-			"vm_status": string(userstore.VMStatusActive),
-			"workstation": map[string]any{
-				"instance_id":  ws.InstanceID,
-				"remote_host":  ws.RemoteHost,
-				"display_name": ws.DisplayName,
-			},
+			"status":    "provisioning",
+			"vm_status": string(userstore.VMStatusProvisioning),
+			"hint":      "VM 생성 중입니다 (1~3분 소요). vm_status 가 active 가 되면 완료.",
 		})
 	})
 
@@ -1911,6 +2062,98 @@ func (s *Server) StartAdmin() {
 		})
 	})
 
+	// POST /api/workstation/start — user-initiated start of a previously
+	// stopped VM. Replaces the implicit auto-start-on-login goroutine, which
+	// raced with the idle sweeper and sometimes left Windows half-booted.
+	// Returns immediately with status=starting; frontend polls /api/workstation/me
+	// for workstation.status == "running" to know when to render the RDP iframe.
+	mux.HandleFunc("/api/workstation/start", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		sess, err := auth.SessionFromRequest(r, s.authProv)
+		if err != nil || sess == nil {
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]any{"error": "unauthenticated"})
+			return
+		}
+		u, err := s.users.Get(sess.Email)
+		if err != nil || u == nil || u.Workstation == nil || strings.TrimSpace(u.Workstation.InstanceID) == "" {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]any{"error": "no workstation assigned"})
+			return
+		}
+		ws := *u.Workstation
+		email := sess.Email
+		userOrg := u.OrgID
+		// Mark as starting so the sweeper doesn't immediately re-stop and the
+		// frontend can render a "시작 중..." spinner.
+		ws.Status = "starting"
+		_ = s.users.AssignWorkstation(email, &ws)
+		s.RecordActivity(email)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+			defer cancel()
+			if err := s.workstations.StartInstance(ctx, &ws); err != nil {
+				log.Printf("[start] %s StartInstance failed: %v", email, err)
+				return
+			}
+			refreshed, err := s.workstations.Ensure(ctx, email, userOrg, &ws)
+			if err != nil {
+				log.Printf("[start] %s Ensure failed: %v", email, err)
+				return
+			}
+			if refreshed == nil {
+				return
+			}
+			// Wait for Windows RDP (3389) to actually accept connections. Ensure
+			// only confirms GCP reports RUNNING + has an external IP; the Windows
+			// OS still needs 1-3 more minutes to finish booting and start the
+			// RDP service. Without this probe the iframe loads while Windows is
+			// half-booted -> Guacamole gets "auth failure" and the user sees a
+			// black screen seconds after clicking Start.
+			port := refreshed.RemotePort
+			if port == 0 {
+				port = 3389
+			}
+			addr := fmt.Sprintf("%s:%d", refreshed.RemoteHost, port)
+			deadline := time.Now().Add(5 * time.Minute)
+			for time.Now().Before(deadline) {
+				dialer := net.Dialer{Timeout: 3 * time.Second}
+				c, derr := dialer.DialContext(ctx, "tcp", addr)
+				if derr == nil {
+					_ = c.Close()
+					break
+				}
+				select {
+				case <-ctx.Done():
+					log.Printf("[start] %s ctx done while waiting for RDP", email)
+					return
+				case <-time.After(5 * time.Second):
+				}
+			}
+			refreshed.Status = "running"
+			if err := s.users.AssignWorkstation(email, refreshed); err != nil {
+				log.Printf("[start] %s AssignWorkstation failed: %v", email, err)
+				return
+			}
+			if s.guac != nil {
+				drivePath := userRDPTransferDir(s.cfg.RDPTransferRoot, email)
+				_ = ensureRDPTransferDir(drivePath)
+				if _, err := s.guac.EnsureSessionURL(ctx, refreshed, drivePath); err != nil {
+					log.Printf("[start] %s guac sync failed: %v", email, err)
+				}
+			}
+			log.Printf("[start] %s up host=%s rdp-ready", email, refreshed.RemoteHost)
+		}()
+		json.NewEncoder(w).Encode(map[string]any{
+			"status": "starting",
+			"hint":   "VM 시작 중입니다 (1~3분 소요).",
+		})
+	})
+
 	mux.HandleFunc("/api/input-gate/evaluate", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.NotFound(w, r)
@@ -1943,8 +2186,8 @@ func (s *Server) StartAdmin() {
 		}
 		// G1 patterns 는 서버가 권위 있음 (클라이언트 body 덮어씀)
 		if rules, _ := s.guardrail.GetGuardrailRules(r.Context(), sess.OrgID); rules != nil {
-			body.G1Patterns = make([]G1PatternRule, 0, len(rules.G1Patterns))
-			for _, r := range rules.G1Patterns {
+			body.G1Patterns = make([]G1PatternRule, 0, len(rules.GT1Patterns))
+			for _, r := range rules.GT1Patterns {
 				body.G1Patterns = append(body.G1Patterns, G1PatternRule{Pattern: r.Pattern, Replacement: r.Replacement, Mode: r.Mode})
 			}
 		}
@@ -2029,6 +2272,15 @@ func (s *Server) StartAdmin() {
 	})
 
 	mux.HandleFunc("/api/auth/logout", func(w http.ResponseWriter, r *http.Request) {
+		// Cost-saving: schedule a delayed StopInstance (10-min grace period).
+		// If the same user logs in again before the timer fires the schedule
+		// is cancelled, so a quick tab-close + reopen doesn't pay the GCP
+		// stop/start round-trip. The actual stop happens in runStopSweeper.
+		if sess, err := auth.SessionFromRequest(r, s.authProv); err == nil && sess != nil {
+			if u, _ := s.users.Get(sess.Email); u != nil && u.Workstation != nil && strings.TrimSpace(u.Workstation.InstanceID) != "" {
+				s.markLogoutAsActivityCheckpoint(sess.Email)
+			}
+		}
 		http.SetCookie(w, &http.Cookie{
 			Name:   "boan_session",
 			Value:  "",
@@ -2342,6 +2594,12 @@ func (s *Server) StartAdmin() {
 				json.NewEncoder(w).Encode(map[string]string{"error": "세션 생성 실패"})
 				return
 			}
+			// Refresh idle timer on login. No auto-start: if the VM was stopped
+			// by the sweeper, the frontend shows "VM 중지됨 + ▶ 시작" and the
+			// user clicks /api/workstation/start to bring it up. Explicit
+			// control eliminates the race-prone background goroutine that
+			// would sometimes leave Windows in a half-booted state.
+			s.RecordActivity(body.Email)
 			// Phase 1: no auto-provisioning on test-mode login.
 			hintMsg := "TEST 모드: OTP 없이 바로 로그인됩니다."
 			if isOwner {
@@ -2432,6 +2690,10 @@ func (s *Server) StartAdmin() {
 			json.NewEncoder(w).Encode(map[string]string{"error": "세션 생성 실패"})
 			return
 		}
+		// Seed idle timer on login. Auto-start is intentionally NOT performed
+		// here — the user clicks the explicit "▶ 시작" button on the Personal
+		// Computer page to bring up a stopped VM.
+		s.RecordActivity(body.Email)
 		json.NewEncoder(w).Encode(map[string]any{
 			"status":     "ok",
 			"role":       string(roleVal),
@@ -3204,6 +3466,33 @@ func (s *Server) StartAdmin() {
 		}
 	})
 
+	// GET /api/files/host-path?path= — S2 의 현재 컨테이너 경로에 대응하는 호스트 OS
+	// 절대경로를 반환. 프론트엔드의 "호스트에서 열기" 버튼이 클립보드 복사용으로
+	// 사용. 브라우저는 보안상 native explorer 를 직접 못 띄우니까, 사용자가 자기
+	// OS 파일 관리자(Files / Finder / Explorer) 의 주소창(Ctrl+L) 에 paste 하면
+	// 해당 위치로 바로 이동.
+	mux.HandleFunc("/api/files/host-path", func(w http.ResponseWriter, r *http.Request) {
+		if cors(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		reqPath := r.URL.Query().Get("path")
+		// 슬래시 escape — strict join, traversal 차단.
+		clean := filepath.Clean("/" + reqPath)
+		hostRoot := strings.TrimSpace(os.Getenv("BOAN_HOST_MOUNT_ROOT"))
+		if hostRoot == "" {
+			// Fallback: 컨테이너 mount root 를 그대로 반환. 사용자가 호스트와
+			// 컨테이너 경로 매핑을 직접 알아야 하므로 이상적이진 않지만 최소
+			// 정보는 제공.
+			hostRoot = mountRootForOrg(resolveOrg(r))
+		}
+		hostPath := filepath.Clean(filepath.Join(hostRoot, clean))
+		json.NewEncoder(w).Encode(map[string]any{
+			"host_path": hostPath,
+			"host_root": hostRoot,
+		})
+	})
+
 	// POST /api/files/transfer — 파일 전송 (S2 ↔ S1 RDP staging)
 	// S2→S1: G1 가드레일 검사 후 sandbox 파일을 RDP staging dir 으로 복사. 사용자의 Guacamole 세션에서 BoanClaw 드라이브로 보임.
 	// S1→S2: 사용자가 BoanClaw 드라이브에 둔 파일을 sandbox 로 복사. SSH/SCP 사용 안 함.
@@ -3277,26 +3566,185 @@ func (s *Server) StartAdmin() {
 				return
 			}
 
-			// 가드레일 — 텍스트 파일 G1 검사
+			// 가드레일 — 텍스트 파일 G1+G2+G3 체인 검사. AccessLevel 은 사용자
+			// users.json 의 access_level 필드 그대로 (ask / allow / deny) 사용.
+			// "ask" 면 G2 HITL approval 까지 가야 — 이전엔 "allow" 로 하드코딩되어
+			// G2 가 건너뛰어졌음 (사용자 제보).
 			content, readErr := os.ReadFile(srcFull)
 			if readErr != nil {
 				w.WriteHeader(http.StatusInternalServerError)
 				json.NewEncoder(w).Encode(map[string]any{"error": "cannot read source file"})
 				return
 			}
-			textContent := string(content)
-			if len(textContent) > 0 {
-				gateResp := evaluateInputGateWithLocal(r.Context(), s.dlpEng, s.guardrail, s.evaluateGuardrailLocal, orgID, InputGateRequest{
-					Mode: "text", Text: textContent, SrcLevel: 2, DestLevel: 1,
-					Flow: "file-transfer-s2-to-s1", AccessLevel: "allow",
-				}, nil)
-				if !gateResp.Allowed {
+			// access level: allow → G1 만, ask → G1 + G2 + G3.
+			userAccessLevel := "ask"
+			if u, err := s.users.Get(sess.Email); err == nil && u != nil && u.AccessLevel != "" {
+				userAccessLevel = string(u.AccessLevel)
+			}
+			// 파일 분류: text / image / drop. drop 은 즉시 차단 — 정책상
+			// human-readable text 와 image 만 검사 후 통과 가능 (암호화 / 압축 /
+			// 바이너리는 가드레일이 의미 검사 불가능하므로 일률 차단).
+			kind := ClassifyFile(body.FileName, content)
+			if kind == FileKindDrop {
+				summary := fmt.Sprintf("%s — dropped (not text/image)", body.FileName)
+				addTrace(traceEntry{
+					Type: "file", Direction: "outbound", Source: sess.Email, Target: "gcp",
+					Summary: summary, Decision: "block", Gate: "classify",
+					Meta: map[string]any{
+						"flow":   "file-transfer-s2-to-s1",
+						"file":   body.FileName,
+						"reason": "파일이 text/image 가 아님 (암호화/압축/바이너리는 가드레일 검사 불가) — 일률 차단",
+						"size":   len(content),
+					},
+				})
+				if s.audit != nil {
+					s.audit.Log(r.Context(), audit.Event{
+						Action: "block:file-transfer", SLevel: 2, Host: "dest_level=1",
+						User:   sess.Email,
+						Reason: fmt.Sprintf("flow=file-transfer-s2-to-s1 file=%s kind=drop size=%d", body.FileName, len(content)),
+						Tool:   "file-transfer", Method: "POST",
+					})
+				}
+				json.NewEncoder(w).Encode(map[string]any{
+					"ok": false, "error": "file kind not allowed (text/image only)",
+					"action": "block", "tier": "classify",
+					"reason": "암호화/압축/바이너리는 가드레일 의미 검사 불가 — text/image 만 허용",
+				})
+				return
+			}
+			isImage := kind == FileKindImage
+			if isImage {
+				gi := s.EvaluateImageBytes(r.Context(), orgID, userAccessLevel, content)
+				switch gi.Action {
+				case "block":
+					summary := fmt.Sprintf("%s — %s blocked", body.FileName, gi.Tier)
+					if gi.Tier == "G1_img" {
+						summary = fmt.Sprintf("%s — G1_img blocked (hash=%s d=%d)", body.FileName, gi.MatchedHash, gi.Distance)
+					}
+					addTrace(traceEntry{
+						Type: "file", Direction: "outbound", Source: sess.Email, Target: "gcp",
+						Summary: summary, Decision: "block", Gate: gi.Tier,
+						Meta: map[string]any{
+							"flow": "file-transfer-s2-to-s1", "file": body.FileName,
+							"reason":       gi.Reason,
+							"matched_hash": gi.MatchedHash, "distance": gi.Distance,
+						},
+					})
+					if s.audit != nil {
+						s.audit.Log(r.Context(), audit.Event{
+							Action: "block:file-transfer", SLevel: 2, Host: "dest_level=1",
+							User:   sess.Email,
+							Reason: fmt.Sprintf("flow=file-transfer-s2-to-s1 file=%s tier=%s %s", body.FileName, gi.Tier, gi.Reason),
+							Tool:   "file-transfer", Method: "POST",
+						})
+					}
 					json.NewEncoder(w).Encode(map[string]any{
-						"ok": false, "error": "guardrail blocked file transfer",
-						"action": gateResp.Action, "reason": gateResp.Reason,
+						"ok": false, "error": fmt.Sprintf("%s blocked image", gi.Tier),
+						"action": "block", "tier": gi.Tier,
+						"matched_hash": gi.MatchedHash, "distance": gi.Distance,
+						"reason": gi.Reason,
+					})
+					return
+				case "ask":
+					// GI2 vision-LLM matched a description — route to HITL approval queue.
+					approvalID := createInputGateApproval(sess.Email, orgID, gi.Reason, InputGateRequest{
+						Mode: "image", Text: body.FileName, Flow: "file-transfer-s2-to-s1",
+						UserEmail: sess.Email, AccessLevel: "ask",
+					})
+					addTrace(traceEntry{
+						Type: "file", Direction: "outbound", Source: sess.Email, Target: "gcp",
+						Summary: fmt.Sprintf("%s — G2_img ask (%s)", body.FileName, gi.Reason),
+						Decision: "ask", Gate: "G2_img",
+						Meta: map[string]any{
+							"flow":        "file-transfer-s2-to-s1", "file": body.FileName,
+							"reason":      gi.Reason,
+							"approval_id": approvalID,
+						},
+					})
+					json.NewEncoder(w).Encode(map[string]any{
+						"ok": false, "error": "GI2 routed to HITL approval",
+						"action": "ask", "tier": "G2_img",
+						"reason": gi.Reason, "approval_id": approvalID,
 					})
 					return
 				}
+			}
+			textContent := string(content)
+			gateAction := "allow"
+			gateReason := "empty file - allowed without inspection"
+			gateTier := "none"
+			gateAllowed := true
+			gateApprovalID := ""
+			if isImage {
+				// Image already passed GI1 above; skip text-chain since GT2 LLM will
+				// flag any binary bytes as "not plain text" and false-block every image.
+				gateReason = "image file - GI1 only path, text chain skipped"
+				gateTier = "G1_img"
+			}
+			if !isImage && len(textContent) > 0 {
+				// 사용자 정책의 G1 patterns 도 chat handler 와 동일하게 주입.
+				// 이전엔 빈 G1Patterns 로 호출해서 backend default seed (credential
+				// 모드) 만 적용되어 사용자 정의 mask/fake 가 무시됐음.
+				var g1Patterns []G1PatternRule
+				if rules, _ := s.guardrail.GetGuardrailRules(r.Context(), orgID); rules != nil {
+					for _, rr := range rules.GT1Patterns {
+						g1Patterns = append(g1Patterns, G1PatternRule{Pattern: rr.Pattern, Replacement: rr.Replacement, Mode: rr.Mode})
+					}
+				}
+				gateResp := evaluateInputGateWithLocal(r.Context(), s.dlpEng, s.guardrail, s.evaluateGuardrailLocal, orgID, InputGateRequest{
+					Mode: "text", Text: textContent, SrcLevel: 2, DestLevel: 1,
+					Flow: "file-transfer-s2-to-s1", AccessLevel: userAccessLevel,
+					UserEmail:  sess.Email,
+					G1Patterns: g1Patterns,
+				}, func(reason string, req InputGateRequest) string {
+					return createInputGateApproval(sess.Email, orgID, reason, req)
+				})
+				gateAction = gateResp.Action
+				gateReason = gateResp.Reason
+				gateTier = gateResp.Tier
+				gateAllowed = gateResp.Allowed
+				gateApprovalID = gateResp.ApprovalID
+			}
+			// observability + audit — block/allow 무관하게 항상 기록.
+			if s.audit != nil {
+				s.audit.Log(r.Context(), audit.Event{
+					Action:   "observe:file-transfer",
+					SLevel:   2,
+					Host:     "dest_level=1",
+					User:     sess.Email,
+					Reason:   fmt.Sprintf("flow=file-transfer-s2-to-s1 file=%s action=%s tier=%s %s", body.FileName, gateAction, gateTier, gateReason),
+					Tool:     "file-transfer",
+					Method:   "POST",
+					BodyHash: audit.HashBody([]byte(textContent)),
+				})
+			}
+			trSummary := body.FileName
+			if isImage {
+				trSummary = fmt.Sprintf("%s — image (%d bytes)", body.FileName, len(content))
+			} else if textContent != "" {
+				preview := textContent
+				if len(preview) > 200 {
+					preview = preview[:200] + "..."
+				}
+				trSummary = fmt.Sprintf("%s — %s", body.FileName, preview)
+			}
+			addTrace(traceEntry{
+				Type: "file", Direction: "outbound", Source: sess.Email, Target: "gcp",
+				Summary: trSummary, Decision: gateAction, Gate: gateTier,
+				Meta: map[string]any{
+					"flow":       "file-transfer-s2-to-s1",
+					"file":       body.FileName,
+					"reason":     gateReason,
+					"size_bytes": len(textContent),
+				},
+			})
+			if !gateAllowed {
+				json.NewEncoder(w).Encode(map[string]any{
+					"ok": false, "error": "guardrail blocked file transfer",
+					"action": gateAction, "reason": gateReason, "tier": gateTier,
+					"approval_id": gateApprovalID,
+				})
+				return
 			}
 
 			dstFull := filepath.Clean(filepath.Join(s1Base, body.DstPath, body.FileName))
@@ -3342,6 +3790,25 @@ func (s *Server) StartAdmin() {
 				json.NewEncoder(w).Encode(map[string]any{"error": "dest path escapes S2 base"})
 				return
 			}
+			// S1→S2 는 가드레일 검사 없이 통과. 단, observability 확장 시 파일
+			// 내용까지 보이도록 src 에서 미리 읽음. text 면 5000자 preview,
+			// image 면 분류만 표기 (전체 byte 는 너무 큼).
+			srcContent, _ := os.ReadFile(srcFull)
+			kind := ClassifyFile(body.FileName, srcContent)
+			preview := ""
+			switch kind {
+			case FileKindText:
+				if len(srcContent) > 5000 {
+					preview = string(srcContent[:5000]) + "..."
+				} else {
+					preview = string(srcContent)
+				}
+			case FileKindImage:
+				preview = fmt.Sprintf("[image: %s, %d bytes]", body.FileName, len(srcContent))
+			case FileKindDrop:
+				preview = fmt.Sprintf("[binary/encrypted: %s, %d bytes]", body.FileName, len(srcContent))
+			}
+
 			n, err := copyFile(srcFull, dstFull)
 			if err != nil {
 				log.Printf("[files/transfer s1→s2] copy failed user=%s err=%v", sess.Email, err)
@@ -3349,6 +3816,33 @@ func (s *Server) StartAdmin() {
 				json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "copy failed: " + err.Error()})
 				return
 			}
+			if s.audit != nil {
+				s.audit.Log(r.Context(), audit.Event{
+					Action: "observe:file-transfer",
+					SLevel: 1,
+					Host:   "dest_level=2",
+					User:   sess.Email,
+					Reason: fmt.Sprintf("flow=file-transfer-s1-to-s2 file=%s bytes=%d kind=%s (no inspection - downstream policy)", body.FileName, n, kind),
+					Tool:   "file-transfer",
+					Method: "POST",
+				})
+			}
+			// trace summary = 파일명 + preview (확장 시 전체 내용 보이게).
+			summaryLine := body.FileName
+			if preview != "" {
+				summaryLine = fmt.Sprintf("%s — %s", body.FileName, preview)
+			}
+			addTrace(traceEntry{
+				Type: "file", Direction: "inbound", Source: "gcp", Target: sess.Email,
+				Summary: summaryLine, Decision: "allow", Gate: "none",
+				Meta: map[string]any{
+					"flow":       "file-transfer-s1-to-s2",
+					"file":       body.FileName,
+					"kind":       string(kind),
+					"reason":     "downstream policy - no inspection",
+					"size_bytes": n,
+				},
+			})
 			json.NewEncoder(w).Encode(map[string]any{
 				"ok": true, "src": srcFull, "dst": dstFull,
 				"size": n, "guardrail": false,
@@ -3817,6 +4311,162 @@ func (s *Server) StartAdmin() {
 		w.Write(raw)
 	})
 
+	// GI1 — 이미지 perceptual-hash 차단 리스트. 이미지 원본은 절대 cloud 로
+	// 전송하지 않는다: device 에서 pHash 계산 후 16-hex 만 policy-server 로 보낸다.
+	mux.HandleFunc("/api/admin/gi1/forbidden", func(w http.ResponseWriter, r *http.Request) {
+		if cors(w, r) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if requireEdit(w, r) {
+			return
+		}
+		if err := r.ParseMultipartForm(5 << 20); err != nil {
+			http.Error(w, "parse multipart: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			http.Error(w, "file field required: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		defer file.Close()
+		hash, err := imagehash.Compute(file)
+		if err != nil {
+			http.Error(w, "hash: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		orgID := resolveOrg(r)
+		orgURL := policyBase
+		if entry, ok := s.orgs.Resolve(orgID); ok && entry.URL != "" {
+			orgURL = entry.URL
+		}
+		description := strings.TrimSpace(r.FormValue("description"))
+		if description == "" {
+			description = header.Filename
+		}
+		body, _ := json.Marshal(map[string]string{
+			"hash":        hash,
+			"description": description,
+			"replacement": strings.TrimSpace(r.FormValue("replacement")),
+		})
+		req, _ := http.NewRequestWithContext(r.Context(), http.MethodPost,
+			orgURL+"/org/"+orgID+"/v1/guardrail/gi1/forbidden", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		attachOrgAuth(req, orgID)
+		resp, err := client.Do(req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		respRaw, _ := io.ReadAll(resp.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.WriteHeader(resp.StatusCode)
+		w.Write(respRaw)
+	})
+
+	mux.HandleFunc("/api/admin/gi1/forbidden/", func(w http.ResponseWriter, r *http.Request) {
+		if cors(w, r) {
+			return
+		}
+		if r.Method != http.MethodDelete {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if requireEdit(w, r) {
+			return
+		}
+		hash := strings.TrimPrefix(r.URL.Path, "/api/admin/gi1/forbidden/")
+		if hash == "" {
+			http.Error(w, "hash required", http.StatusBadRequest)
+			return
+		}
+		orgID := resolveOrg(r)
+		orgURL := policyBase
+		if entry, ok := s.orgs.Resolve(orgID); ok && entry.URL != "" {
+			orgURL = entry.URL
+		}
+		req, _ := http.NewRequestWithContext(r.Context(), http.MethodDelete,
+			orgURL+"/org/"+orgID+"/v1/guardrail/gi1/forbidden/"+hash, nil)
+		attachOrgAuth(req, orgID)
+		resp, err := client.Do(req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
+	})
+
+	mux.HandleFunc("/api/admin/gi2/descriptions", func(w http.ResponseWriter, r *http.Request) {
+		if cors(w, r) {
+			return
+		}
+		if r.Method != http.MethodPut {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if requireEdit(w, r) {
+			return
+		}
+		orgID := resolveOrg(r)
+		orgURL := policyBase
+		if entry, ok := s.orgs.Resolve(orgID); ok && entry.URL != "" {
+			orgURL = entry.URL
+		}
+		req, _ := http.NewRequestWithContext(r.Context(), http.MethodPut,
+			orgURL+"/org/"+orgID+"/v1/guardrail/gi2/descriptions", r.Body)
+		req.Header.Set("Content-Type", "application/json")
+		attachOrgAuth(req, orgID)
+		resp, err := client.Do(req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
+	})
+
+	mux.HandleFunc("/api/admin/gi1/threshold", func(w http.ResponseWriter, r *http.Request) {
+		if cors(w, r) {
+			return
+		}
+		if r.Method != http.MethodPut {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if requireEdit(w, r) {
+			return
+		}
+		orgID := resolveOrg(r)
+		orgURL := policyBase
+		if entry, ok := s.orgs.Resolve(orgID); ok && entry.URL != "" {
+			orgURL = entry.URL
+		}
+		req, _ := http.NewRequestWithContext(r.Context(), http.MethodPut,
+			orgURL+"/org/"+orgID+"/v1/guardrail/gi1/threshold", r.Body)
+		req.Header.Set("Content-Type", "application/json")
+		attachOrgAuth(req, orgID)
+		resp, err := client.Do(req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
+	})
+
 	mux.HandleFunc("/api/policy/", func(w http.ResponseWriter, r *http.Request) {
 		if cors(w, r) {
 			return
@@ -3879,6 +4529,43 @@ func (s *Server) StartAdmin() {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 			w.WriteHeader(resp.StatusCode)
 			w.Write(respRaw)
+		case rest == "/v1/policy/stream" && r.Method == http.MethodGet:
+			// SSE pass-through: forwards admin UI 의 EventSource 를 cloud policy-server
+			// 의 /org/{id}/network-policy.stream 으로 그대로 연결한다. Response 는
+			// io.Copy + Flusher 로 줄단위 즉시 전송 — 60s 폴링 fallback 없이도
+			// 다른 admin 의 정책 변경이 UI 에 <100ms 만에 반영된다.
+			req, _ := http.NewRequestWithContext(r.Context(), http.MethodGet,
+				orgURL+"/org/"+orgID+"/network-policy.stream", nil)
+			req.Header.Set("Accept", "text/event-stream")
+			attachOrgAuth(req, orgID)
+			streamClient := &http.Client{Transport: client.Transport}
+			resp, err := streamClient.Do(req)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadGateway)
+				return
+			}
+			defer resp.Body.Close()
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("X-Accel-Buffering", "no")
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			w.WriteHeader(resp.StatusCode)
+			flusher, _ := w.(http.Flusher)
+			buf := make([]byte, 4096)
+			for {
+				n, err := resp.Body.Read(buf)
+				if n > 0 {
+					w.Write(buf[:n])
+					if flusher != nil {
+						flusher.Flush()
+					}
+				}
+				if err != nil {
+					return
+				}
+			}
+
 		case rest == "/v1/policy/rollback" && r.Method == http.MethodPost:
 			if requireEdit(w, r) {
 				return
@@ -4274,41 +4961,7 @@ func (s *Server) StartAdmin() {
 			w.WriteHeader(resp.StatusCode)
 			json.NewEncoder(w).Encode(map[string]any{"status": "stored", "role": body.Name})
 
-		case rest == "/v1/passthrough" && r.Method == http.MethodGet:
-			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-			json.NewEncoder(w).Encode(s.listCredentialPassthrough(orgID))
-
-		case rest == "/v1/passthrough" && r.Method == http.MethodPost:
-			var body struct {
-				Name  string `json:"name"`
-				Value string `json:"value"`
-			}
-			json.NewDecoder(r.Body).Decode(&body)
-			if err := s.upsertCredentialPassthrough(orgID, body.Name, body.Value); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-			json.NewEncoder(w).Encode(map[string]any{"status": "stored", "name": strings.TrimSpace(body.Name)})
-
 		default:
-			// passthrough DELETE: /v1/passthrough/{name}
-			if strings.HasPrefix(rest, "/v1/passthrough/") && r.Method == http.MethodDelete {
-				name := strings.TrimPrefix(rest, "/v1/passthrough/")
-				if name == "" {
-					http.NotFound(w, r)
-					return
-				}
-				if err := s.deleteCredentialPassthrough(orgID, name); err != nil {
-					http.Error(w, err.Error(), http.StatusInternalServerError)
-					return
-				}
-				w.Header().Set("Access-Control-Allow-Origin", "*")
-				w.WriteHeader(http.StatusNoContent)
-				return
-			}
 			// credentials DELETE: /v1/credentials/{role}
 			if strings.HasPrefix(rest, "/v1/credentials/") && r.Method == http.MethodDelete {
 				id := strings.TrimPrefix(rest, "/v1/credentials/")
@@ -5400,8 +6053,8 @@ func (s *Server) dlpRulesLoaded() int {
 	return s.dlpEng.RulesCount()
 }
 
-// applyG1Diff — "+pattern | description | mode" 형식의 G1 제안 diff 를 파싱해
-// G1CustomPattern list 로 반환. propose-g1-amendment 의 시스템 프롬프트 포맷에 맞춤.
+// applyG1Diff — "+pattern | description | mode" 형식의 GT1 제안 diff 를 파싱해
+// GT1Pattern list 로 반환. propose-g1-amendment 의 시스템 프롬프트 포맷에 맞춤.
 // "-" 로 시작하는 줄은 제거 제안으로 간주하지만 현재는 무시 (단순 append 모드).
 func applyG1Diff(diff string) []map[string]any {
 	var out []map[string]any

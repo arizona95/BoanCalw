@@ -173,6 +173,11 @@ services:
       - BOAN_LISTEN=:18080
       - BOAN_ADMIN_LISTEN=:18081
       - BOAN_ADMIN_PASSWORD=boan-admin
+      # Stable JWT secret so user cookies survive proxy restart. Without this
+      # the auth package generates a random secret on every boot and every
+      # existing session becomes 401-unauthenticated. Dev-only static value;
+      # production must supply BOAN_JWT_SECRET via env_file.
+      - BOAN_JWT_SECRET=${BOAN_JWT_SECRET:-boanclaw-dev-jwt-do-not-use-in-prod-2026}
       - BOAN_OAUTH_CLIENT_ID=${BOAN_OAUTH_CLIENT_ID:-}
       - BOAN_OAUTH_CLIENT_SECRET=${BOAN_OAUTH_CLIENT_SECRET:-}
       - BOAN_OAUTH_REDIRECT_URL=http://localhost:19080/api/auth/callback
@@ -288,6 +293,9 @@ services:
       # S2(sandbox): /home/boan/Desktop/boanclaw (고정)
       # S1(GCP Windows staging, sandbox-local): /home/boan/Desktop/boanclaw-gcp
       - BOAN_MOUNT_ROOT=/home/boan/Desktop/boanclaw
+      # File Manager 의 "호스트에서 열기" 버튼이 표시할 실제 호스트 경로.
+      # /home/boan/Desktop/boanclaw 의 bind-mount source 와 같아야 함.
+      - BOAN_HOST_MOUNT_ROOT=${BOAN_HOST_MOUNT_ROOT:-${HOME}/Desktop/boanclaw}
       - BOAN_S1_STAGE_ROOT=/home/boan/Desktop/boanclaw-gcp
       - BOAN_CA_CERT=/tmp/boan/ca.crt
       - BOAN_CA_KEY=/tmp/boan/ca.key

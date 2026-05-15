@@ -90,16 +90,6 @@ func TestSanitizeAllowsObviouslyFakeCredentialValues(t *testing.T) {
 	}
 }
 
-func TestSanitizeAllowsRegisteredPassthroughValues(t *testing.T) {
-	in := `export ANTHROPIC_API_KEY=sk-ant-api03-custompassthrough12345678901234`
-	out := sanitizeCredentialReadableTextWithKnown(in, nil, map[string]struct{}{
-		"sk-ant-api03-custompassthrough12345678901234": {},
-	})
-	if out != in {
-		t.Fatalf("expected registered passthrough value unchanged, got %q", out)
-	}
-}
-
 func TestRedactValueInKeywordMatch(t *testing.T) {
 	cases := []struct {
 		in   string
@@ -146,7 +136,7 @@ func TestSanitizeCredentialReadableTextWithKnown(t *testing.T) {
 	in := "use sk-ant-api03-test1234567890abcdefghijklmnop for this request"
 	out := sanitizeCredentialReadableTextWithKnown(in, map[string]string{
 		"sk-ant-api03-test1234567890abcdefghijklmnop": "{{CREDENTIAL:test-anthropic-key}}",
-	}, nil)
+	})
 	if strings.Contains(out, "sk-ant-api03-test1234567890abcdefghijklmnop") {
 		t.Fatalf("expected raw credential removed, got %q", out)
 	}
