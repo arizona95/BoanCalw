@@ -48,7 +48,7 @@ RUN apt-get update && \
 # /opt/boanclaw-meta 에 기록한다. entrypoint 가 시작 직전에 같은 두 값을
 # 다시 계산해서 일치 여부를 검사하고, 불일치면 fail-closed 로 종료한다.
 # 새 OpenClaw 를 허용하려면: OPENCLAW_VERSION 을 올리고 rebuild → 새 hash 로 갱신.
-ARG OPENCLAW_VERSION=2026.4.9
+ARG OPENCLAW_VERSION=2026.5.12
 RUN npm install -g openclaw@${OPENCLAW_VERSION} && \
     OPENCLAW_DIR="$(npm config get prefix)/lib/node_modules/openclaw" && \
     INSTALLED_VERSION="$(node -e "console.log(require('${OPENCLAW_DIR}/package.json').version)")" && \
